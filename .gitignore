@@ -1,0 +1,41 @@
+# OS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Go
+/bin/
+/dist/
+*.test
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+build/
+coverage/
+*.tsbuildinfo
+
+# Infra / data
+docker-compose.override.yml
+/tmp/
+/data/

@@ -1,0 +1,97 @@
+# Example application manifest — declares the authorization surface of an app.
+# Synced with: warden plan --env staging && warden apply --env staging
+#
+# See ../SPEC.md §11.2 and §15.2
+
+application: billing
+name: Billing
+version: 3
+
+resources:
+  - key: project
+    name: Project
+    actions:
+      - { key: read,   name: View project }
+      - { key: manage, name: Manage project, implies: [read] }
+
+  - key: invoice
+    name: Invoice
+    parent: project                     # enables subtree grants: a grant on a project cascades
+    attributes:                         # JSON Schema for resource.attributes used in conditions
+      type: object
+      properties:
+        amount:  { type: number }
+        status:  { type: string, enum: [draft, pending, approved, paid, void] }
+      required: [amount, status]
+    actions:
+      - { key: read,    name: View invoice }
+      - { key: create,  name: Create invoice }
+      - { key: approve, name: Approve invoice }
+      - { key: void,    name: Void invoice }
+
+  - key: report
+    name: Report
+    actions:
+      - { key: read,     name: View reports }
+      - { key: schedule, name: Schedule reports, implies: [read] }
+
+roles:
+  - key: billing.viewer
+    name: Billing Viewer
+    permissions:
+      - billing.invoice:read
+      - billing.project:read
+
+  - key: billing.approver
+    name: Billing Approver
+    inherits: [billing.viewer]
+    permissions:
+      - billing.invoice:approve
+    constraints:
+      requires_mfa: true
+
+  - key: billing.admin
+    name: Billing Administrator
+    inherits: [billing.approver]
+    permissions:
+      - billing.invoice:void
+      - billing.project:manage
+      - billing.report:*
+    constraints:
+      separation_of_duties_conflicts: [billing.approver]
+
+ui:
+  elements:
+    - key: nav.reports
+      label: Reports navigation item
+      path: "Sidebar > Reports"
+      suggests: { permission: billing.report:read }
+      default_mode: hidden
+
+    - key: invoices.approve_button
+      label: Approve invoice button
+      description: Primary action on the invoice detail page
+      path: "Invoices > Detail > Actions"
+      suggests:
+        permission: billing.invoice:approve
+        resource_type: billing.invoice   # resource-scoped: <Guard> must pass a resource
+      default_mode: disabled
+
+    - key: invoices.void_button
+      label: Void invoice button
+      path: "Invoices > Detail > Actions"
+      suggests:
+        permission: billing.invoice:void
+        resource_type: billing.invoice
+      default_mode: hidden
+
+    - key: invoices.amount_column
+      label: Invoice amount column
+      path: "Invoices > List"
+      suggests: { permission: billing.invoice:read }
+      default_mode: read_only
+
+settings:
+  fail_mode: closed        # closed | open_read | stale
+  cache_mode: cached       # remote | cached | embedded
+  decision_log: denies     # off | denies | sampled | all
