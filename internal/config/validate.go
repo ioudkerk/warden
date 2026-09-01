@@ -78,6 +78,7 @@ var fieldToBinding = map[string]string{
 	"http.write_timeout":               "http-write-timeout",
 	"http.shutdown_timeout":            "http-shutdown-timeout",
 	"database.url":                     "database-url",
+	"database.system_url":              "database-system-url",
 	"database.max_open_conns":          "database-max-open-conns",
 	"database.max_idle_conns":          "database-max-idle-conns",
 	"database.statement_timeout":       "database-statement-timeout",
@@ -242,6 +243,24 @@ func (c *Config) validateDatabase(errs *Errors) {
 			errs.add("database.url", "has no host")
 		}
 	}
+	// Optional, but if given it must be well-formed: discovering at bootstrap that
+	// the system connection string is malformed is discovering it too late.
+	if !c.Database.SystemURL.IsZero() {
+		u, err := url.Parse(c.Database.SystemURL.Expose())
+		switch {
+		case err != nil:
+			errs.add("database.system_url", "is not a valid PostgreSQL URL")
+		case u.Scheme != "postgres" && u.Scheme != "postgresql":
+			errs.add("database.system_url", fmt.Sprintf("must use the postgres:// or postgresql:// scheme (got %q)", u.Scheme))
+		case u.Host == "":
+			errs.add("database.system_url", "has no host")
+		}
+		if c.Database.SystemURL.Expose() == c.Database.URL.Expose() && c.Environment.IsProduction() {
+			errs.add("database.system_url",
+				"is identical to database.url; the two must be different roles or row-level security is not enforced (see deploy/roles.sql)")
+		}
+	}
+
 	if c.Database.MaxOpenConns <= 0 {
 		errs.add("database.max_open_conns", "must be positive")
 	}

@@ -61,15 +61,28 @@ plain `CREATE INDEX` blocks nothing. The first index added to a populated table 
 | `000002_tenancy_and_identity` | `tenant`, `app_user`, `credential`, `idp_connection`, `identity`, `session`, `refresh_token` | M0-5 |
 | `000003_groups` | `group_`, `group_member` | M0-5 |
 | `000004_applications_and_permissions` | `application`, `environment`, `app_enrollment`, `resource_type`, `action`, `permission` | M0-5 |
+| `000005_row_level_security` | Policies on every tenant-scoped table, plus `tenant_isolation_registry` | M0-6 |
 
-Still to come: row-level security policies (M0-6), roles and grants (M2-1), resource
-instances and hierarchy (M7), UI elements and bindings (M5), audit and decision events
-(M2-12, M2-8).
+Still to come: roles and grants (M2-1), resource instances and hierarchy (M7), UI
+elements and bindings (M5), audit and decision events (M2-12, M2-8).
 
-> **Row-level security is not enabled yet.** The tables above carry `tenant_id` and are
-> ready for it, but the policies and the connection wrapper that sets
-> `warden.tenant_id` arrive with task M0-6. Until then, tenant scoping rests on
-> application-level filtering alone. Do not deploy this schema.
+## Tenant isolation
+
+Every tenant-scoped table has row-level security **enabled and forced**, with a
+policy comparing `tenant_id` to the `warden.tenant_id` session setting. `FORCE` is
+what makes it real: `ENABLE` alone exempts the table's owner, so a deployment serving
+traffic as the owner would have isolation switched on and doing nothing, with no
+symptom at all.
+
+Warden sets the variable through `store.InTenant`, which uses `SET LOCAL` semantics so
+the scope cannot outlive its transaction and leak to the next user of a pooled
+connection. A query issued with no scope declared sees nothing: `current_setting(...,
+true)` returns NULL for a missing setting, and NULL equals nothing.
+
+Adding a table means classifying it in `tenant_isolation_registry` — the test in
+`internal/store` compares that registry against the schema in both directions, so a
+new table cannot silently escape a policy. Two roles are needed in production; see
+[`../../deploy/roles.sql`](../../deploy/roles.sql).
 
 ## Naming
 

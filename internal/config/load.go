@@ -122,6 +122,8 @@ func fields() []field {
 
 		{"database-url", "WARDEN_DATABASE_URL", "PostgreSQL connection string (required)",
 			func(c *Config, v string) error { c.Database.URL = secrets.New(v); return nil }},
+		{"database-system-url", "WARDEN_DATABASE_SYSTEM_URL", "PostgreSQL connection string for cross-tenant work; the role holds BYPASSRLS",
+			func(c *Config, v string) error { c.Database.SystemURL = secrets.New(v); return nil }},
 		{"database-max-open-conns", "WARDEN_DATABASE_MAX_OPEN_CONNS", "maximum open database connections",
 			intSetter(func(c *Config) *int { return &c.Database.MaxOpenConns })},
 		{"database-max-idle-conns", "WARDEN_DATABASE_MAX_IDLE_CONNS", "maximum idle database connections",

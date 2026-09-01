@@ -69,6 +69,8 @@ CREATE TABLE public.app_enrollment (
     settings jsonb DEFAULT '{}'::jsonb NOT NULL
 );
 
+ALTER TABLE ONLY public.app_enrollment FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: TABLE app_enrollment; Type: COMMENT; Schema: public; Owner: -
 --
@@ -95,6 +97,8 @@ CREATE TABLE public.app_user (
     CONSTRAINT app_user_id_check CHECK ((id ~~ 'usr\_%'::text)),
     CONSTRAINT app_user_status_valid CHECK ((status = ANY (ARRAY['invited'::text, 'active'::text, 'suspended'::text, 'deprovisioned'::text])))
 );
+
+ALTER TABLE ONLY public.app_user FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: COLUMN app_user.status; Type: COMMENT; Schema: public; Owner: -
@@ -148,6 +152,8 @@ CREATE TABLE public.credential (
     CONSTRAINT credential_type_valid CHECK ((type = ANY (ARRAY['password'::text, 'totp'::text, 'webauthn'::text, 'recovery_code'::text])))
 );
 
+ALTER TABLE ONLY public.credential FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: environment; Type: TABLE; Schema: public; Owner: -
 --
@@ -186,6 +192,8 @@ CREATE TABLE public.group_ (
     CONSTRAINT group_source_valid CHECK ((source = ANY (ARRAY['local'::text, 'idp'::text, 'scim'::text])))
 );
 
+ALTER TABLE ONLY public.group_ FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: group_member; Type: TABLE; Schema: public; Owner: -
 --
@@ -202,6 +210,8 @@ CREATE TABLE public.group_member (
     CONSTRAINT group_member_source_valid CHECK ((source = ANY (ARRAY['local'::text, 'idp'::text, 'scim'::text])))
 );
 
+ALTER TABLE ONLY public.group_member FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: identity; Type: TABLE; Schema: public; Owner: -
 --
@@ -216,6 +226,8 @@ CREATE TABLE public.identity (
     linked_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT identity_id_check CHECK ((id ~~ 'idn\_%'::text))
 );
+
+ALTER TABLE ONLY public.identity FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: idp_connection; Type: TABLE; Schema: public; Owner: -
@@ -238,6 +250,8 @@ CREATE TABLE public.idp_connection (
     CONSTRAINT idp_connection_jit_policy_valid CHECK ((jit_policy = ANY (ARRAY['create'::text, 'link_only'::text, 'deny_unknown'::text]))),
     CONSTRAINT idp_connection_kind_valid CHECK ((kind = ANY (ARRAY['oidc'::text, 'saml'::text, 'local'::text])))
 );
+
+ALTER TABLE ONLY public.idp_connection FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: COLUMN idp_connection.email_trusted; Type: COMMENT; Schema: public; Owner: -
@@ -285,6 +299,8 @@ CREATE TABLE public.refresh_token (
     CONSTRAINT refresh_token_id_check CHECK ((id ~~ 'rft\_%'::text))
 );
 
+ALTER TABLE ONLY public.refresh_token FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: resource_type; Type: TABLE; Schema: public; Owner: -
 --
@@ -330,6 +346,8 @@ CREATE TABLE public.session (
     CONSTRAINT session_id_check CHECK ((id ~~ 'ses\_%'::text))
 );
 
+ALTER TABLE ONLY public.session FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: TABLE session; Type: COMMENT; Schema: public; Owner: -
 --
@@ -354,6 +372,8 @@ CREATE TABLE public.tenant (
     CONSTRAINT tenant_status_valid CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'deleted'::text])))
 );
 
+ALTER TABLE ONLY public.tenant FORCE ROW LEVEL SECURITY;
+
 --
 -- Name: TABLE tenant; Type: COMMENT; Schema: public; Owner: -
 --
@@ -365,6 +385,23 @@ COMMENT ON TABLE public.tenant IS 'An isolated customer space. The isolation bou
 --
 
 COMMENT ON COLUMN public.tenant.permission_rev IS 'Incremented on every authorization-affecting write; the consistency token (SPEC §10.5).';
+
+--
+-- Name: tenant_isolation_registry; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_isolation_registry (
+    table_name text NOT NULL,
+    tenant_scoped boolean NOT NULL,
+    rationale text,
+    CONSTRAINT tenant_isolation_registry_global_needs_rationale CHECK ((tenant_scoped OR (rationale IS NOT NULL)))
+);
+
+--
+-- Name: TABLE tenant_isolation_registry; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_isolation_registry IS 'Declares, per table, whether it holds tenant-scoped data. The isolation test in internal/store cross-checks this against pg_class, so a new table cannot silently escape row-level security.';
 
 --
 -- Name: action action_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -484,6 +521,13 @@ ALTER TABLE ONLY public.session
 
 ALTER TABLE ONLY public.session
     ADD CONSTRAINT session_pkey PRIMARY KEY (id);
+
+--
+-- Name: tenant_isolation_registry tenant_isolation_registry_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_isolation_registry
+    ADD CONSTRAINT tenant_isolation_registry_pkey PRIMARY KEY (table_name);
 
 --
 -- Name: tenant tenant_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -925,6 +969,126 @@ ALTER TABLE ONLY public.session
 
 ALTER TABLE ONLY public.session
     ADD CONSTRAINT session_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.app_user(id) ON DELETE CASCADE;
+
+--
+-- Name: app_enrollment; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.app_enrollment ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: app_user; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.app_user ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: credential; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.credential ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: group_; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.group_ ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: group_member; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.group_member ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: identity; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.identity ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: idp_connection; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.idp_connection ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: refresh_token; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.refresh_token ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: session; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.session ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: tenant; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.tenant ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: app_enrollment tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.app_enrollment USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: app_user tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.app_user USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: credential tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.credential USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: group_ tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.group_ USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: group_member tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.group_member USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: identity tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.identity USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: idp_connection tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.idp_connection USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: refresh_token tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.refresh_token USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: session tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.session USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: tenant tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.tenant USING ((id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((id = current_setting('warden.tenant_id'::text, true)));
 
 --
 -- PostgreSQL database dump complete

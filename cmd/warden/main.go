@@ -15,6 +15,7 @@ import (
 
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/secrets"
+	"github.com/warden-project/warden/internal/store"
 )
 
 // version is stamped at build time:
@@ -95,6 +96,11 @@ func runConfigCheck(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "  http         %s\n", cfg.HTTP.Addr)
 	fmt.Fprintf(stdout, "  database     %s\n", cfg.Database.URL)
 	fmt.Fprintf(stdout, "  cache        %s %s\n", cfg.Cache.Backend, cfg.Cache.URL)
+	if cfg.Database.SystemURL.IsZero() {
+		fmt.Fprintf(stdout, "  system db    not configured — migrations, bootstrap and cross-tenant jobs are unavailable\n")
+	} else {
+		fmt.Fprintf(stdout, "  system db    %s\n", cfg.Database.SystemURL)
+	}
 
 	// The keyring was already built during validation; building it again here is
 	// cheap and lets the command report which key is active, which is what an
@@ -132,14 +138,27 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		"kek_active", keyring.ActiveKeyID(),
 	)
 
-	// The HTTP listener, the database pool and the role-specific services attach
-	// here. They arrive with M0-6 (tenant-scoped store), M0-7 (query layer) and
-	// M0-10 (health and metrics); until then this proves the startup path —
-	// configuration resolved, secrets loaded, signals handled — end to end.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Warn("no server roles are implemented yet; holding until interrupted (tasks M0-6, M0-7, M0-10)")
+	// Opening the pool verifies that the request-serving role cannot bypass
+	// row-level security, and refuses to continue in production if it can. That
+	// check has to happen before anything serves traffic: a deployment with the
+	// wrong role has no tenant isolation and no symptom.
+	db, err := store.Open(ctx, cfg, store.TenantScoped)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	log.Info("database connected", "role", db.Role(), "access", db.Access().String())
+	if warning := db.IsolationWarning(); warning != "" {
+		log.Warn("TENANT ISOLATION IS NOT ENFORCED BY THE DATABASE", "detail", warning)
+	}
+
+	// The HTTP listener and the role-specific services attach here; they arrive with
+	// M0-7 (query layer) and M0-10 (health and metrics).
+	log.Warn("no server roles are implemented yet; holding until interrupted (tasks M0-7, M0-10)")
 	<-ctx.Done()
 	log.Info("shutting down", "grace_period", cfg.HTTP.ShutdownTimeout)
 	return nil

@@ -90,10 +90,25 @@ type HTTPConfig struct {
 
 // DatabaseConfig configures the Postgres system of record.
 type DatabaseConfig struct {
-	// URL is a libpq connection string. No default: there is no sensible guess, and
-	// a default pointing at localhost invites a production process to come up
-	// against the wrong database.
+	// URL is a libpq connection string for the role that serves requests. No
+	// default: there is no sensible guess, and a default pointing at localhost
+	// invites a production process to come up against the wrong database.
+	//
+	// This role must NOT be able to bypass row-level security. Warden verifies that
+	// at startup and refuses to serve production traffic if it can, because a
+	// request-serving role with BYPASSRLS has tenant isolation switched off with no
+	// outward symptom at all. See deploy/roles.sql.
 	URL secrets.Secret `yaml:"url"`
+
+	// SystemURL is the connection for work that is inherently cross-tenant:
+	// migrations, `warden init`, and background jobs such as assignment expiry. The
+	// role behind it holds BYPASSRLS, and everything it does is audited precisely
+	// because the database is not constraining it (SPEC §6.2).
+	//
+	// Optional. Without it Warden serves tenant traffic normally and reports that
+	// cross-tenant operations are unavailable, rather than quietly running them
+	// through a connection that cannot see the rows.
+	SystemURL secrets.Secret `yaml:"system_url"`
 
 	MaxOpenConns    int           `yaml:"max_open_conns"`
 	MaxIdleConns    int           `yaml:"max_idle_conns"`

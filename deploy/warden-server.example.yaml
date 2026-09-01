@@ -36,8 +36,21 @@ http:
   trusted_proxy_cidrs: []
 
 database:
-  # Prefer WARDEN_DATABASE_URL over writing the password into this file.
-  url: postgres://warden@localhost:5432/warden?sslmode=verify-full
+  # The role that serves requests. Prefer WARDEN_DATABASE_URL over writing a password
+  # into this file.
+  #
+  # This role must NOT be able to bypass row-level security — Warden checks at startup
+  # and refuses to serve production traffic if it can, because a request-serving role
+  # with BYPASSRLS has tenant isolation switched off with no visible symptom. Create
+  # the roles with deploy/roles.sql.
+  url: postgres://warden_app@localhost:5432/warden?sslmode=verify-full
+
+  # Optional. The role for work that is inherently cross-tenant: migrations,
+  # `warden init`, and background jobs such as assignment expiry. It holds BYPASSRLS,
+  # and everything it does is audited precisely because the database is not
+  # constraining it (SPEC §6.2). Without it, those operations are unavailable and
+  # Warden says so rather than running them blind.
+  system_url: postgres://warden_system@localhost:5432/warden?sslmode=verify-full
   max_open_conns: 25
   max_idle_conns: 5
   conn_max_lifetime: 30m
