@@ -1,0 +1,107 @@
+suite: validity-windows
+spec: "§9.5, §9.8"
+description: >
+  Time-boxed assignments. A grant outside its window is not a grant the subject does
+  not have — it is one that has expired or not yet begun, and saying so is what makes
+  a time-boxed elevation debuggable. The window is half-open: valid_from is inclusive
+  and valid_until is the first instant at which the grant no longer applies.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve]
+
+  roles:
+    - key: billing.viewer
+      permissions: [billing.invoice:read]
+    - key: billing.approver
+      permissions: [billing.invoice:approve]
+
+  tenants:
+    - key: acme
+      users:
+        - key: temp
+        - key: future
+        - key: permanent
+      grants:
+        # A four-hour elevation on 2026-08-21.
+        - id: grn_elevation
+          subject: { user: temp }
+          role: billing.approver
+          scope: tenant
+          valid_from: "2026-08-21T10:00:00Z"
+          valid_until: "2026-08-21T14:00:00Z"
+
+        - id: grn_not_yet
+          subject: { user: future }
+          role: billing.approver
+          scope: tenant
+          valid_from: "2027-01-01T00:00:00Z"
+
+        - id: grn_permanent
+          subject: { user: permanent }
+          role: billing.viewer
+          scope: tenant
+
+checks:
+  - name: inside the window the grant applies
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:approve
+    now: "2026-08-21T12:00:00Z"
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_elevation }
+
+  - name: valid_from is inclusive
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:approve
+    now: "2026-08-21T10:00:00Z"
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_elevation }
+
+  # Half-open: the grant is gone at exactly valid_until, not one moment later. Getting
+  # this wrong by one instant is the classic off-by-one in an expiry.
+  - name: valid_until is exclusive
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:approve
+    now: "2026-08-21T14:00:00Z"
+    expect: { allowed: false, reason: grant_expired }
+
+  - name: after the window the grant has expired
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:approve
+    now: "2026-08-21T14:00:01Z"
+    expect: { allowed: false, reason: grant_expired }
+
+  - name: before the window the grant has not begun
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:approve
+    now: "2026-08-21T09:59:59Z"
+    expect: { allowed: false, reason: grant_expired }
+
+  - name: a grant that starts in the future does not apply yet
+    tenant: acme
+    subject: future
+    permission: billing.invoice:approve
+    now: "2026-08-21T12:00:00Z"
+    expect: { allowed: false, reason: grant_expired }
+
+  # An expired grant is distinguishable from no grant at all, which is the whole
+  # point of the separate reason code.
+  - name: a permission nobody ever granted is not reported as expired
+    tenant: acme
+    subject: temp
+    permission: billing.invoice:read
+    now: "2026-08-21T20:00:00Z"
+    expect: { allowed: false, reason: no_grant }
+
+  - name: a grant with no window is unaffected by the clock
+    tenant: acme
+    subject: permanent
+    permission: billing.invoice:read
+    now: "2099-01-01T00:00:00Z"
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_permanent }

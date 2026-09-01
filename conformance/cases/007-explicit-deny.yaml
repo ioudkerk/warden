@@ -1,0 +1,112 @@
+suite: explicit-deny
+spec: "§9.7"
+description: >
+  Precedence is explicit deny > explicit allow > implicit deny. A deny cannot be
+  out-voted by any number of grants, by a wider scope, or by a role that would
+  otherwise allow — but it reaches only as far as its own scope, and only the
+  permissions it names.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: project
+          actions: [read]
+        - key: invoice
+          parent: project
+          actions: [read, approve, void]
+
+  roles:
+    - key: billing.admin
+      permissions: [billing.invoice:read, billing.invoice:approve, billing.invoice:void, billing.project:read]
+
+  tenants:
+    - key: acme
+      users:
+        - key: contractor
+        - key: staffer
+      groups:
+        - key: g_contractors
+          members: [contractor]
+
+      resources:
+        - ref: billing.project:alpha
+        - ref: billing.project:beta
+        - ref: billing.invoice:a1
+          parent: billing.project:alpha
+        - ref: billing.invoice:b1
+          parent: billing.project:beta
+
+      grants:
+        # Deliberately generous: the deny has to beat a tenant-wide admin role, and
+        # a second overlapping grant, to prove precedence rather than luck.
+        - id: grn_contractor_admin
+          subject: { user: contractor }
+          role: billing.admin
+          scope: tenant
+        - id: grn_contractor_admin_again
+          subject: { group: g_contractors }
+          role: billing.admin
+          scope: billing.project:alpha/**
+        - id: grn_staffer_admin
+          subject: { user: staffer }
+          role: billing.admin
+          scope: tenant
+
+      denials:
+        - id: den_void_anywhere
+          subject: { user: contractor }
+          permission: billing.invoice:void
+          scope: tenant
+          reason: Contractors may never void an invoice.
+
+        - id: den_group_read_alpha
+          subject: { group: g_contractors }
+          permission: billing.invoice:read
+          scope: billing.project:alpha/**
+          reason: Project alpha holds regulated data.
+
+checks:
+  - name: an explicit deny beats a tenant-wide allow
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:void
+    resource: billing.invoice:b1
+    expect: { allowed: false, reason: explicit_deny }
+
+  - name: an explicit deny beats two overlapping allows
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:void
+    resource: billing.invoice:a1
+    expect: { allowed: false, reason: explicit_deny }
+
+  - name: a deny reaches only the permission it names
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:approve
+    resource: billing.invoice:a1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_contractor_admin }
+
+  # A group-scoped deny applies to the group's members.
+  - name: a deny on a group applies to its members
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: false, reason: explicit_deny }
+
+  # ...and stops at the boundary of its own scope, exactly like a grant.
+  - name: a scoped deny does not reach outside its scope
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:read
+    resource: billing.invoice:b1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_contractor_admin }
+
+  - name: a deny on one subject does not affect another
+    tenant: acme
+    subject: staffer
+    permission: billing.invoice:void
+    resource: billing.invoice:a1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_staffer_admin }

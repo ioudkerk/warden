@@ -1,0 +1,150 @@
+suite: wildcards-and-implies
+spec: "§9.2"
+description: >
+  The two ways a role grants more than it lists. Wildcards are legal in a grant and
+  never in a check. Action implication is expanded into the closure when the model is
+  loaded, not walked during a check, and it is transitive.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions:
+            - key: read
+            - key: write
+              implies: [read]
+            # Transitive: manage → write → read.
+            - key: manage
+              implies: [write, delete]
+            - key: delete
+            - key: approve
+        - key: report
+          actions: [read, write]
+    - key: shipping
+      resource_types:
+        - key: parcel
+          actions: [read]
+
+  roles:
+    - key: invoice.everything
+      permissions: [billing.invoice:*]
+    - key: billing.reader
+      permissions: [billing.*:read]
+    - key: billing.everything
+      permissions: [billing.*:*]
+    - key: invoice.manager
+      permissions: [billing.invoice:manage]
+
+  tenants:
+    - key: acme
+      users:
+        - key: star_action
+        - key: star_type
+        - key: star_both
+        - key: manager
+      grants:
+        - id: grn_star_action
+          subject: { user: star_action }
+          role: invoice.everything
+          scope: tenant
+        - id: grn_star_type
+          subject: { user: star_type }
+          role: billing.reader
+          scope: tenant
+        - id: grn_star_both
+          subject: { user: star_both }
+          role: billing.everything
+          scope: tenant
+        - id: grn_manager
+          subject: { user: manager }
+          role: invoice.manager
+          scope: tenant
+
+checks:
+  # --- billing.invoice:* --------------------------------------------------------
+  - name: an action wildcard covers every action on its resource type
+    tenant: acme
+    subject: star_action
+    permission: billing.invoice:approve
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_star_action }
+
+  - name: an action wildcard does not cross to another resource type
+    tenant: acme
+    subject: star_action
+    permission: billing.report:read
+    expect: { allowed: false, reason: no_grant }
+
+  # --- billing.*:read -----------------------------------------------------------
+  - name: a resource-type wildcard covers that action on every type
+    tenant: acme
+    subject: star_type
+    permission: billing.report:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_star_type }
+
+  - name: a resource-type wildcard does not cross to another action
+    tenant: acme
+    subject: star_type
+    permission: billing.report:write
+    expect: { allowed: false, reason: no_grant }
+
+  - name: a resource-type wildcard does not cross to another application
+    tenant: acme
+    subject: star_type
+    permission: shipping.parcel:read
+    expect: { allowed: false, reason: no_grant }
+
+  # --- billing.*:* --------------------------------------------------------------
+  - name: a full wildcard covers the whole application
+    tenant: acme
+    subject: star_both
+    permission: billing.invoice:delete
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_star_both }
+
+  # There is no cross-application wildcard: the application segment is always literal.
+  - name: a full wildcard is still confined to its application
+    tenant: acme
+    subject: star_both
+    permission: shipping.parcel:read
+    expect: { allowed: false, reason: no_grant }
+
+  # A wildcard grant does not widen the permission *surface*: an action nobody
+  # declared is still a typo.
+  - name: a wildcard does not make an undeclared permission valid
+    tenant: acme
+    subject: star_both
+    permission: billing.invoice:incinerate
+    expect: { allowed: false, reason: unknown_permission }
+
+  # --- implies ------------------------------------------------------------------
+  - name: the granted action itself
+    tenant: acme
+    subject: manager
+    permission: billing.invoice:manage
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_manager }
+
+  - name: a directly implied action
+    tenant: acme
+    subject: manager
+    permission: billing.invoice:delete
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_manager }
+
+  - name: another directly implied action
+    tenant: acme
+    subject: manager
+    permission: billing.invoice:write
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_manager }
+
+  # manage implies write, and write implies read.
+  - name: implication is transitive
+    tenant: acme
+    subject: manager
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_manager }
+
+  # Implication is one-directional: nothing implies approve.
+  - name: implication does not reach an unrelated action
+    tenant: acme
+    subject: manager
+    permission: billing.invoice:approve
+    expect: { allowed: false, reason: no_grant }

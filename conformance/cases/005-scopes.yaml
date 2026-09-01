@@ -1,0 +1,209 @@
+suite: scopes
+spec: "§9.5"
+description: >
+  Every scope form in the specification's table, each with the near-miss that must
+  not match. A grant that exists but does not reach the requested object denies with
+  out_of_scope, which is a different fact from holding no grant at all — and the
+  difference is what makes a support conversation short.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: project
+          actions: [read]
+        - key: invoice
+          parent: project
+          actions: [read]
+        - key: line_item
+          parent: invoice
+          actions: [read]
+    - key: shipping
+      resource_types:
+        - key: parcel
+          actions: [read]
+
+  roles:
+    - key: billing.viewer
+      permissions: [billing.invoice:read, billing.project:read, billing.line_item:read]
+    - key: shipping.viewer
+      permissions: [shipping.parcel:read]
+    - key: everything.viewer
+      permissions: [billing.invoice:read, shipping.parcel:read]
+
+  tenants:
+    - key: acme
+      users:
+        - key: tenant_wide
+        - key: app_wide
+        - key: env_bound
+        - key: instance_bound
+        - key: subtree_bound
+
+      resources:
+        - ref: billing.project:alpha
+        - ref: billing.project:beta
+        - ref: billing.invoice:a1
+          parent: billing.project:alpha
+        - ref: billing.invoice:b1
+          parent: billing.project:beta
+        - ref: billing.line_item:a1-1
+          parent: billing.invoice:a1
+        - ref: shipping.parcel:p1
+
+      grants:
+        - id: grn_tenant
+          subject: { user: tenant_wide }
+          role: everything.viewer
+          scope: tenant
+
+        - id: grn_app
+          subject: { user: app_wide }
+          role: everything.viewer
+          scope: app:billing
+
+        - id: grn_env
+          subject: { user: env_bound }
+          role: billing.viewer
+          scope: app:billing/env:prod
+
+        - id: grn_instance
+          subject: { user: instance_bound }
+          role: billing.viewer
+          scope: billing.project:alpha
+
+        - id: grn_subtree
+          subject: { user: subtree_bound }
+          role: billing.viewer
+          scope: billing.project:alpha/**
+
+checks:
+  # --- tenant scope: everything in the tenant, across applications ---------------
+  - name: tenant scope reaches one application
+    tenant: acme
+    subject: tenant_wide
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_tenant }
+
+  - name: tenant scope reaches another application
+    tenant: acme
+    subject: tenant_wide
+    permission: shipping.parcel:read
+    resource: shipping.parcel:p1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_tenant }
+
+  - name: tenant scope covers a check with no resource
+    tenant: acme
+    subject: tenant_wide
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_tenant }
+
+  # --- application scope --------------------------------------------------------
+  - name: application scope reaches its own application
+    tenant: acme
+    subject: app_wide
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_app }
+
+  - name: application scope does not reach another application
+    tenant: acme
+    subject: app_wide
+    permission: shipping.parcel:read
+    resource: shipping.parcel:p1
+    expect: { allowed: false, reason: out_of_scope }
+
+  # --- environment scope --------------------------------------------------------
+  - name: environment scope applies in its own environment
+    tenant: acme
+    subject: env_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    environment: prod
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_env }
+
+  - name: environment scope does not apply in another environment
+    tenant: acme
+    subject: env_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    environment: staging
+    expect: { allowed: false, reason: out_of_scope }
+
+  # A check that does not say which environment it is in cannot be shown to be in the
+  # granted one. Denying is the safe reading.
+  - name: environment scope does not apply when the check names no environment
+    tenant: acme
+    subject: env_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: false, reason: out_of_scope }
+
+  # --- resource instance scope --------------------------------------------------
+  - name: instance scope covers exactly that object
+    tenant: acme
+    subject: instance_bound
+    permission: billing.project:read
+    resource: billing.project:alpha
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_instance }
+
+  - name: instance scope does not cover a sibling
+    tenant: acme
+    subject: instance_bound
+    permission: billing.project:read
+    resource: billing.project:beta
+    expect: { allowed: false, reason: out_of_scope }
+
+  # The distinction between an instance grant and a subtree grant: without /** the
+  # grant stops at the object itself.
+  - name: instance scope does not cascade to a child
+    tenant: acme
+    subject: instance_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: false, reason: out_of_scope }
+
+  - name: instance scope cannot satisfy a check with no resource
+    tenant: acme
+    subject: instance_bound
+    permission: billing.project:read
+    expect: { allowed: false, reason: out_of_scope }
+
+  # --- resource subtree scope ---------------------------------------------------
+  - name: subtree scope covers the root itself
+    tenant: acme
+    subject: subtree_bound
+    permission: billing.project:read
+    resource: billing.project:alpha
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_subtree }
+
+  - name: subtree scope cascades one level down
+    tenant: acme
+    subject: subtree_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:a1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_subtree }
+
+  - name: subtree scope cascades two levels down
+    tenant: acme
+    subject: subtree_bound
+    permission: billing.line_item:read
+    resource: billing.line_item:a1-1
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_subtree }
+
+  - name: subtree scope does not reach a different branch
+    tenant: acme
+    subject: subtree_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:b1
+    expect: { allowed: false, reason: out_of_scope }
+
+  # An application that does not register its object graph loses only the cascade
+  # (SPEC §9.5). An unregistered resource has no parent, so nothing cascades to it.
+  - name: subtree scope does not reach an unregistered resource
+    tenant: acme
+    subject: subtree_bound
+    permission: billing.invoice:read
+    resource: billing.invoice:never-registered
+    expect: { allowed: false, reason: out_of_scope }

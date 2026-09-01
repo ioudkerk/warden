@@ -1,0 +1,124 @@
+suite: conditions
+spec: "§9.6"
+description: >
+  The ABAC layer. Conditions narrow a grant and never widen it; an attribute that
+  cannot be resolved denies with missing_attribute rather than being treated as
+  absent-and-therefore-true; and attributes passed by the caller take precedence over
+  those registered on the instance, because the application owns its objects.
+
+now: "2026-08-21T14:00:00Z"
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve]
+
+  roles:
+    - key: billing.approver
+      permissions: [billing.invoice:approve, billing.invoice:read]
+
+  tenants:
+    - key: acme
+      users:
+        - key: maria
+          attributes: { department: finance, approval_limit: 50000 }
+        - key: no_limit_set
+          attributes: { department: finance }
+        - key: sales_person
+          attributes: { department: sales, approval_limit: 50000 }
+
+      resources:
+        - ref: billing.invoice:small
+          attributes: { amount: 100, status: pending, department: finance }
+        - ref: billing.invoice:large
+          attributes: { amount: 999999, status: pending, department: finance }
+        - ref: billing.invoice:no_amount
+          attributes: { status: pending, department: finance }
+
+      grants:
+        - id: grn_within_limit
+          subject: { user: maria }
+          role: billing.approver
+          scope: tenant
+          condition: "resource.attributes.amount <= subject.attributes.approval_limit"
+
+        - id: grn_no_limit_attr
+          subject: { user: no_limit_set }
+          role: billing.approver
+          scope: tenant
+          condition: "resource.attributes.amount <= subject.attributes.approval_limit"
+
+        - id: grn_same_department
+          subject: { user: sales_person }
+          role: billing.approver
+          scope: tenant
+          condition: "subject.attributes.department == resource.attributes.department"
+
+checks:
+  - name: a condition that holds allows
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:small
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_within_limit }
+
+  - name: a condition that does not hold denies
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:large
+    expect: { allowed: false, reason: condition_failed }
+
+  # SPEC §9.6: "If a condition references an attribute that cannot be resolved, the
+  # result is deny with reason missing_attribute, never silently true."
+  - name: a missing resource attribute denies as missing, not as failed
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:no_amount
+    expect: { allowed: false, reason: missing_attribute }
+
+  - name: a missing subject attribute denies as missing
+    tenant: acme
+    subject: no_limit_set
+    permission: billing.invoice:approve
+    resource: billing.invoice:small
+    expect: { allowed: false, reason: missing_attribute }
+
+  - name: comparing two attributes that differ denies
+    tenant: acme
+    subject: sales_person
+    permission: billing.invoice:approve
+    resource: billing.invoice:small
+    expect: { allowed: false, reason: condition_failed }
+
+  # Attribute sourcing order: inline beats registered, because the caller holds the
+  # current value and the registered copy may be stale.
+  - name: inline attributes override the registered ones
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:large
+    attributes: { amount: 10 }
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_within_limit }
+
+  - name: inline attributes can also make a passing condition fail
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:small
+    attributes: { amount: 60000 }
+    expect: { allowed: false, reason: condition_failed }
+
+  # A condition is attached to the *grant*, not to one permission within it, so it
+  # constrains every permission the granted role carries. billing.approver gives read
+  # as well as approve, and both are narrowed by the approval limit. This is easy to
+  # get wrong in either direction, so it is pinned explicitly.
+  - name: a grant condition constrains every permission the role carries
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:read
+    resource: billing.invoice:large
+    expect: { allowed: false, reason: condition_failed }

@@ -1,0 +1,98 @@
+suite: role-inheritance
+spec: "§9.3"
+description: >
+  Role inheritance is a DAG, and expansion is transitive. A role's holder gets every
+  permission of every role above it, however many levels up and however many paths
+  lead there — but inheritance never flows downward.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve, void, export]
+
+  roles:
+    - key: base.reader
+      permissions: [billing.invoice:read]
+
+    - key: base.exporter
+      permissions: [billing.invoice:export]
+
+    # Two levels up from admin, and reachable by two distinct paths.
+    - key: billing.approver
+      inherits: [base.reader]
+      permissions: [billing.invoice:approve]
+
+    - key: billing.admin
+      inherits: [billing.approver, base.exporter]
+      permissions: [billing.invoice:void]
+
+    # Inherits nothing; exists to prove inheritance is not symmetric.
+    - key: billing.void_only
+      permissions: [billing.invoice:void]
+
+  tenants:
+    - key: acme
+      users:
+        - key: admin
+        - key: approver
+        - key: voider
+      grants:
+        - id: grn_admin
+          subject: { user: admin }
+          role: billing.admin
+          scope: tenant
+        - id: grn_approver
+          subject: { user: approver }
+          role: billing.approver
+          scope: tenant
+        - id: grn_voider
+          subject: { user: voider }
+          role: billing.void_only
+          scope: tenant
+
+checks:
+  - name: a role's own permission
+    tenant: acme
+    subject: admin
+    permission: billing.invoice:void
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_admin }
+
+  - name: one level of inheritance
+    tenant: acme
+    subject: admin
+    permission: billing.invoice:approve
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_admin }
+
+  - name: two levels of inheritance, through the approver
+    tenant: acme
+    subject: admin
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_admin }
+
+  - name: the second inheritance path is followed too
+    tenant: acme
+    subject: admin
+    permission: billing.invoice:export
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_admin }
+
+  - name: an inherited role's holder gets its parents
+    tenant: acme
+    subject: approver
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_approver }
+
+  # The direction matters. billing.admin inherits billing.approver, so an approver
+  # must NOT receive the admin's permissions.
+  - name: inheritance does not flow downward
+    tenant: acme
+    subject: approver
+    permission: billing.invoice:void
+    expect: { allowed: false, reason: no_grant }
+
+  - name: a role that inherits nothing gets nothing extra
+    tenant: acme
+    subject: voider
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: no_grant }

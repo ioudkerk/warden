@@ -1,0 +1,136 @@
+suite: worked-example
+spec: "§9.9"
+description: >
+  The worked example from the specification, transcribed exactly. If this case ever
+  fails, either an implementation is wrong or the specification changed — and the
+  specification changing without this case changing is itself the bug.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: project
+          actions: [read, manage]
+        - key: invoice
+          parent: project
+          actions: [read, approve, void]
+
+  roles:
+    - key: billing.viewer
+      permissions:
+        - billing.invoice:read
+        - billing.project:read
+
+    - key: billing.approver
+      inherits: [billing.viewer]
+      permissions:
+        - billing.invoice:approve
+
+    - key: billing.admin
+      inherits: [billing.approver]
+      permissions:
+        - billing.invoice:void
+        - billing.project:manage
+
+  tenants:
+    - key: acme
+      users:
+        - key: maria
+        - key: contractor
+
+      groups:
+        - key: g_finance
+          members: [maria, contractor]
+
+      resources:
+        - ref: billing.project:acme-2026
+        - ref: billing.project:other
+        - ref: billing.invoice:4711
+          parent: billing.project:acme-2026
+          attributes: { amount: 30000, status: pending }
+        - ref: billing.invoice:4712
+          parent: billing.project:acme-2026
+          attributes: { amount: 90000, status: pending }
+        - ref: billing.invoice:9002
+          parent: billing.project:other
+          attributes: { amount: 30000, status: pending }
+
+      grants:
+        - id: grn_finance_viewer
+          subject: { group: g_finance }
+          role: billing.viewer
+          scope: tenant
+
+        - id: grn_maria_approver
+          subject: { user: maria }
+          role: billing.approver
+          scope: billing.project:acme-2026/**
+          condition: "resource.attributes.amount <= 50000"
+
+      denials:
+        - id: den_contractor_void
+          subject: { user: contractor }
+          permission: billing.invoice:void
+          scope: tenant
+          reason: A contractor may never void an invoice.
+
+checks:
+  - name: approve an in-scope invoice under the limit
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:4711
+    expect:
+      allowed: true
+      reason: grant_matched
+      matched_grant: grn_maria_approver
+
+  - name: approve an invoice in another project is out of scope
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:9002
+    expect:
+      allowed: false
+      reason: out_of_scope
+
+  - name: approve an in-scope invoice over the limit fails the condition
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:approve
+    resource: billing.invoice:4712
+    expect:
+      allowed: false
+      reason: condition_failed
+
+  - name: read any invoice, through the tenant-wide group role
+    tenant: acme
+    subject: maria
+    permission: billing.invoice:read
+    resource: billing.invoice:9002
+    expect:
+      allowed: true
+      reason: grant_matched
+      matched_grant: grn_finance_viewer
+
+  # Not in §9.9's table, but the assignment it lists is only meaningful if the deny
+  # actually bites — and the contractor holds billing.viewer, which does not include
+  # void, so the deny must be shown to outrank something that would otherwise allow.
+  - name: the contractor is explicitly denied voiding
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:void
+    resource: billing.invoice:4711
+    expect:
+      allowed: false
+      reason: explicit_deny
+
+  - name: the contractor still reads invoices through the group
+    tenant: acme
+    subject: contractor
+    permission: billing.invoice:read
+    resource: billing.invoice:4711
+    expect:
+      allowed: true
+      reason: grant_matched
+      matched_grant: grn_finance_viewer

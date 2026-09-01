@@ -1,0 +1,100 @@
+suite: rbac-basics
+spec: "§9.1, §9.2, §7.6"
+description: >
+  The floor of the model: nothing is granted by default, an undeclared permission is
+  a typo rather than a missing grant, and a subject who is not active cannot be
+  allowed no matter what they hold.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve]
+
+  roles:
+    - key: billing.viewer
+      permissions: [billing.invoice:read]
+
+  tenants:
+    - key: acme
+      users:
+        - key: alice
+          status: active
+        - key: invitee
+          status: invited
+        - key: suspended_user
+          status: suspended
+        - key: departed
+          status: deprovisioned
+      grants:
+        - id: grn_alice_viewer
+          subject: { user: alice }
+          role: billing.viewer
+          scope: tenant
+        - id: grn_invitee_viewer
+          subject: { user: invitee }
+          role: billing.viewer
+          scope: tenant
+        - id: grn_suspended_viewer
+          subject: { user: suspended_user }
+          role: billing.viewer
+          scope: tenant
+        - id: grn_departed_viewer
+          subject: { user: departed }
+          role: billing.viewer
+          scope: tenant
+
+checks:
+  - name: a granted permission is allowed
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_alice_viewer }
+
+  # Implicit deny: RBAC grants nothing that was not granted (SPEC §9.1).
+  - name: a permission nobody granted is denied
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:approve
+    expect: { allowed: false, reason: no_grant }
+
+  # SPEC §9.2: an unknown permission denies AND is distinguishable, so a typo
+  # surfaces in staging instead of silently denying in production.
+  - name: an undeclared permission is reported as unknown, not as a missing grant
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:aprove
+    expect: { allowed: false, reason: unknown_permission }
+
+  - name: a permission for an application that does not exist is unknown
+    tenant: acme
+    subject: alice
+    permission: shipping.parcel:read
+    expect: { allowed: false, reason: unknown_permission }
+
+  - name: an unknown subject is distinguishable from an unauthorised one
+    tenant: acme
+    subject: nobody
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: subject_not_found }
+
+  # SPEC §7.6: every lifecycle state but active denies, even where the grant is
+  # perfectly good. Suspension is how an incident is stopped.
+  - name: an invited user cannot use their grants yet
+    tenant: acme
+    subject: invitee
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: subject_inactive }
+
+  - name: a suspended user cannot use their grants
+    tenant: acme
+    subject: suspended_user
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: subject_inactive }
+
+  - name: a deprovisioned user cannot use their grants
+    tenant: acme
+    subject: departed
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: subject_inactive }

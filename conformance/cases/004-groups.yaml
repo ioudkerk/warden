@@ -1,0 +1,79 @@
+suite: groups
+spec: "§9.4"
+description: >
+  Groups receive assignments exactly as users do, and nesting is transitive: a member
+  of a nested group holds the outer group's roles. Membership is not inherited in the
+  other direction, and a group's roles reach only its members.
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve]
+
+  roles:
+    - key: billing.viewer
+      permissions: [billing.invoice:read]
+    - key: billing.approver
+      permissions: [billing.invoice:approve]
+
+  tenants:
+    - key: acme
+      users:
+        - key: deep_member     # in g_emea_finance, three levels down
+        - key: direct_member   # in g_all_staff only
+        - key: outsider        # in no group
+
+      groups:
+        # g_emea_finance ⊂ g_finance ⊂ g_all_staff
+        - key: g_all_staff
+          members: [direct_member, g_finance]
+        - key: g_finance
+          members: [g_emea_finance]
+        - key: g_emea_finance
+          members: [deep_member]
+
+      grants:
+        - id: grn_staff_viewer
+          subject: { group: g_all_staff }
+          role: billing.viewer
+          scope: tenant
+        - id: grn_emea_approver
+          subject: { group: g_emea_finance }
+          role: billing.approver
+          scope: tenant
+
+checks:
+  - name: a direct member holds the group's role
+    tenant: acme
+    subject: direct_member
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_staff_viewer }
+
+  - name: a member of the innermost group holds its role
+    tenant: acme
+    subject: deep_member
+    permission: billing.invoice:approve
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_emea_approver }
+
+  # Two levels of nesting between deep_member and g_all_staff.
+  - name: nesting carries roles transitively, outward
+    tenant: acme
+    subject: deep_member
+    permission: billing.invoice:read
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_staff_viewer }
+
+  # direct_member is in g_all_staff, which CONTAINS g_finance. Being in the outer
+  # group must not confer the inner group's roles.
+  - name: membership does not flow inward
+    tenant: acme
+    subject: direct_member
+    permission: billing.invoice:approve
+    expect: { allowed: false, reason: no_grant }
+
+  - name: a user in no group holds nothing
+    tenant: acme
+    subject: outsider
+    permission: billing.invoice:read
+    expect: { allowed: false, reason: no_grant }

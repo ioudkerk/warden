@@ -1,0 +1,122 @@
+suite: context-and-mfa
+spec: "§9.3, §9.6"
+description: >
+  The parts of a decision that come from the request rather than the model: the
+  caller-supplied context a condition can read, and the role constraint that requires
+  a second factor before a role may be used at all.
+
+now: "2026-08-21T14:00:00Z"
+
+model:
+  applications:
+    - key: billing
+      resource_types:
+        - key: invoice
+          actions: [read, approve, void]
+
+  roles:
+    - key: billing.viewer
+      permissions: [billing.invoice:read]
+
+    # SPEC §9.3: a role constrained to require MFA needs step-up to be *used*, not
+    # merely to be held.
+    - key: billing.destroyer
+      permissions: [billing.invoice:void]
+      requires_mfa: true
+
+  tenants:
+    - key: acme
+      users:
+        - key: alice
+        - key: ops
+
+      grants:
+        - id: grn_office_hours
+          subject: { user: alice }
+          role: billing.viewer
+          scope: tenant
+          condition: 'context.time.getHours("UTC") >= 8 && context.time.getHours("UTC") < 20'
+
+        - id: grn_internal_network
+          subject: { user: alice }
+          role: billing.viewer
+          scope: tenant
+          condition: 'context.ip.inCidr("10.0.0.0/8")'
+
+        - id: grn_destroyer
+          subject: { user: ops }
+          role: billing.destroyer
+          scope: tenant
+
+checks:
+  # context.time defaults to the check's evaluation time when the caller does not
+  # supply one, so a time-of-day condition is reproducible.
+  - name: a time-of-day condition inside the window
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    now: "2026-08-21T14:00:00Z"
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_office_hours }
+
+  - name: a time-of-day condition outside the window
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    now: "2026-08-21T03:00:00Z"
+    context: { ip: "203.0.113.4" }
+    expect: { allowed: false, reason: condition_failed }
+
+  # The second grant's CIDR condition can allow where the first one's clock does not:
+  # candidates are tried until one holds.
+  - name: a second grant allows where the first one's condition failed
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    now: "2026-08-21T03:00:00Z"
+    context: { ip: "10.1.2.3" }
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_internal_network }
+
+  - name: an address outside the block fails the CIDR condition
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    now: "2026-08-21T03:00:00Z"
+    context: { ip: "203.0.113.4" }
+    expect: { allowed: false, reason: condition_failed }
+
+  # A condition reading a context value the caller did not send is a missing
+  # attribute, not a false condition — the same rule as for subject and resource.
+  - name: a condition on an unsupplied context value is a missing attribute
+    tenant: acme
+    subject: alice
+    permission: billing.invoice:read
+    now: "2026-08-21T03:00:00Z"
+    expect: { allowed: false, reason: missing_attribute }
+
+  # --- MFA ----------------------------------------------------------------------
+  - name: an MFA-constrained role is refused without a second factor
+    tenant: acme
+    subject: ops
+    permission: billing.invoice:void
+    context: { amr: [pwd] }
+    expect: { allowed: false, reason: mfa_required }
+
+  - name: an MFA-constrained role is refused when the context says nothing
+    tenant: acme
+    subject: ops
+    permission: billing.invoice:void
+    expect: { allowed: false, reason: mfa_required }
+
+  - name: an MFA-constrained role works with a TOTP second factor
+    tenant: acme
+    subject: ops
+    permission: billing.invoice:void
+    context: { amr: [pwd, otp] }
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_destroyer }
+
+  - name: an MFA-constrained role works with a passkey
+    tenant: acme
+    subject: ops
+    permission: billing.invoice:void
+    context: { amr: [webauthn] }
+    expect: { allowed: true, reason: grant_matched, matched_grant: grn_destroyer }
