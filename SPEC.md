@@ -2,7 +2,10 @@
 
 **Version:** 0.1 (draft)
 **Date:** 2026-08-21
-**Status:** Pre-implementation. Sections marked *(open)* need a decision before the milestone that depends on them.
+**Status:** Pre-implementation, entering M0. The two blocking decisions are made — the server
+is **Go** ([ADR-0001](docs/adr/0001-server-language.md)) and the project is **open source**
+([ADR-0003](docs/adr/0003-project-shape-and-license.md)). Remaining sections marked *(open)*
+affect M4 and later and do not block M0–M3. Task breakdown: [`docs/tasks.md`](docs/tasks.md).
 
 ---
 
@@ -1217,10 +1220,8 @@ Benchmarks live in `bench/` and run in CI on every release with regression gates
 | Migrations | `golang-migrate`, forward-only, expand/contract | Zero-downtime upgrades. |
 | Container | Distroless image, non-root, read-only rootfs | Baseline hardening. |
 
-*(open: Go for the server is the recommendation, not a decision the user has ratified. If the
-team is Python-only, a FastAPI + SQLAlchemy server is viable for v1 at the cost of the
-single-binary story and roughly 3–5× the PDP hardware. See
-[ADR-0001](docs/adr/0001-server-language.md).)*
+Go was ratified on 2026-08-31; see [ADR-0001](docs/adr/0001-server-language.md) for the
+options weighed and the reversal path.
 
 ---
 
@@ -1318,12 +1319,12 @@ reviews, SAML IdP mode, Vue/Svelte/Angular SDKs (2.0).
 
 | # | Question | Blocks |
 | --- | --- | --- |
-| Q1 | Server language: Go (recommended) or Python? | M0 |
-| Q2 | Is this a product to sell, an internal platform, or open source? Changes tenancy, licensing and the admin console's depth. | M0 |
+| ~~Q1~~ | ~~Server language: Go or Python?~~ **Resolved 2026-08-31: Go.** See [ADR-0001](docs/adr/0001-server-language.md). | — |
+| ~~Q2~~ | ~~Product to sell, internal platform, or open source?~~ **Resolved 2026-08-31: open source.** See [ADR-0003](docs/adr/0003-project-shape-and-license.md). | — |
 | Q3 | Do target applications already have a resource hierarchy they can mirror, or must v1 work with instance-level grants only? | M7 |
 | Q4 | Is SAML needed at launch, or can it follow OIDC by one milestone? It is roughly a third of M4. | M4 |
 | Q5 | Multi-region from day one, or single-region for 1.0? | M8 |
 | Q6 | Should the attribute webhook (PIP) ship in v1, or are inline attributes sufficient? | M7 |
 | Q7 | Does the product need to be an *upstream* SAML IdP (apps that only speak SAML), or is OIDC-to-apps enough? | Post-1.0 |
 | Q8 | Data residency requirements — do any target customers require EU-only storage? | M8 |
-| Q9 | Naming: "Warden" is a placeholder. Trademark clearance needed before any public release. | Pre-1.0 |
+| Q9 | Naming: "Warden" is a placeholder. Trademark clearance needed **before the repository is made public** (ADR-0003), not merely before 1.0. | Publication |

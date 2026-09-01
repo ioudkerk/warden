@@ -17,7 +17,11 @@ Teams integrate through two SDK families:
 
 ## Status
 
-Pre-implementation. The authoritative document is [`SPEC.md`](./SPEC.md).
+Pre-implementation, entering M0. The authoritative document is [`SPEC.md`](./SPEC.md).
+
+Decided: the server is **Go** ([ADR-0001](./docs/adr/0001-server-language.md)) and the
+project is **open source** ([ADR-0003](./docs/adr/0003-project-shape-and-license.md)).
+Work is broken down in [`docs/tasks.md`](./docs/tasks.md).
 
 ## Documents
 
@@ -28,8 +32,17 @@ Pre-implementation. The authoritative document is [`SPEC.md`](./SPEC.md).
 | [docs/api.md](./docs/api.md) | HTTP API reference (auth, authz, management) |
 | [docs/sdk-backend-python.md](./docs/sdk-backend-python.md) | Python SDK design |
 | [docs/sdk-frontend-react.md](./docs/sdk-frontend-react.md) | React SDK and UI element binding |
+| [docs/tasks.md](./docs/tasks.md) | Milestone task breakdown with exit conditions |
 | [docs/adr/](./docs/adr/) | Architecture decision records |
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md). `make build test lint` should be green on a
+clean clone; `make help` lists every target. Vulnerabilities go to
+[SECURITY.md](./SECURITY.md), never to a public issue.
 
 ## License
 
-TBD.
+[Apache-2.0](./LICENSE). See
+[ADR-0003](./docs/adr/0003-project-shape-and-license.md) for why, and note that the
+name "Warden" is still a placeholder pending trademark clearance (SPEC §23 Q9).
