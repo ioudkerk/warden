@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS permission;
+DROP TABLE IF EXISTS action;
+DROP TABLE IF EXISTS resource_type;
+DROP TABLE IF EXISTS app_enrollment;
+DROP TABLE IF EXISTS environment;
+DROP TABLE IF EXISTS application;
