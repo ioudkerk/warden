@@ -1,0 +1,80 @@
+# Warden server configuration.
+#
+# Every setting here can also be given as an environment variable or a flag; later
+# layers win, in the order file → environment → flags. Run `warden help` for the full
+# list of flags and their environment variables, and `warden config` to resolve and
+# print the effective configuration before a deploy.
+#
+# Note this file is NOT warden.yaml — that name belongs to an application manifest
+# (SPEC §11.2, examples/warden.yaml), which is a different schema entirely.
+#
+# Unknown keys are a startup error, not a warning: a typo must never leave a setting
+# silently at its default.
+
+# dev | staging | prod. Defaults to prod, so an operator who says nothing gets the
+# strict behaviour: https issuer required, no in-process cache, no auto-migration.
+environment: prod
+
+# Which tiers this process serves: auth, pdp, mgmt, worker, or all (SPEC §5.2).
+roles: [all]
+
+# This deployment's public origin, and the "iss" claim of every token it signs.
+# Required — relying parties compare it byte for byte.
+issuer: https://warden.example.com
+
+http:
+  addr: ":8080"
+  read_timeout: 15s
+  write_timeout: 30s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+  max_request_bytes: 4194304
+  # CIDRs whose X-Forwarded-For header is believed. Empty means trust nobody.
+  # context.ip feeds authorization conditions (SPEC §9.6), so a spoofable client
+  # address is a policy bypass rather than a logging nuisance — list only the
+  # proxies actually in front of this deployment.
+  trusted_proxy_cidrs: []
+
+database:
+  # Prefer WARDEN_DATABASE_URL over writing the password into this file.
+  url: postgres://warden@localhost:5432/warden?sslmode=verify-full
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 30m
+  connect_timeout: 10s
+  statement_timeout: 5s
+  # Run migrations as a separate pre-upgrade job (SPEC §20.1) so a rolling deploy
+  # cannot have several replicas racing to migrate. Refused in production.
+  auto_migrate: false
+
+cache:
+  # redis is required for any deployment with more than one process: the change
+  # stream that invalidates SDK caches fans out through it (SPEC §10.5).
+  # in-process is a single-node convenience and is refused in production.
+  backend: redis
+  url: redis://localhost:6379/0
+  dial_timeout: 5s
+  pool_size: 20
+
+security:
+  # Where to read the key-encryption key: env:NAME, file:/path or kms:<uri>.
+  # 32 bytes, base64 or hex. Generate one with: openssl rand -base64 32
+  # There is no default and no generated fallback — a key invented at startup would
+  # silently orphan every previously encrypted row on the next restart.
+  kek: env:WARDEN_KEK
+  # Keys retained for decryption during a rotation. Values written under them stay
+  # readable; new values are written under `kek` above.
+  retired_keks: []
+  token_signing_algorithm: RS256
+  # Bounded to 5m–15m by SPEC §8.2: a short lifetime is the backstop for revocation.
+  access_token_ttl: 10m
+  key_rotation_interval: 2160h # 90 days
+
+log:
+  level: info   # debug | info | warn | error
+  format: json  # json | text
+
+telemetry:
+  metrics_addr: ":9090"
+  tracing_otlp_endpoint: ""
+  trace_sample_ratio: 0.01

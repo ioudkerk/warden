@@ -17,6 +17,8 @@
 /bin/
 /dist/
 *.test
+coverage.out
+coverage.html
 
 # Python
 __pycache__/
@@ -35,7 +37,16 @@ build/
 coverage/
 *.tsbuildinfo
 
+# Build provenance (generated in CI, never committed)
+*.sbom.spdx.json
+*.sbom.json
+
 # Infra / data
 docker-compose.override.yml
 /tmp/
 /data/
+
+# Local server configuration. The committed example lives at
+# deploy/warden-server.example.yaml; a real one holds connection strings.
+warden-server.yaml
+warden-server.local.yaml

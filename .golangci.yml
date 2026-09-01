@@ -1,0 +1,87 @@
+# golangci-lint configuration.
+#
+# The selection is deliberately opinionated toward the things that bite an auth
+# service: unchecked errors, unhandled contexts, shadowed variables, and anything
+# that could put a secret somewhere it does not belong.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  # Not enabled: err113. Warden's startup errors are deliberately specific and
+  # one-off ("security.kek: environment variable X is not set"); sentinels exist
+  # only where a caller actually branches on them (ErrKEKNotConfigured,
+  # ErrKeyUnknown, ErrHelpRequested). err113 would push every message behind a
+  # package-level var and make them worse.
+  enable:
+    - bodyclose      # a leaked response body is a slow resource leak in the PDP hot path
+    - contextcheck   # every outbound call must carry the caller's context
+    - copyloopvar
+    - durationcheck
+    - errorlint      # errors.Is/As over == and type assertions
+    - gocritic
+    - goconst
+    - misspell
+    - nilerr
+    - noctx
+    - prealloc
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readability of config structs beats packing
+    revive:
+      rules:
+        - name: exported
+          disabled: true # doc comments are enforced by review, not by a linter
+    goconst:
+      min-len: 3
+      min-occurrences: 4
+    gocritic:
+      enabled-tags: [diagnostic, style, performance]
+      disabled-checks:
+        - whyNoLint
+        - hugeParam
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Table-driven tests carry long literal blocks and repeated strings; neither is
+      # a defect there.
+      - path: _test\.go
+        linters: [goconst, gocritic, unparam, prealloc]
+      # The binding table in load.go is repetitive by design — that is the point of
+      # it being a table.
+      - path: internal/config/load\.go
+        linters: [goconst]
+      # The conformance corpus is loaded and validated once per test run, never on a
+      # request path. Ranging by value over its structs costs nothing and reads far
+      # better than indexing, so the performance advice does not apply here.
+      - path: conformance/
+        text: rangeValCopy
+        linters: [gocritic]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/warden-project/warden
