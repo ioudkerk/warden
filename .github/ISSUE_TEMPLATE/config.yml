@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/warden-project/warden/security/advisories/new
+    about: >-
+      Do not open a public issue for a suspected vulnerability in an authorization
+      service. Report it privately — see SECURITY.md.
+  - name: Question or idea
+    url: https://github.com/warden-project/warden/discussions
+    about: For questions, design discussion and anything not yet a concrete bug.

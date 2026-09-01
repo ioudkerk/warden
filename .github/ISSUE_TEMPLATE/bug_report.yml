@@ -1,0 +1,79 @@
+name: Bug report
+description: Something behaves differently from how it is specified or documented.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **If this is a security vulnerability, stop and read [SECURITY.md](../blob/main/SECURITY.md).**
+        Authorization bypasses, tenant crossing and token flaws are reported privately.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >-
+        The smallest set of steps that shows the problem. For an authorization
+        question, the role, grant and check involved matter more than anything else.
+      placeholder: |
+        1. Grant `billing.viewer` to user U at scope `tenant:T`
+        2. Check `billing.invoice:read` for U on `billing.invoice:4711`
+        3. Expected allow, got deny with reason `no_grant`
+    validations:
+      required: true
+
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision output
+      description: >-
+        For an authorization bug, the output of `POST /v1/authz/explain` is the single
+        most useful thing you can attach — it shows which grants matched and which
+        conditions failed. Redact anything sensitive.
+      render: json
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `warden version`, or the commit you built from.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Server — authorization (PDP)
+        - Server — identity and tokens
+        - Server — federation (OIDC/SAML)
+        - Server — management API
+        - Admin console
+        - Python SDK
+        - Browser / React SDK
+        - CLI
+        - Deployment and operations
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: How Warden is deployed, and the Postgres and Redis versions.
+      placeholder: |
+        Deployment: single container / Kubernetes / other
+        Postgres: 16.2
+        Redis: 7.2
+        Configuration: output of `warden config` (it redacts secrets)

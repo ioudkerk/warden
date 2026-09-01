@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a capability Warden does not have.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [SPEC.md](../blob/main/SPEC.md) first — much of what Warden will
+        do is specified but not yet built, and [docs/tasks.md](../blob/main/docs/tasks.md)
+        says which milestone it belongs to. If your idea is already there, an issue
+        saying you need it sooner is still useful; say so.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do that Warden makes hard or impossible? Describe the
+        situation rather than the solution — it often turns out there is a better
+        answer than the one that brought you here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds you have used, and why they are not enough.
+
+  - type: checkboxes
+    id: spec
+    attributes:
+      label: Checks
+      options:
+        - label: I have read the relevant part of SPEC.md and this is not already specified.
+        - label: This does not require Warden to become a general-purpose policy language platform (a stated non-goal, SPEC §2.2).
