@@ -1,0 +1,316 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# A push to a branch that is already building cancels the older run; main never
+# cancels, so every commit on main has a complete result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # Reproducibility: the toolchain versions live in one place and CI uses the same
+  # pins as a developer's machine.
+  GO_VERSION: "1.27.0"
+  NODE_VERSION: "24"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: warden
+          POSTGRES_PASSWORD: warden
+          POSTGRES_DB: warden
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U warden -d warden"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+
+    env:
+      DATABASE_URL: postgres://warden:warden@localhost:5432/warden?sslmode=disable
+      REDIS_URL: redis://localhost:6379/0
+      # Tenant isolation is a named threat (SPEC §17.1). The suite that proves it
+      # skips without a database, so CI always supplies one — a skipped isolation
+      # test and a passing one look identical in a summary.
+      WARDEN_TEST_DATABASE_URL: postgres://warden:warden@localhost:5432/warden?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify formatting
+        run: make fmt-check
+
+      - name: Verify go.mod is tidy
+        run: make tidy
+
+      - name: Lint
+        run: make lint
+
+      # -race catches data races, which a linter cannot. -shuffle=on catches tests
+      # that only pass in declaration order — the kind that hides a shared-state bug
+      # until the day someone adds a test above it.
+      - name: Test
+        run: make test-cover
+
+      - name: Build
+        run: make build
+
+      # Called out as its own step because a failure here means two implementations
+      # of Warden's authorization semantics disagree, which is a different kind of
+      # problem from a unit test breaking (SPEC §21).
+      - name: Conformance corpus
+        run: make conformance
+
+      # Called out separately because a failure here means tenant data is reachable
+      # across the isolation boundary, which is a different order of problem from a
+      # unit test breaking.
+      - name: Tenant isolation
+        run: go test -count=1 -v -run 'Tenant|Isolation|Classified|Protected' ./internal/store/...
+
+      # The suite skips silently without a database, and a skipped security test
+      # reads exactly like a passing one. Fail the build if it did not actually run.
+      - name: Confirm the isolation suite was not skipped
+        run: |
+          output=$(go test -count=1 -v -run TestTenantIsolation ./internal/store/... 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "SKIP"; then
+            echo "::error::the tenant isolation suite was skipped; WARDEN_TEST_DATABASE_URL is not reaching it"
+            exit 1
+          fi
+
+      - name: Confirm the binary refuses to start unconfigured
+        run: |
+          if ./bin/warden config >/dev/null 2>&1; then
+            echo "::error::warden accepted an empty configuration; it must fail closed"
+            exit 1
+          fi
+          ./bin/warden version
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  migrations:
+    name: Migrations round-trip (Postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # SPEC §19 requires PostgreSQL 15+. Both ends of the supported range are
+        # exercised, because a migration that only works on the newer one is a
+        # self-hoster's problem, not ours to discover later.
+        postgres: ["15", "16"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: warden
+          POSTGRES_PASSWORD: warden
+          POSTGRES_DB: warden
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U warden -d warden"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+
+    env:
+      DATABASE_URL: postgres://warden:warden@localhost:5432/warden?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Every migration must roll back as cleanly as it applies. Without this, an
+      # irreversible migration is discovered during an incident rather than in review.
+      - name: Apply, roll back and re-apply every migration
+        run: make migrate-up migrate-redo
+
+      # After a full down, nothing but golang-migrate's own bookkeeping should
+      # remain. A down migration that forgets a table leaves the next `up` to fail on
+      # an object that already exists — usually on someone else's machine.
+      - name: Confirm a full rollback leaves no objects behind
+        run: |
+          make migrate-up
+          "$PWD/bin/migrate" -path internal/store/migrations -database "$DATABASE_URL" down -all
+          leftovers=$(psql "$DATABASE_URL" -tAc \
+            "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'schema_migrations'")
+          if [ -n "$leftovers" ]; then
+            echo "::error::down migrations left these tables behind:"; echo "$leftovers"
+            exit 1
+          fi
+          make migrate-up
+
+      # The committed schema is the reviewable artefact: a migration whose effect is
+      # not what its author intended shows up as a diff in the pull request.
+      # The committed dump is canonical on the newest supported major; older majors
+      # format their output slightly differently, so comparing them would churn.
+      - name: Verify the committed schema matches the migrations
+        if: matrix.postgres == '16'
+        run: make schema-check
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+
+  python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        working-directory: sdk/python
+        run: ruff check .
+
+      - name: Type-check
+        working-directory: sdk/python
+        run: mypy src
+
+      - name: Test
+        working-directory: sdk/python
+        run: |
+          if [ -d tests ]; then pytest; else echo "No tests yet (milestone M3)."; fi
+
+  node:
+    name: Console and JS SDKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install
+        run: npm install --workspaces --include-workspace-root --if-present
+
+      - name: Lint, type-check and test
+        run: |
+          npm run lint --if-present
+          npm run typecheck --if-present
+          npm run test --if-present
+
+  # Warden is infrastructure other people's security depends on, so dependency and
+  # code scanning is a required check rather than a nightly job.
+  security:
+    name: Security scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: govulncheck
+        run: make audit-go
+
+      - name: pip-audit
+        working-directory: sdk/python
+        run: |
+          pip install --upgrade pip pip-audit
+          pip install -e .
+          pip-audit --strict --desc
+
+      - name: npm audit
+        run: npm audit --audit-level=high
+
+      # Run from the released binary rather than the marketplace action, which needs
+      # a licence key for organisation-owned repositories.
+      - name: Scan for committed secrets
+        run: |
+          version=8.30.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks dir . --redact --verbose
+
+  # Provenance is built from the first commit, not retrofitted at 1.0 (ADR-0003).
+  # An artifact history without attestation cannot be given one later.
+  provenance:
+    name: SBOM and provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: warden.sbom.spdx.json
+
+      # Attestation requires a non-fork context with an OIDC token; skip on forks
+      # rather than failing a contributor's first pull request.
+      - name: Attest the build provenance
+        if: github.event_name == 'push' && github.repository_owner != ''
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: bin/warden
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: warden.sbom.spdx.json
