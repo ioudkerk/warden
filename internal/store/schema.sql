@@ -469,6 +469,24 @@ CREATE TABLE public.schema_migrations (
 );
 
 --
+-- Name: service_account; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.service_account (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    name text NOT NULL,
+    token_hash bytea NOT NULL,
+    application_id text,
+    disabled_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT service_account_hash_is_sha256 CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT service_account_id_check CHECK ((id ~~ 'svc\_%'::text))
+);
+
+--
 -- Name: session; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -696,6 +714,13 @@ ALTER TABLE ONLY public.role
 
 ALTER TABLE ONLY public.schema_migrations
     ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (version);
+
+--
+-- Name: service_account service_account_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.service_account
+    ADD CONSTRAINT service_account_pkey PRIMARY KEY (id);
 
 --
 -- Name: session session_id_tenant_key; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1000,6 +1025,24 @@ CREATE INDEX role_permission_tenant_idx ON public.role_permission USING btree (t
 --
 
 CREATE INDEX role_tenant_id_idx ON public.role USING btree (tenant_id);
+
+--
+-- Name: service_account_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX service_account_tenant_idx ON public.service_account USING btree (tenant_id);
+
+--
+-- Name: service_account_tenant_name_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX service_account_tenant_name_key ON public.service_account USING btree (tenant_id, name);
+
+--
+-- Name: service_account_token_hash_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX service_account_token_hash_key ON public.service_account USING btree (token_hash);
 
 --
 -- Name: session_expires_at_idx; Type: INDEX; Schema: public; Owner: -
@@ -1353,6 +1396,20 @@ ALTER TABLE ONLY public.role_permission
 
 ALTER TABLE ONLY public.role
     ADD CONSTRAINT role_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: service_account service_account_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.service_account
+    ADD CONSTRAINT service_account_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(id) ON DELETE CASCADE;
+
+--
+-- Name: service_account service_account_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.service_account
+    ADD CONSTRAINT service_account_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
 
 --
 -- Name: session session_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -

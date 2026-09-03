@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 )
@@ -53,6 +54,19 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	case "serve":
 		return runServe(rest, stdout, stderr)
+
+	case "apply":
+		return runApply(rest, stdout, stderr)
+	case "tenant":
+		return runTenant(rest, stdout, stderr)
+	case "user":
+		return runUser(rest, stdout, stderr)
+	case "grant":
+		return runGrant(rest, stdout, stderr)
+	case "resource":
+		return runResource(rest, stdout, stderr)
+	case "token":
+		return runToken(rest, stdout, stderr)
 
 	default:
 		usage(stderr)
@@ -156,12 +170,30 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		log.Warn("TENANT ISOLATION IS NOT ENFORCED BY THE DATABASE", "detail", warning)
 	}
 
-	// The HTTP listener and the role-specific services attach here; they arrive with
-	// M0-7 (query layer) and M0-10 (health and metrics).
-	log.Warn("no server roles are implemented yet; holding until interrupted (tasks M0-7, M0-10)")
-	<-ctx.Done()
-	log.Info("shutting down", "grace_period", cfg.HTTP.ShutdownTimeout)
-	return nil
+	// The system pool is what authentication needs: resolving a service-account
+	// token to its tenant happens before any tenant scope exists.
+	var system *store.Store
+	if !cfg.Database.SystemURL.IsZero() {
+		system, err = store.Open(ctx, cfg, store.SystemAccess)
+		if err != nil {
+			return err
+		}
+		defer system.Close()
+		log.Info("system database connected", "role", system.Role())
+	}
+
+	if !cfg.HasRole(config.RolePDP) {
+		log.Warn("no listener: this process serves no role that has endpoints yet",
+			"roles", cfg.EffectiveRoles())
+		<-ctx.Done()
+		return nil
+	}
+
+	server, err := httpapi.New(cfg, log, db, system)
+	if err != nil {
+		return err
+	}
+	return server.ListenAndServe(ctx)
 }
 
 func newLogger(cfg *config.Config, out io.Writer) *slog.Logger {
@@ -202,6 +234,15 @@ Usage:
   warden config [flags]    resolve and validate the configuration, then print it
   warden version           print the build version
   warden help              print this message
+
+Administration (until the console arrives in M6). Each needs database.system_url:
+  warden apply -f <manifest.yaml>              publish an application's permission surface
+  warden tenant -slug <slug>                   create a tenant
+  warden user -tenant <slug> -email <email>    create a user, printing its subject id
+  warden grant -tenant <slug> -user <id> -role <key> [-scope <scope>] [-condition <cel>] [-until <ts>]
+  warden grant -tenant <slug> -revoke <id>     remove a grant
+  warden resource -tenant <slug> -ref <app.type:id> [-parent <ref>] [-attributes <json>]
+  warden token -tenant <slug> -name <name>     mint a service-account token, shown once
 
 Configuration is read from a file, then the environment, then flags, each layer
 overriding the one before it. The file is selected with -config or WARDEN_CONFIG.
