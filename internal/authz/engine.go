@@ -261,24 +261,24 @@ func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (
 // scopeCovers implements the scope forms of SPEC §9.5.
 func (m *Model) scopeCovers(kind, ref string, want Permission, req Request) bool {
 	switch kind {
-	case "tenant":
+	case ScopeTenant:
 		return true
 
-	case "application":
+	case ScopeApplication:
 		return ref == want.App
 
-	case "environment":
+	case ScopeEnvironment:
 		// "billing/prod". An environment-scoped grant cannot be shown to apply to a
 		// check that does not say which environment it is in; denying is the safe
 		// reading.
 		app, env, ok := splitEnvScope(ref)
 		return ok && app == want.App && req.Environment != "" && req.Environment == env
 
-	case "resource":
+	case ScopeResource:
 		// Exactly that object, and nothing below it.
 		return req.Resource != "" && req.Resource == ref
 
-	case "subtree":
+	case ScopeSubtree:
 		return req.Resource != "" && m.IsAncestor(ref, req.Resource)
 
 	default:

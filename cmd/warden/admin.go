@@ -185,6 +185,7 @@ func runGrant(args []string, stdout, stderr io.Writer) error {
 	condition := fs.String("condition", "", "CEL condition narrowing the grant")
 	until := fs.String("until", "", "RFC 3339 expiry, for a time-boxed elevation")
 	reason := fs.String("reason", "", "why this was granted; recorded for audit")
+	as := fs.String("as", "", "the subject making this assignment; without it the CLI acts as the deployment operator, which bypasses the escalation guard")
 	revoke := fs.String("revoke", "", "grant id to remove instead of creating one")
 	own, rest := splitOwnFlags(fs, args)
 	if err := fs.Parse(own); err != nil {
@@ -218,7 +219,12 @@ func runGrant(args []string, stdout, stderr io.Writer) error {
 	}
 
 	return withProvisioner(rest, stderr, func(ctx context.Context, p *provision.Provisioner, _ *config.Config) error {
+		actor := provision.Actor{SystemOperator: true}
+		if *as != "" {
+			actor = provision.Actor{SubjectID: *as}
+		}
 		id, err := p.Grant(ctx, provision.GrantOptions{
+			Actor:      actor,
 			TenantSlug: *tenant, UserID: *user, GroupID: *group, RoleKey: *role,
 			Scope: *scope, Condition: *condition, ValidUntil: validUntil, Reason: *reason,
 		})

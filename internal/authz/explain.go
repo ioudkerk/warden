@@ -162,16 +162,16 @@ func (t *trace) result() *Explanation {
 // two columns it is stored in.
 func scopeString(kind, ref string) string {
 	switch kind {
-	case "tenant":
+	case ScopeTenant:
 		return "tenant"
-	case "application":
+	case ScopeApplication:
 		return "app:" + ref
-	case "environment":
+	case ScopeEnvironment:
 		if app, env, ok := strings.Cut(ref, "/"); ok {
 			return "app:" + app + "/env:" + env
 		}
 		return "app:" + ref
-	case "subtree":
+	case ScopeSubtree:
 		return ref + "/**"
 	default:
 		return ref

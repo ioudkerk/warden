@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/audit"
+	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/store"
 )
 
@@ -50,7 +51,9 @@ func New(db *store.Store) (*Provisioner, error) {
 
 // record appends an audit entry inside the caller's transaction.
 func (p *Provisioner) record(ctx context.Context, tx pgx.Tx, e audit.Entry) error {
-	e.ActorClientID = p.actor
+	if e.ActorUserID == "" && e.ActorClientID == "" {
+		e.ActorClientID = p.actor
+	}
 	_, err := p.audit.Append(ctx, tx, e)
 	return err
 }
@@ -310,8 +313,39 @@ func (p *Provisioner) CreateUser(ctx context.Context, tenantSlug, email string, 
 	return userID, err
 }
 
+// Actor is who is performing an administrative action.
+//
+// Exactly one field must be set, and Grant refuses if neither is — a caller who
+// forgets to say who is acting gets an error rather than a bypass. Making the
+// unguarded path a named, deliberate thing is the point: SPEC §17.1 threat 3 is
+// prevented by a check that cannot be omitted by accident.
+type Actor struct {
+	// SubjectID is the user performing the action. Their own authority bounds what
+	// they can assign.
+	SubjectID string
+
+	// SystemOperator marks the deployment operator acting through the CLI or a
+	// migration. It bypasses the escalation guard, which is not a loophole: this
+	// caller already holds the BYPASSRLS database credential and can write any row
+	// it likes. What the flag buys is that the bypass is recorded as such.
+	SystemOperator bool
+}
+
+func (a Actor) validate() error {
+	switch {
+	case a.SubjectID != "" && a.SystemOperator:
+		return errors.New("an actor is either a subject or the system operator, not both")
+	case a.SubjectID == "" && !a.SystemOperator:
+		return errors.New(
+			"an actor is required: set Actor.SubjectID for a delegated action, or " +
+				"Actor.SystemOperator to act as the deployment operator")
+	}
+	return nil
+}
+
 // GrantOptions describes an assignment.
 type GrantOptions struct {
+	Actor      Actor
 	TenantSlug string
 	UserID     string
 	GroupID    string
@@ -322,12 +356,26 @@ type GrantOptions struct {
 	Reason     string
 }
 
-// Grant assigns a role at a scope.
+// Grant assigns a role at a scope, refusing an assignment that would confer more
+// authority than the assigner holds (SPEC §17.1 threat 3).
 func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error) {
+	if err := o.Actor.validate(); err != nil {
+		return "", err
+	}
 	tenantID := id("ten", o.TenantSlug)
 	kind, ref, err := ParseScope(o.Scope, tenantID)
 	if err != nil {
 		return "", err
+	}
+
+	if !o.Actor.SystemOperator {
+		if refusal := p.checkAssignment(ctx, tenantID, o, kind, ref); refusal != nil {
+			// An attempted escalation is exactly the thing worth having a record of,
+			// and the transaction that would have carried it has rolled back — so it
+			// is written separately, on its own.
+			p.recordRefusal(ctx, tenantID, o, refusal)
+			return "", refusal
+		}
 	}
 
 	grantID := fmt.Sprintf("grn_%s", randomSuffix())
@@ -351,6 +399,11 @@ func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error)
 			kind, ref, condition, o.ValidUntil, o.Reason); execErr != nil {
 			return execErr
 		}
+		if _, execErr := tx.Exec(ctx,
+			`UPDATE grant_ SET granted_by = $1 WHERE id = $2`,
+			nullIfEmpty(o.Actor.SubjectID), grantID); execErr != nil {
+			return execErr
+		}
 		if recordErr := p.record(ctx, tx, audit.Entry{
 			TenantID: tenantID, Action: "role.granted",
 			TargetType: "grant", TargetID: grantID,
@@ -366,6 +419,69 @@ func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error)
 		return bumpTenant(ctx, tx, tenantID)
 	})
 	return grantID, err
+}
+
+// checkAssignment loads the tenant's model and asks the guard.
+//
+// The model is loaded through the system pool, where row-level security does not
+// apply — which is safe only because internal/authz's loader filters by tenant
+// explicitly. Relying on RLS here would have silently mixed every tenant's roles into
+// one assigner's apparent authority.
+func (p *Provisioner) checkAssignment(
+	ctx context.Context, tenantID string, o GrantOptions, scopeKind, scopeRef string,
+) *authz.EscalationError {
+	var refusal *authz.EscalationError
+
+	err := p.db.InSystem(ctx, "checking an assignment for escalation", func(ctx context.Context, tx pgx.Tx) error {
+		m := authz.NewModel(tenantID)
+		if err := authz.LoadModelInto(ctx, tx, m); err != nil {
+			return err
+		}
+		refusal = authz.CanAssign(m, authz.AssignmentRequest{
+			Assigner:   o.Actor.SubjectID,
+			RoleID:     id("rol", o.RoleKey),
+			ScopeKind:  scopeKind,
+			ScopeRef:   scopeRef,
+			ValidUntil: o.ValidUntil,
+			Now:        time.Now().UTC(),
+		})
+		return nil
+	})
+	if err != nil {
+		// A guard that cannot run must refuse. Proceeding because the check failed
+		// is the one outcome that turns an error into an escalation.
+		return &authz.EscalationError{
+			Reason: authz.RefusalNotPermitted,
+			Detail: "the escalation guard could not be evaluated: " + err.Error(),
+		}
+	}
+	return refusal
+}
+
+// recordRefusal writes a refused assignment to the audit log. It is best effort: a
+// refusal that could not be recorded is still a refusal, and failing the request a
+// second time would tell the caller nothing new.
+func (p *Provisioner) recordRefusal(
+	ctx context.Context, tenantID string, o GrantOptions, refusal *authz.EscalationError,
+) {
+	err := p.db.InSystem(ctx, "recording a refused assignment", func(ctx context.Context, tx pgx.Tx) error {
+		return p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "role.assignment_refused",
+			TargetType: "role", TargetID: id("rol", o.RoleKey),
+			ActorUserID: o.Actor.SubjectID,
+			After: map[string]any{
+				"refusal": refusal.Reason, "detail": refusal.Detail,
+				"missing": refusal.Missing, "scope": o.Scope,
+				"subject_user": o.UserID, "subject_group": o.GroupID,
+			},
+			Reason: o.Reason,
+		})
+	})
+	if err != nil {
+		// Nowhere to report this but the process log; the caller already has their
+		// refusal.
+		_ = err
+	}
 }
 
 // Revoke removes a grant.
@@ -558,4 +674,11 @@ func (p *Provisioner) RecentAudit(ctx context.Context, tenantSlug string, limit 
 		return rows.Err()
 	})
 	return entries, err
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

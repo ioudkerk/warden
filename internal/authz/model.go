@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+// Scope kinds, as stored in grant_.scope_kind and denial.scope_kind. The schema's
+// CHECK constraint lists the same set; the two must agree, and a bare string in one
+// place would silently never match rather than fail.
+const (
+	ScopeTenant      = "tenant"
+	ScopeApplication = "application"
+	ScopeEnvironment = "environment"
+	ScopeResource    = "resource"
+	ScopeSubtree     = "subtree"
+)
+
 // Permission is app.type:action, split once so matching never re-parses.
 type Permission struct {
 	App, ResourceType, Action string
@@ -179,4 +190,16 @@ func (m *Model) RoleGrants(roleID string, want Permission) (string, bool) {
 // produced a decision, so the order has to be defined rather than incidental.
 func sortGrants(g []Grant) {
 	sort.Slice(g, func(i, j int) bool { return g[i].Seq < g[j].Seq })
+}
+
+// NewModel returns an empty model for a tenant, ready for LoadModelInto.
+func NewModel(tenantID string) *Model {
+	return &Model{
+		TenantID:            tenantID,
+		DeclaredPermissions: map[string]bool{},
+		Subjects:            map[string]Subject{},
+		Roles:               map[string]*Role{},
+		Resources:           map[string]Resource{},
+		GroupsOf:            map[string]map[string]bool{},
+	}
 }

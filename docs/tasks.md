@@ -179,12 +179,12 @@ the corpus covers all of §9.
 | M2-4 [B] | Scope matching: tenant / app / environment / instance / subtree | Every scope form in §9.5 has corpus cases including near-miss negatives |
 | M2-5 | Explicit denies with precedence `deny > allow > implicit deny`, admin-only, justification required, always audited | Property test: an explicit deny always wins, whatever the grant set |
 | M2-6 [B] | `POST /v1/authz/check` and `/batch-check` (1 000 per call) | §18 latency targets met on the reference hardware |
-| M2-7 | `/effective-permissions`, `/explain` with the §10.3 derivation shape | `explain` is refused in prod for non-admins (it leaks policy structure) |
-| M2-8 | Decision log: `off`/`denies`/`sampled`/`all`, buffered async sink that never blocks the decision path | Sink saturation drops records and increments a metric; it never adds latency |
+| M2-7 | **Status: done (explain).** `/effective-permissions`, `/explain` with the §10.3 derivation shape | `explain` is refused in prod for non-admins (it leaks policy structure) |
+| M2-8 | **Status: done.** Decision log: `off`/`denies`/`sampled`/`all`, buffered async sink that never blocks the decision path | Sink saturation drops records and increments a metric; it never adds latency |
 | M2-9 | Groups: local and IdP-sourced, nesting DAG, assignments | IdP group membership is *replaced* per login (§9.4) |
-| M2-10 [B] | **Privilege-escalation guard**: a subject may not assign a role containing permissions they lack, absent `tenant.role:assign_any` (§17.1 threat 3) | Dedicated test suite; this is a named threat, not a nice-to-have |
+| M2-10 [B] | **Status: done.** **Privilege-escalation guard**: a subject may not assign a role containing permissions they lack, absent `tenant.role:assign_any` (§17.1 threat 3) | Dedicated test suite; this is a named threat, not a nice-to-have |
 | M2-11 | Multi-tenant isolation sweep: every management endpoint × foreign `tenant_id` ⇒ 404 | Endpoint list is generated from the router, so a new endpoint cannot skip the sweep |
-| M2-12 | Admin audit log: append-only, hash-chained `prev_hash`, before/after diff | Tampering with any row breaks verification of the chain |
+| M2-12 | **Status: done.** Admin audit log: append-only, hash-chained `prev_hash`, before/after diff | Tampering with any row breaks verification of the chain |
 
 ---
 

@@ -137,6 +137,7 @@ func newFixtureWithExplain(t *testing.T, mayExplain bool) fixture {
 			t.Fatalf("user in %s: %v", tn, userErr)
 		}
 		if _, grantErr := p.Grant(ctx, provision.GrantOptions{
+			Actor:      provision.Actor{SystemOperator: true},
 			TenantSlug: tn, UserID: user, RoleKey: "billing.viewer", Scope: "tenant",
 		}); grantErr != nil {
 			t.Fatalf("grant in %s: %v", tn, grantErr)

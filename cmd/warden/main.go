@@ -265,7 +265,7 @@ Administration (until the console arrives in M6). Each needs database.system_url
   warden apply -f <manifest.yaml>              publish an application's permission surface
   warden tenant -slug <slug>                   create a tenant
   warden user -tenant <slug> -email <email>    create a user, printing its subject id
-  warden grant -tenant <slug> -user <id> -role <key> [-scope <scope>] [-condition <cel>] [-until <ts>]
+  warden grant -tenant <slug> -user <id> -role <key> [-scope <scope>] [-as <assigner>] [-until <ts>]
   warden grant -tenant <slug> -revoke <id>     remove a grant
   warden resource -tenant <slug> -ref <app.type:id> [-parent <ref>] [-attributes <json>]
   warden token -tenant <slug> -name <name>     mint a service-account token, shown once

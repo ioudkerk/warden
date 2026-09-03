@@ -89,6 +89,22 @@ END;
 $_$;
 
 --
+-- Name: warden_role_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.warden_role_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.immutable THEN
+        RAISE EXCEPTION 'role % is immutable and cannot be % ', OLD.key, lower(TG_OP)
+            USING HINT = 'Fork it into a tenant role instead.';
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+--
 -- Name: warden_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1554,6 +1570,18 @@ CREATE TRIGGER resource_node_set_updated_at BEFORE UPDATE ON public.resource_nod
 --
 
 CREATE TRIGGER resource_type_set_updated_at BEFORE UPDATE ON public.resource_type FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
+-- Name: role role_immutable_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER role_immutable_no_delete BEFORE DELETE ON public.role FOR EACH ROW EXECUTE FUNCTION public.warden_role_immutable();
+
+--
+-- Name: role role_immutable_no_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER role_immutable_no_update BEFORE UPDATE ON public.role FOR EACH ROW EXECUTE FUNCTION public.warden_role_immutable();
 
 --
 -- Name: role role_set_updated_at; Type: TRIGGER; Schema: public; Owner: -

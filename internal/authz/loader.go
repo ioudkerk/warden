@@ -115,6 +115,12 @@ func (e *Engine) currentRevision(ctx context.Context, tenantID string) (int64, e
 // load reads a tenant's whole authorization model in one transaction, so the parts
 // cannot disagree with one another. Reading roles in one transaction and grants in
 // another could observe a role that a concurrent write has already removed.
+//
+// Every query names the tenant explicitly. Row-level security would filter these
+// anyway on the tenant-scoped pool, but SPEC §6.2 puts RLS *behind* application-level
+// filtering rather than in place of it — and relying on RLS alone means this loader
+// silently returns every tenant's model if it is ever run on a connection that
+// bypasses it, which is precisely what the privilege-escalation guard needs to do.
 func (e *Engine) load(ctx context.Context, tenantID string, revision int64) (*Model, error) {
 	m := &Model{
 		TenantID:            tenantID,
@@ -127,22 +133,7 @@ func (e *Engine) load(ctx context.Context, tenantID string, revision int64) (*Mo
 	}
 
 	err := e.db.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
-		if err := loadPermissionSurface(ctx, tx, m); err != nil {
-			return err
-		}
-		if err := loadSubjects(ctx, tx, m); err != nil {
-			return err
-		}
-		if err := loadGroups(ctx, tx, m); err != nil {
-			return err
-		}
-		if err := loadRoles(ctx, tx, m); err != nil {
-			return err
-		}
-		if err := loadGrantsAndDenials(ctx, tx, m); err != nil {
-			return err
-		}
-		return loadResources(ctx, tx, m)
+		return LoadModelInto(ctx, tx, m)
 	})
 	if err != nil {
 		return nil, err
@@ -167,6 +158,25 @@ func (e *Engine) load(ctx context.Context, tenantID string, revision int64) (*Mo
 
 // The permission surface is global: an application declares it once (SPEC §6.1).
 // Action implication is expanded here, at load, and never during a check (SPEC §9.2).
+// LoadModelInto reads one tenant's model using the transaction given. It is exported
+// so that the privilege-escalation guard can build a model through the system pool,
+// where row-level security does not apply and the explicit tenant filters below are
+// the only thing keeping one tenant's roles out of another's decision.
+func LoadModelInto(ctx context.Context, tx pgx.Tx, m *Model) error {
+	if m.TenantID == "" {
+		return fmt.Errorf("loading a model requires a tenant")
+	}
+	for _, load := range []func(context.Context, pgx.Tx, *Model) error{
+		loadPermissionSurface, loadSubjects, loadGroups,
+		loadRoles, loadGrantsAndDenials, loadResources,
+	} {
+		if err := load(ctx, tx, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadPermissionSurface(ctx context.Context, tx pgx.Tx, m *Model) error {
 	rows, err := tx.Query(ctx, `SELECT key FROM permission`)
 	if err != nil {
@@ -184,7 +194,9 @@ func loadPermissionSurface(ctx context.Context, tx pgx.Tx, m *Model) error {
 }
 
 func loadSubjects(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx, `SELECT id, status, attributes FROM app_user WHERE deleted_at IS NULL`)
+	rows, err := tx.Query(ctx,
+		`SELECT id, status, attributes FROM app_user WHERE tenant_id = $1 AND deleted_at IS NULL`,
+		m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading subjects: %w", err)
 	}
@@ -206,15 +218,16 @@ func loadGroups(ctx context.Context, tx pgx.Tx, m *Model) error {
 		WITH RECURSIVE membership AS (
 			SELECT member_user_id AS user_id, group_id
 			  FROM group_member
-			 WHERE member_user_id IS NOT NULL
+			 WHERE member_user_id IS NOT NULL AND tenant_id = $1
 			UNION
 			SELECT ms.user_id, gm.group_id
 			  FROM group_member gm
 			  JOIN membership ms ON gm.member_group_id = ms.group_id
+			 WHERE gm.tenant_id = $1
 		)
 		SELECT user_id, group_id FROM membership`
 
-	rows, err := tx.Query(ctx, q)
+	rows, err := tx.Query(ctx, q, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading group membership: %w", err)
 	}
@@ -233,7 +246,9 @@ func loadGroups(ctx context.Context, tx pgx.Tx, m *Model) error {
 }
 
 func loadRoles(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx, `SELECT id, key, constraints FROM role`)
+	rows, err := tx.Query(ctx,
+		`SELECT id, key, constraints FROM role WHERE tenant_id = $1 OR tenant_id IS NULL`,
+		m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading roles: %w", err)
 	}
@@ -257,7 +272,9 @@ func loadRoles(ctx context.Context, tx pgx.Tx, m *Model) error {
 
 	own := map[string][]string{}                 // role id -> permission keys as written
 	conditions := map[string]map[string]string{} // role id -> permission key -> condition
-	permRows, permErr := tx.Query(ctx, `SELECT role_id, permission_key, condition FROM role_permission`)
+	permRows, permErr := tx.Query(ctx,
+		`SELECT role_id, permission_key, condition FROM role_permission
+		  WHERE tenant_id = $1 OR tenant_id IS NULL`, m.TenantID)
 	if permErr != nil {
 		return fmt.Errorf("loading role permissions: %w", permErr)
 	}
@@ -281,7 +298,9 @@ func loadRoles(ctx context.Context, tx pgx.Tx, m *Model) error {
 	}
 
 	inherits := map[string][]string{}
-	inhRows, inhErr := tx.Query(ctx, `SELECT role_id, parent_role_id FROM role_inheritance`)
+	inhRows, inhErr := tx.Query(ctx,
+		`SELECT role_id, parent_role_id FROM role_inheritance
+		  WHERE tenant_id = $1 OR tenant_id IS NULL`, m.TenantID)
 	if inhErr != nil {
 		return fmt.Errorf("loading role inheritance: %w", inhErr)
 	}
@@ -459,7 +478,7 @@ func loadGrantsAndDenials(ctx context.Context, tx pgx.Tx, m *Model) error {
 	rows, err := tx.Query(ctx, `
 		SELECT id, seq, subject_user_id, subject_group_id, role_id,
 		       scope_kind, scope_ref, condition, valid_from, valid_until
-		  FROM grant_ ORDER BY seq`)
+		  FROM grant_ WHERE tenant_id = $1 ORDER BY seq`, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading grants: %w", err)
 	}
@@ -487,7 +506,8 @@ func loadGrantsAndDenials(ctx context.Context, tx pgx.Tx, m *Model) error {
 	}
 
 	denialRows, denialErr := tx.Query(ctx, `
-		SELECT id, subject_user_id, subject_group_id, permission_key, scope_kind, scope_ref FROM denial`)
+		SELECT id, subject_user_id, subject_group_id, permission_key, scope_kind, scope_ref
+		  FROM denial WHERE tenant_id = $1`, m.TenantID)
 	if denialErr != nil {
 		return fmt.Errorf("loading denials: %w", denialErr)
 	}
@@ -516,7 +536,8 @@ func loadGrantsAndDenials(ctx context.Context, tx pgx.Tx, m *Model) error {
 }
 
 func loadResources(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx, `SELECT ref, parent_ref, attributes FROM resource_node`)
+	rows, err := tx.Query(ctx,
+		`SELECT ref, parent_ref, attributes FROM resource_node WHERE tenant_id = $1`, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading resources: %w", err)
 	}
