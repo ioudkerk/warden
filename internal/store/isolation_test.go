@@ -24,14 +24,23 @@ import (
 func tenantScopedTables(t *testing.T, ctx context.Context, conn *pgx.Conn) []string {
 	t.Helper()
 
-	// A table is tenant-scoped if it carries tenant_id, or if it is the tenant table
-	// itself (which is keyed on id).
+	// A table is tenant-scoped when it carries tenant_id (or is the tenant table
+	// itself, keyed on id) AND the registry says it holds tenant data.
+	//
+	// Both halves are needed. The column is what makes protection possible; the
+	// registry is what records the intent. A table may carry tenant_id and still be
+	// a deliberate exemption — service_account is, because resolving a token to its
+	// tenant necessarily happens before any tenant scope exists. The registry forces
+	// that exemption to be written down with a reason, and
+	// TestEveryTableIsClassified fails on a table that has the column and no entry.
 	const discover = `
 		SELECT c.relname
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
+		  JOIN tenant_isolation_registry r ON r.table_name = c.relname
 		 WHERE n.nspname = 'public'
 		   AND c.relkind = 'r'
+		   AND r.tenant_scoped
 		   AND (c.relname = 'tenant'
 		        OR EXISTS (SELECT 1 FROM pg_attribute a
 		                    WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND a.attnum > 0))
@@ -74,15 +83,12 @@ func TestEveryTableIsClassified(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	discovered := map[string]bool{}
-	for _, name := range tenantScopedTables(t, ctx, conn) {
-		discovered[name] = true
-	}
-
 	type row struct {
-		name       string
-		classified bool
-		scoped     *bool
+		name        string
+		classified  bool
+		scoped      *bool
+		hasTenantID bool
+		rationale   *string
 	}
 
 	// Read the whole result before issuing another query: a pgx connection carries
@@ -90,7 +96,12 @@ func TestEveryTableIsClassified(t *testing.T) {
 	// list fails with "conn busy".
 	var all []row
 	rows, err := conn.Query(ctx, `
-		SELECT c.relname, r.tenant_scoped, (r.table_name IS NOT NULL)
+		SELECT c.relname,
+		       r.tenant_scoped,
+		       (r.table_name IS NOT NULL),
+		       EXISTS (SELECT 1 FROM pg_attribute a
+		                WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND a.attnum > 0),
+		       r.rationale
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
 		  LEFT JOIN tenant_isolation_registry r ON r.table_name = c.relname
@@ -101,7 +112,7 @@ func TestEveryTableIsClassified(t *testing.T) {
 	}
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.name, &r.scoped, &r.classified); err != nil {
+		if err := rows.Scan(&r.name, &r.scoped, &r.classified, &r.hasTenantID, &r.rationale); err != nil {
 			rows.Close()
 			t.Fatalf("scanning: %v", err)
 		}
@@ -114,16 +125,24 @@ func TestEveryTableIsClassified(t *testing.T) {
 
 	for _, r := range all {
 		if !r.classified {
-			t.Errorf("table %q is not in tenant_isolation_registry. Add it to migration 000005: "+
-				"either it holds tenant data and needs a policy, or it is global and needs a written reason", r.name)
+			t.Errorf("table %q is not in tenant_isolation_registry. Classify it in the migration "+
+				"that creates it: either it holds tenant data and needs a policy, or it is exempt "+
+				"and needs a written reason", r.name)
 			continue
 		}
 		if r.scoped == nil {
 			continue
 		}
-		if *r.scoped != discovered[r.name] {
-			t.Errorf("table %q is registered as tenant_scoped=%v but the schema says %v "+
-				"(a tenant_id column is what decides)", r.name, *r.scoped, discovered[r.name])
+		// The case that matters: a table that carries tenant data but is marked
+		// exempt. That is allowed — service_account is — but only deliberately, and
+		// the reason has to be recorded rather than assumed.
+		if r.hasTenantID && !*r.scoped && (r.rationale == nil || *r.rationale == "") {
+			t.Errorf("table %q has a tenant_id column but is registered as not tenant-scoped, "+
+				"with no rationale. An exemption from row-level security must say why", r.name)
+		}
+		if !r.hasTenantID && *r.scoped && r.name != "tenant" {
+			t.Errorf("table %q is registered as tenant-scoped but has no tenant_id column, "+
+				"so no policy can key on one", r.name)
 		}
 	}
 }
@@ -236,13 +255,40 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 				[]any{"grp_" + suffix, "usr_" + suffix, tn}},
 			{`INSERT INTO app_enrollment (tenant_id, application_id) VALUES ($1, 'app_shared')`,
 				[]any{tn}},
+			{`INSERT INTO role (id, tenant_id, application_id, key, name, type)
+			  VALUES ($1, $2, 'app_shared', $3, 'Viewer', 'tenant_custom')`,
+				[]any{"rol_v_" + suffix, tn, "viewer-" + suffix}},
+			{`INSERT INTO role (id, tenant_id, application_id, key, name, type)
+			  VALUES ($1, $2, 'app_shared', $3, 'Approver', 'tenant_custom')`,
+				[]any{"rol_a_" + suffix, tn, "approver-" + suffix}},
+			{`INSERT INTO role_inheritance (role_id, parent_role_id, tenant_id) VALUES ($1, $2, $3)`,
+				[]any{"rol_a_" + suffix, "rol_v_" + suffix, tn}},
+			{`INSERT INTO role_permission (role_id, tenant_id, permission_key) VALUES ($1, $2, 'billing.invoice:read')`,
+				[]any{"rol_v_" + suffix, tn}},
+			{`INSERT INTO resource_node (tenant_id, ref) VALUES ($1, $2)`,
+				[]any{tn, "billing.invoice:" + suffix}},
+			{`INSERT INTO grant_ (id, tenant_id, subject_user_id, role_id, scope_kind, scope_ref)
+			  VALUES ($1, $2, $3, $4, 'tenant', $2)`,
+				[]any{"grn_" + suffix, tn, "usr_" + suffix, "rol_v_" + suffix}},
+			{`INSERT INTO denial (id, tenant_id, subject_user_id, permission_key, scope_kind, scope_ref, reason)
+			  VALUES ($1, $2, $3, 'billing.invoice:void', 'tenant', $2, 'seeded for the isolation test')`,
+				[]any{"den_" + suffix, tn, "usr_" + suffix}},
 		}
 
-		// One shared, global application, so app_enrollment has something to point at.
+		// One shared, global application, so app_enrollment has something to point
+		// at, plus a global role template — the row with a NULL tenant_id that both
+		// tenants must be able to read and neither may create.
 		if tn == tenantA {
-			if _, err := conn.Exec(ctx,
-				`INSERT INTO application (id, key, name) VALUES ('app_shared', 'billing', 'Billing')`); err != nil {
-				t.Fatalf("seeding the application: %v", err)
+			for _, stmt := range []string{
+				`INSERT INTO application (id, key, name) VALUES ('app_shared', 'billing', 'Billing')`,
+				`INSERT INTO role (id, tenant_id, application_id, key, name, type)
+				 VALUES ('rol_global', NULL, 'app_shared', 'billing.viewer', 'Billing Viewer', 'application_template')`,
+				`INSERT INTO role_permission (role_id, tenant_id, permission_key)
+				 VALUES ('rol_global', NULL, 'billing.invoice:read')`,
+			} {
+				if _, err := conn.Exec(ctx, stmt); err != nil {
+					t.Fatalf("seeding the shared application: %v", err)
+				}
 			}
 		}
 
@@ -291,21 +337,25 @@ func TestTenantIsolation(t *testing.T) {
 			col := tenantColumn(table)
 
 			err := app.InTenant(ctx, tenantA, func(ctx context.Context, tx pgx.Tx) error {
-				var mine, theirs, total int
+				var mine, theirs, global, total int
+				// Some tables permit a NULL tenant — a global role template, which
+				// every tenant may read and none may write. Those rows are counted
+				// separately so they cannot mask a leak.
 				q := fmt.Sprintf(`
 					SELECT count(*) FILTER (WHERE %[1]s = $1),
 					       count(*) FILTER (WHERE %[1]s = $2),
+					       count(*) FILTER (WHERE %[1]s IS NULL),
 					       count(*)
 					  FROM %[2]s`, col, pgx.Identifier{table}.Sanitize())
-				if err := tx.QueryRow(ctx, q, tenantA, tenantB).Scan(&mine, &theirs, &total); err != nil {
+				if err := tx.QueryRow(ctx, q, tenantA, tenantB).Scan(&mine, &theirs, &global, &total); err != nil {
 					return err
 				}
 
 				if theirs != 0 {
 					t.Errorf("a connection scoped to tenant A can see %d of tenant B's rows", theirs)
 				}
-				if total != theirs+mine {
-					t.Errorf("saw %d rows in total but only %d attributable to either tenant", total, theirs+mine)
+				if total != mine+global {
+					t.Errorf("saw %d rows in total but only %d of tenant A's and %d global", total, mine, global)
 				}
 				// Without this, a policy denying everything would pass the test above.
 				if mine == 0 {
@@ -321,9 +371,15 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
-// A connection that has not declared a tenant must see nothing. Unset means denied:
-// the alternative reading — an absent setting meaning "unrestricted" — is how a
-// forgotten scope becomes a cross-tenant read.
+// A connection that has not declared a tenant must see no tenant-owned row. Unset
+// means denied: the alternative reading — an absent setting meaning "unrestricted" —
+// is how a forgotten scope becomes a cross-tenant read.
+//
+// Rows with a NULL tenant are exempt, and deliberately so. They are application role
+// templates: part of the declared surface an application publishes once and every
+// tenant adopts (SPEC §6.1), in the same category as the application, resource_type
+// and permission tables, which carry no policy at all. Holding them to a stricter
+// standard than the rest of that surface would be inconsistent, not safer.
 func TestQueryWithoutATenantSeesNothing(t *testing.T) {
 	ctx := context.Background()
 	systemURL, applicationURL := setupDatabase(t)
@@ -343,13 +399,61 @@ func TestQueryWithoutATenantSeesNothing(t *testing.T) {
 	// being guarded against.
 	for _, table := range tables {
 		var n int
-		q := fmt.Sprintf(`SELECT count(*) FROM %s`, pgx.Identifier{table}.Sanitize())
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s IS NOT NULL`,
+			pgx.Identifier{table}.Sanitize(), tenantColumn(table))
 		if err := app.Pool().QueryRow(ctx, q).Scan(&n); err != nil {
 			t.Fatalf("querying %s: %v", table, err)
 		}
 		if n != 0 {
-			t.Errorf("%s: a query with no tenant scope returned %d rows; it must return none", table, n)
+			t.Errorf("%s: a query with no tenant scope returned %d tenant-owned rows; it must return none",
+				table, n)
 		}
+	}
+}
+
+// role, role_inheritance and role_permission are the only tables where a policy's
+// USING and WITH CHECK differ: a tenant may read a global template and must not be
+// able to create one. Reusing USING for writes — which is what Postgres does when
+// WITH CHECK is omitted — would let any tenant publish a role to every other tenant.
+func TestATenantCanReadGlobalTemplatesButNotCreateThem(t *testing.T) {
+	ctx := context.Background()
+	systemURL, applicationURL := setupDatabase(t)
+
+	sysConn, err := pgx.Connect(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	defer sysConn.Close(ctx)
+	seedTwoTenants(t, ctx, sysConn)
+
+	cfg := testConfig(t, systemURL, applicationURL, config.EnvProduction)
+	app := openStore(t, cfg, store.TenantScoped)
+
+	if err := app.InTenant(ctx, tenantA, func(ctx context.Context, tx pgx.Tx) error {
+		var n int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM role WHERE tenant_id IS NULL`).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			t.Error("a tenant cannot see the global role templates it is meant to adopt")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("reading templates: %v", err)
+	}
+
+	writeErr := app.InTenant(ctx, tenantA, func(ctx context.Context, tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx,
+			`INSERT INTO role (id, tenant_id, application_id, key, name, type)
+			 VALUES ('rol_planted', NULL, 'app_shared', 'planted', 'Planted', 'application_template')`)
+		return execErr
+	})
+	if writeErr == nil {
+		t.Fatal("a tenant created a global role template, which every other tenant would then see")
+	}
+	if !strings.Contains(writeErr.Error(), "row-level security") {
+		t.Fatalf("the write failed, but not because of the policy: %v", writeErr)
 	}
 }
 
@@ -544,13 +648,14 @@ func TestTenantListIsStable(t *testing.T) {
 
 	got := tenantScopedTables(t, ctx, conn)
 	want := []string{
-		"app_enrollment", "app_user", "credential", "group_", "group_member",
-		"identity", "idp_connection", "refresh_token", "session", "tenant",
+		"app_enrollment", "app_user", "credential", "denial", "grant_", "group_",
+		"group_member", "identity", "idp_connection", "refresh_token", "resource_node",
+		"role", "role_inheritance", "role_permission", "session", "tenant",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("the set of tenant-scoped tables changed.\n  got:  %v\n  want: %v\n"+
-			"If this is intentional, update this list and confirm the new table has a policy in migration 000005.",
+			"If this is intentional, update this list and confirm the new table has a policy.",
 			got, want)
 	}
 }

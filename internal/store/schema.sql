@@ -155,6 +155,30 @@ CREATE TABLE public.credential (
 ALTER TABLE ONLY public.credential FORCE ROW LEVEL SECURITY;
 
 --
+-- Name: denial; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.denial (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    subject_user_id text,
+    subject_group_id text,
+    permission_key public.citext NOT NULL,
+    scope_kind text NOT NULL,
+    scope_ref text NOT NULL,
+    reason text NOT NULL,
+    created_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT denial_exactly_one_subject CHECK ((num_nonnulls(subject_user_id, subject_group_id) = 1)),
+    CONSTRAINT denial_id_check CHECK ((id ~~ 'den\_%'::text)),
+    CONSTRAINT denial_permission_well_formed CHECK ((permission_key OPERATOR(public.~) '^[^.:[:space:]]+\.(\*|[^.:*[:space:]]+):(\*|[^.:*[:space:]]+)$'::public.citext)),
+    CONSTRAINT denial_reason_check CHECK ((length(btrim(reason)) > 0)),
+    CONSTRAINT denial_scope_kind_valid CHECK ((scope_kind = ANY (ARRAY['tenant'::text, 'application'::text, 'environment'::text, 'resource'::text, 'subtree'::text])))
+);
+
+ALTER TABLE ONLY public.denial FORCE ROW LEVEL SECURITY;
+
+--
 -- Name: environment; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -172,6 +196,46 @@ CREATE TABLE public.environment (
 --
 
 COMMENT ON TABLE public.environment IS 'A slice of an application''s configuration. UI bindings are environment-scoped so a change is testable in staging and promoted (SPEC §11.3).';
+
+--
+-- Name: grant_; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.grant_ (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    subject_user_id text,
+    subject_group_id text,
+    role_id text NOT NULL,
+    scope_kind text NOT NULL,
+    scope_ref text NOT NULL,
+    condition text,
+    valid_from timestamp with time zone DEFAULT now() NOT NULL,
+    valid_until timestamp with time zone,
+    granted_by text,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    seq bigint NOT NULL,
+    CONSTRAINT grant__id_check CHECK ((id ~~ 'grn\_%'::text)),
+    CONSTRAINT grant_exactly_one_subject CHECK ((num_nonnulls(subject_user_id, subject_group_id) = 1)),
+    CONSTRAINT grant_scope_kind_valid CHECK ((scope_kind = ANY (ARRAY['tenant'::text, 'application'::text, 'environment'::text, 'resource'::text, 'subtree'::text]))),
+    CONSTRAINT grant_window_ordered CHECK (((valid_until IS NULL) OR (valid_until > valid_from)))
+);
+
+ALTER TABLE ONLY public.grant_ FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: grant__seq_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.grant_ ALTER COLUMN seq ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.grant__seq_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
 
 --
 -- Name: group_; Type: TABLE; Schema: public; Owner: -
@@ -302,6 +366,22 @@ CREATE TABLE public.refresh_token (
 ALTER TABLE ONLY public.refresh_token FORCE ROW LEVEL SECURITY;
 
 --
+-- Name: resource_node; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_node (
+    tenant_id text NOT NULL,
+    ref text NOT NULL,
+    resource_type_id text,
+    parent_ref text,
+    attributes jsonb DEFAULT '{}'::jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_node_not_its_own_parent CHECK ((parent_ref IS DISTINCT FROM ref))
+);
+
+ALTER TABLE ONLY public.resource_node FORCE ROW LEVEL SECURITY;
+
+--
 -- Name: resource_type; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -318,6 +398,66 @@ CREATE TABLE public.resource_type (
     CONSTRAINT resource_type_key_has_no_separators CHECK (((key OPERATOR(public.!~) '[.:*[:space:]]'::public.citext) AND (length((key)::text) > 0))),
     CONSTRAINT resource_type_not_own_parent CHECK ((parent_type_id IS DISTINCT FROM id))
 );
+
+--
+-- Name: role; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role (
+    id text NOT NULL,
+    tenant_id text,
+    application_id text,
+    key public.citext NOT NULL,
+    name text NOT NULL,
+    description text,
+    type text NOT NULL,
+    forked_from text,
+    template_version integer,
+    constraints jsonb DEFAULT '{}'::jsonb NOT NULL,
+    assignable_by text[] DEFAULT '{}'::text[] NOT NULL,
+    immutable boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT role_id_check CHECK ((id ~~ 'rol\_%'::text)),
+    CONSTRAINT role_not_its_own_fork CHECK ((forked_from IS DISTINCT FROM id)),
+    CONSTRAINT role_scope_matches_type CHECK ((((type = 'tenant_custom'::text) AND (tenant_id IS NOT NULL)) OR ((type = ANY (ARRAY['system'::text, 'application_template'::text])) AND (tenant_id IS NULL)))),
+    CONSTRAINT role_type_valid CHECK ((type = ANY (ARRAY['system'::text, 'application_template'::text, 'tenant_custom'::text])))
+);
+
+ALTER TABLE ONLY public.role FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: COLUMN role.tenant_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.role.tenant_id IS 'NULL for an application template or system role, which every tenant can read but none can modify.';
+
+--
+-- Name: role_inheritance; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role_inheritance (
+    role_id text NOT NULL,
+    parent_role_id text NOT NULL,
+    tenant_id text,
+    CONSTRAINT role_inheritance_no_self_reference CHECK ((role_id <> parent_role_id))
+);
+
+ALTER TABLE ONLY public.role_inheritance FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: role_permission; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.role_permission (
+    role_id text NOT NULL,
+    tenant_id text,
+    permission_key public.citext NOT NULL,
+    condition text,
+    CONSTRAINT role_permission_well_formed CHECK ((permission_key OPERATOR(public.~) '^[^.:[:space:]]+\.(\*|[^.:*[:space:]]+):(\*|[^.:*[:space:]]+)$'::public.citext))
+);
+
+ALTER TABLE ONLY public.role_permission FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
@@ -446,11 +586,25 @@ ALTER TABLE ONLY public.credential
     ADD CONSTRAINT credential_pkey PRIMARY KEY (id);
 
 --
+-- Name: denial denial_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.denial
+    ADD CONSTRAINT denial_pkey PRIMARY KEY (id);
+
+--
 -- Name: environment environment_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.environment
     ADD CONSTRAINT environment_pkey PRIMARY KEY (id);
+
+--
+-- Name: grant_ grant__pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.grant_
+    ADD CONSTRAINT grant__pkey PRIMARY KEY (id);
 
 --
 -- Name: group_ group__pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -495,11 +649,46 @@ ALTER TABLE ONLY public.refresh_token
     ADD CONSTRAINT refresh_token_pkey PRIMARY KEY (id);
 
 --
+-- Name: resource_node resource_node_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_node
+    ADD CONSTRAINT resource_node_pkey PRIMARY KEY (tenant_id, ref);
+
+--
 -- Name: resource_type resource_type_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.resource_type
     ADD CONSTRAINT resource_type_pkey PRIMARY KEY (id);
+
+--
+-- Name: role role_id_tenant_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT role_id_tenant_key UNIQUE (id, tenant_id);
+
+--
+-- Name: role_inheritance role_inheritance_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_inheritance
+    ADD CONSTRAINT role_inheritance_pkey PRIMARY KEY (role_id, parent_role_id);
+
+--
+-- Name: role_permission role_permission_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_permission
+    ADD CONSTRAINT role_permission_pkey PRIMARY KEY (role_id, permission_key);
+
+--
+-- Name: role role_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT role_pkey PRIMARY KEY (id);
 
 --
 -- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -591,10 +780,40 @@ CREATE INDEX credential_tenant_id_idx ON public.credential USING btree (tenant_i
 CREATE INDEX credential_user_id_type_idx ON public.credential USING btree (user_id, type);
 
 --
+-- Name: denial_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX denial_tenant_idx ON public.denial USING btree (tenant_id);
+
+--
 -- Name: environment_application_name_key; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX environment_application_name_key ON public.environment USING btree (application_id, name);
+
+--
+-- Name: grant_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX grant_expiry_idx ON public.grant_ USING btree (valid_until) WHERE (valid_until IS NOT NULL);
+
+--
+-- Name: grant_tenant_group_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX grant_tenant_group_idx ON public.grant_ USING btree (tenant_id, subject_group_id) WHERE (subject_group_id IS NOT NULL);
+
+--
+-- Name: grant_tenant_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX grant_tenant_scope_idx ON public.grant_ USING btree (tenant_id, scope_ref);
+
+--
+-- Name: grant_tenant_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX grant_tenant_user_idx ON public.grant_ USING btree (tenant_id, subject_user_id) WHERE (subject_user_id IS NOT NULL);
 
 --
 -- Name: group_connection_idx; Type: INDEX; Schema: public; Owner: -
@@ -723,6 +942,18 @@ CREATE INDEX refresh_token_session_idx ON public.refresh_token USING btree (sess
 CREATE INDEX refresh_token_tenant_id_idx ON public.refresh_token USING btree (tenant_id);
 
 --
+-- Name: resource_node_attributes_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_node_attributes_idx ON public.resource_node USING gin (attributes jsonb_path_ops);
+
+--
+-- Name: resource_node_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_node_parent_idx ON public.resource_node USING btree (tenant_id, parent_ref) WHERE (parent_ref IS NOT NULL);
+
+--
 -- Name: resource_type_application_key_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -733,6 +964,42 @@ CREATE UNIQUE INDEX resource_type_application_key_key ON public.resource_type US
 --
 
 CREATE INDEX resource_type_parent_idx ON public.resource_type USING btree (parent_type_id) WHERE (parent_type_id IS NOT NULL);
+
+--
+-- Name: role_application_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_application_id_idx ON public.role USING btree (application_id);
+
+--
+-- Name: role_inheritance_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_inheritance_parent_idx ON public.role_inheritance USING btree (parent_role_id);
+
+--
+-- Name: role_inheritance_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_inheritance_tenant_idx ON public.role_inheritance USING btree (tenant_id);
+
+--
+-- Name: role_owner_key_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX role_owner_key_key ON public.role USING btree (tenant_id, application_id, key) NULLS NOT DISTINCT;
+
+--
+-- Name: role_permission_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_permission_tenant_idx ON public.role_permission USING btree (tenant_id);
+
+--
+-- Name: role_tenant_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX role_tenant_id_idx ON public.role USING btree (tenant_id);
 
 --
 -- Name: session_expires_at_idx; Type: INDEX; Schema: public; Owner: -
@@ -777,10 +1044,22 @@ CREATE TRIGGER application_set_updated_at BEFORE UPDATE ON public.application FO
 CREATE TRIGGER group_set_updated_at BEFORE UPDATE ON public.group_ FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
 
 --
+-- Name: resource_node resource_node_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_node_set_updated_at BEFORE UPDATE ON public.resource_node FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
 -- Name: resource_type resource_type_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER resource_type_set_updated_at BEFORE UPDATE ON public.resource_type FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
+-- Name: role role_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER role_set_updated_at BEFORE UPDATE ON public.role FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
 
 --
 -- Name: tenant tenant_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
@@ -831,11 +1110,60 @@ ALTER TABLE ONLY public.credential
     ADD CONSTRAINT credential_user_fkey FOREIGN KEY (user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
 
 --
+-- Name: denial denial_group_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.denial
+    ADD CONSTRAINT denial_group_fkey FOREIGN KEY (subject_group_id, tenant_id) REFERENCES public.group_(id, tenant_id) ON DELETE CASCADE;
+
+--
+-- Name: denial denial_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.denial
+    ADD CONSTRAINT denial_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: denial denial_user_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.denial
+    ADD CONSTRAINT denial_user_fkey FOREIGN KEY (subject_user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
+
+--
 -- Name: environment environment_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.environment
     ADD CONSTRAINT environment_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(id) ON DELETE CASCADE;
+
+--
+-- Name: grant_ grant__tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.grant_
+    ADD CONSTRAINT grant__tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: grant_ grant_group_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.grant_
+    ADD CONSTRAINT grant_group_fkey FOREIGN KEY (subject_group_id, tenant_id) REFERENCES public.group_(id, tenant_id) ON DELETE CASCADE;
+
+--
+-- Name: grant_ grant_role_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.grant_
+    ADD CONSTRAINT grant_role_fkey FOREIGN KEY (role_id) REFERENCES public.role(id) ON DELETE CASCADE;
+
+--
+-- Name: grant_ grant_user_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.grant_
+    ADD CONSTRAINT grant_user_fkey FOREIGN KEY (subject_user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
 
 --
 -- Name: group_ group__connection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -943,6 +1271,27 @@ ALTER TABLE ONLY public.refresh_token
     ADD CONSTRAINT refresh_token_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
 
 --
+-- Name: resource_node resource_node_parent_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_node
+    ADD CONSTRAINT resource_node_parent_fkey FOREIGN KEY (tenant_id, parent_ref) REFERENCES public.resource_node(tenant_id, ref) ON DELETE SET NULL (parent_ref);
+
+--
+-- Name: resource_node resource_node_resource_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_node
+    ADD CONSTRAINT resource_node_resource_type_id_fkey FOREIGN KEY (resource_type_id) REFERENCES public.resource_type(id);
+
+--
+-- Name: resource_node resource_node_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_node
+    ADD CONSTRAINT resource_node_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
 -- Name: resource_type resource_type_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -955,6 +1304,55 @@ ALTER TABLE ONLY public.resource_type
 
 ALTER TABLE ONLY public.resource_type
     ADD CONSTRAINT resource_type_parent_type_id_fkey FOREIGN KEY (parent_type_id) REFERENCES public.resource_type(id);
+
+--
+-- Name: role role_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT role_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(id) ON DELETE CASCADE;
+
+--
+-- Name: role role_forked_from_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT role_forked_from_fkey FOREIGN KEY (forked_from) REFERENCES public.role(id);
+
+--
+-- Name: role_inheritance role_inheritance_role_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_inheritance
+    ADD CONSTRAINT role_inheritance_role_fkey FOREIGN KEY (role_id, tenant_id) REFERENCES public.role(id, tenant_id) ON DELETE CASCADE;
+
+--
+-- Name: role_inheritance role_inheritance_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_inheritance
+    ADD CONSTRAINT role_inheritance_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: role_permission role_permission_role_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_permission
+    ADD CONSTRAINT role_permission_role_fkey FOREIGN KEY (role_id, tenant_id) REFERENCES public.role(id, tenant_id) ON DELETE CASCADE;
+
+--
+-- Name: role_permission role_permission_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role_permission
+    ADD CONSTRAINT role_permission_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: role role_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.role
+    ADD CONSTRAINT role_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
 
 --
 -- Name: session session_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -989,6 +1387,18 @@ ALTER TABLE public.app_user ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.credential ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: denial; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.denial ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: grant_; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.grant_ ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: group_; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -1017,6 +1427,30 @@ ALTER TABLE public.idp_connection ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.refresh_token ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: resource_node; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.resource_node ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: role; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.role ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: role_inheritance; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.role_inheritance ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: role_permission; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.role_permission ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: session; Type: ROW SECURITY; Schema: public; Owner: -
@@ -1049,6 +1483,18 @@ CREATE POLICY tenant_isolation ON public.app_user USING ((tenant_id = current_se
 CREATE POLICY tenant_isolation ON public.credential USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
 
 --
+-- Name: denial tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.denial USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: grant_ tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.grant_ USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
 -- Name: group_ tenant_isolation; Type: POLICY; Schema: public; Owner: -
 --
 
@@ -1077,6 +1523,30 @@ CREATE POLICY tenant_isolation ON public.idp_connection USING ((tenant_id = curr
 --
 
 CREATE POLICY tenant_isolation ON public.refresh_token USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: resource_node tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.resource_node USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: role tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.role USING (((tenant_id IS NULL) OR (tenant_id = current_setting('warden.tenant_id'::text, true)))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: role_inheritance tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.role_inheritance USING (((tenant_id IS NULL) OR (tenant_id = current_setting('warden.tenant_id'::text, true)))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: role_permission tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.role_permission USING (((tenant_id IS NULL) OR (tenant_id = current_setting('warden.tenant_id'::text, true)))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
 
 --
 -- Name: session tenant_isolation; Type: POLICY; Schema: public; Owner: -

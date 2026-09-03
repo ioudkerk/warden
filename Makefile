@@ -46,9 +46,14 @@ install: ## Install warden into GOBIN
 .PHONY: test
 test: test-go ## Run every test suite
 
+# -p 1 runs one package at a time. The integration packages each rebuild the schema
+# of the same database, so running them concurrently has one dropping the schema out
+# from under the other — which surfaces as an unrelated-looking "type citext does not
+# exist". Per-package databases would also work; serialising is cheaper and the suite
+# is seconds long.
 .PHONY: test-go
 test-go: ## Run the Go tests with the race detector
-	$(GO) test -race -shuffle=on -count=1 ./...
+	$(GO) test -race -shuffle=on -count=1 -p 1 ./...
 
 # The tenant-isolation suite needs a real PostgreSQL; without one it skips rather
 # than fails, so `make test` stays useful on a machine with no database. CI always
@@ -57,7 +62,7 @@ test-go: ## Run the Go tests with the race detector
 test-integration: ## Run the tests that need PostgreSQL (starts it if needed)
 	@docker compose -f deploy/docker-compose.yml up -d postgres >/dev/null
 	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U warden -d warden >/dev/null 2>&1; do :; done
-	WARDEN_TEST_DATABASE_URL="$(DATABASE_URL)" $(GO) test -race -count=1 ./internal/store/...
+	WARDEN_TEST_DATABASE_URL="$(DATABASE_URL)" $(GO) test -race -count=1 -p 1 ./internal/...
 
 .PHONY: test-isolation
 test-isolation: ## Run only the tenant-isolation suite, verbosely
@@ -65,7 +70,7 @@ test-isolation: ## Run only the tenant-isolation suite, verbosely
 
 .PHONY: test-cover
 test-cover: ## Run the Go tests and write a coverage profile
-	$(GO) test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+	$(GO) test -race -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic ./...
 	$(GO) tool cover -func=coverage.out | tail -1
 
 .PHONY: conformance
@@ -158,6 +163,16 @@ schema-check: schema-dump ## Fail if the committed schema does not match the mig
 .PHONY: dev-up
 dev-up: ## Start Postgres, Redis and Mailpit for local development
 	docker compose -f deploy/docker-compose.yml up -d
+
+.PHONY: dev-roles
+dev-roles: ## Create the local warden_app and warden_system roles (idempotent)
+	@docker compose -f deploy/docker-compose.yml exec -T postgres \
+		psql -U warden -d warden -q -v ON_ERROR_STOP=1 < deploy/dev-roles.sql
+	@echo "warden_app and warden_system are ready"
+
+.PHONY: dev-setup
+dev-setup: dev-up migrate-up dev-roles ## Start the dependencies, migrate, and create the roles
+	@echo "the development database is ready"
 
 .PHONY: dev-down
 dev-down: ## Stop the local development dependencies
