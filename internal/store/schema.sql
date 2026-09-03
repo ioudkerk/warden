@@ -747,6 +747,49 @@ ALTER TABLE ONLY public.session FORCE ROW LEVEL SECURITY;
 COMMENT ON TABLE public.session IS 'The browser-level SSO artifact (sid). Survives token refresh; the target of "log out everywhere". Mirrored from Redis for the active-sessions UI (SPEC §8.3).';
 
 --
+-- Name: setup_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.setup_token (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    user_id text NOT NULL,
+    token_hash bytea NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT setup_token_hash_is_sha256 CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT setup_token_id_check CHECK ((id ~~ 'stk\_%'::text))
+);
+
+--
+-- Name: signing_key; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.signing_key (
+    id text NOT NULL,
+    kid text NOT NULL,
+    algorithm text NOT NULL,
+    public_key text NOT NULL,
+    private_key bytea NOT NULL,
+    kek_id text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    activated_at timestamp with time zone,
+    retired_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    CONSTRAINT signing_key_algorithm_valid CHECK ((algorithm = ANY (ARRAY['RS256'::text, 'ES256'::text]))),
+    CONSTRAINT signing_key_id_check CHECK ((id ~~ 'key\_%'::text)),
+    CONSTRAINT signing_key_status_valid CHECK ((status = ANY (ARRAY['active'::text, 'previous'::text, 'retired'::text])))
+);
+
+--
+-- Name: TABLE signing_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.signing_key IS 'Token signing keys. Private halves are envelope-encrypted under the KEK (SPEC §17); a database copy alone cannot mint tokens.';
+
+--
 -- Name: tenant; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -761,6 +804,7 @@ CREATE TABLE public.tenant (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     deleted_at timestamp with time zone,
     CONSTRAINT tenant_id_check CHECK ((id ~~ 'ten\_%'::text)),
+    CONSTRAINT tenant_slug_not_reserved CHECK (((id = 'ten_system'::text) OR (slug OPERATOR(public.<>) ALL (ARRAY['system'::public.citext, 'warden'::public.citext, 'admin'::public.citext, 'internal'::public.citext])))),
     CONSTRAINT tenant_status_valid CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'deleted'::text])))
 );
 
@@ -1022,6 +1066,20 @@ ALTER TABLE ONLY public.session
 
 ALTER TABLE ONLY public.session
     ADD CONSTRAINT session_pkey PRIMARY KEY (id);
+
+--
+-- Name: setup_token setup_token_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.setup_token
+    ADD CONSTRAINT setup_token_pkey PRIMARY KEY (id);
+
+--
+-- Name: signing_key signing_key_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.signing_key
+    ADD CONSTRAINT signing_key_pkey PRIMARY KEY (id);
 
 --
 -- Name: tenant_isolation_registry tenant_isolation_registry_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1444,6 +1502,36 @@ CREATE INDEX session_tenant_id_idx ON public.session USING btree (tenant_id);
 --
 
 CREATE INDEX session_user_active_idx ON public.session USING btree (user_id) WHERE (revoked_at IS NULL);
+
+--
+-- Name: setup_token_hash_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX setup_token_hash_key ON public.setup_token USING btree (token_hash);
+
+--
+-- Name: setup_token_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX setup_token_user_idx ON public.setup_token USING btree (user_id);
+
+--
+-- Name: signing_key_kek_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX signing_key_kek_idx ON public.signing_key USING btree (kek_id);
+
+--
+-- Name: signing_key_kid_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX signing_key_kid_key ON public.signing_key USING btree (kid);
+
+--
+-- Name: signing_key_one_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX signing_key_one_active ON public.signing_key USING btree (status) WHERE (status = 'active'::text);
 
 --
 -- Name: tenant_slug_key; Type: INDEX; Schema: public; Owner: -
@@ -1916,6 +2004,20 @@ ALTER TABLE ONLY public.session
 
 ALTER TABLE ONLY public.session
     ADD CONSTRAINT session_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.app_user(id) ON DELETE CASCADE;
+
+--
+-- Name: setup_token setup_token_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.setup_token
+    ADD CONSTRAINT setup_token_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: setup_token setup_token_user_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.setup_token
+    ADD CONSTRAINT setup_token_user_fkey FOREIGN KEY (user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
 
 --
 -- Name: app_enrollment; Type: ROW SECURITY; Schema: public; Owner: -

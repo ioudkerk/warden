@@ -119,6 +119,7 @@ a case's expected `reason` changes. The format is documented in `conformance/REA
 enough that the Python SDK can implement a runner against it without asking questions.
 
 ### M0-9 Bootstrap (`warden init`)
+**Status: done.**
 Creates the system tenant, generates the signing keypair with a `kid`, creates the first
 owner, prints a one-time setup URL. **No default credentials, ever** (§20.2).
 **Exit:** a fresh database plus `warden init` yields exactly one usable one-time URL; running

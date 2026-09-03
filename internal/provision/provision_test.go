@@ -32,7 +32,20 @@ type fixture struct {
 	bob string
 }
 
+// setupBare gives a migrated database with nothing in it: no manifest, no tenant.
+// The bootstrap tests need one, because bootstrapping is what happens before any of
+// that exists.
+func setupBare(t *testing.T) fixture {
+	t.Helper()
+	return newFixture(t, false)
+}
+
 func setup(t *testing.T) fixture {
+	t.Helper()
+	return newFixture(t, true)
+}
+
+func newFixture(t *testing.T, seed bool) fixture {
 	t.Helper()
 	dsn := os.Getenv(dsnEnv)
 	if dsn == "" {
@@ -84,6 +97,11 @@ func setup(t *testing.T) fixture {
 	if err != nil {
 		t.Fatalf("provisioner: %v", err)
 	}
+	f := fixture{p: p, conn: conn}
+	if !seed {
+		return f
+	}
+
 	manifest, err := provision.LoadManifest(filepath.Join("..", "..", "examples", "warden.yaml"))
 	if err != nil {
 		t.Fatalf("manifest: %v", err)
@@ -95,7 +113,6 @@ func setup(t *testing.T) fixture {
 		t.Fatalf("tenant: %v", err)
 	}
 
-	f := fixture{p: p, conn: conn}
 	for _, u := range []struct {
 		name  string
 		roles []string

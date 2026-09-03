@@ -56,6 +56,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "serve":
 		return runServe(rest, stdout, stderr)
 
+	case "init":
+		return runInit(rest, stdout, stderr)
 	case "apply":
 		return runApply(rest, stdout, stderr)
 	case "tenant":
@@ -262,6 +264,7 @@ Usage:
   warden help              print this message
 
 Administration (until the console arrives in M6). Each needs database.system_url:
+  warden init -owner <email>                   bootstrap a fresh deployment; prints a one-time URL
   warden apply -f <manifest.yaml>              publish an application's permission surface
   warden tenant -slug <slug>                   create a tenant
   warden user -tenant <slug> -email <email>    create a user, printing its subject id

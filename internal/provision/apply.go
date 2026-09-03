@@ -592,18 +592,18 @@ func (p *Provisioner) CreateServiceAccount(ctx context.Context, tenantSlug, name
 // The forms are those of SPEC §9.5.
 func ParseScope(scope, tenantID string) (kind, ref string, err error) {
 	switch {
-	case scope == "" || scope == "tenant":
-		return "tenant", tenantID, nil
+	case scope == "" || scope == authz.ScopeTenant:
+		return authz.ScopeTenant, tenantID, nil
 	case strings.HasPrefix(scope, "app:"):
 		rest := strings.TrimPrefix(scope, "app:")
 		if app, env, found := strings.Cut(rest, "/env:"); found {
-			return "environment", app + "/" + env, nil
+			return authz.ScopeEnvironment, app + "/" + env, nil
 		}
-		return "application", rest, nil
+		return authz.ScopeApplication, rest, nil
 	case strings.HasSuffix(scope, "/**"):
-		return "subtree", strings.TrimSuffix(scope, "/**"), nil
+		return authz.ScopeSubtree, strings.TrimSuffix(scope, "/**"), nil
 	case strings.Contains(scope, ":"):
-		return "resource", scope, nil
+		return authz.ScopeResource, scope, nil
 	default:
 		return "", "", fmt.Errorf(
 			"scope %q is not a recognised form; want tenant, app:<key>, app:<key>/env:<name>, "+

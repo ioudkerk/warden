@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/provision"
+	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 )
 
@@ -342,4 +344,66 @@ func runAudit(args []string, stdout, stderr io.Writer) error {
 		}
 		return nil
 	})
+}
+
+// runInit bootstraps a fresh deployment (SPEC §20.2).
+func runInit(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("warden init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	email := fs.String("owner", "", "email address of the deployment's first owner")
+	own, rest := splitOwnFlags(fs, args)
+	if err := fs.Parse(own); err != nil {
+		return err
+	}
+	if *email == "" {
+		return fmt.Errorf("usage: warden init -owner <email>")
+	}
+
+	cfg, err := config.Load(config.Source{
+		Args: rest, LookupEnv: os.LookupEnv, ReadFile: os.ReadFile, Stderr: stderr,
+	})
+	if err != nil {
+		return err
+	}
+	keyring, err := cfg.Keyring(secrets.OSLookupEnv, secrets.OSReadFile)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	db, err := store.Open(ctx, cfg, store.SystemAccess)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	p, err := provision.New(db)
+	if err != nil {
+		return err
+	}
+
+	result, err := p.Bootstrap(ctx, *email, cfg.Issuer, cfg.Security.TokenSigningAlgorithm, keyring)
+	if err != nil {
+		if errors.Is(err, provision.ErrAlreadyInitialised) {
+			// Refused rather than repeated: a second init on a live deployment would
+			// mint a fresh setup URL for an existing owner, which is a password
+			// reset with no authentication in front of it.
+			return fmt.Errorf("%w. To recover access to an existing deployment, "+
+				"use the account recovery flow rather than re-initialising", err)
+		}
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Warden is initialised.\n\n")
+	fmt.Fprintf(stdout, "  deployment tenant  %s\n", result.TenantID)
+	fmt.Fprintf(stdout, "  first owner        %s (%s), role system.owner\n", result.Email, result.OwnerID)
+	fmt.Fprintf(stdout, "  signing key        %s, %s\n", result.SigningKeyID, result.SigningKeyAlg)
+	fmt.Fprintf(stdout, "\nOpen this once, within %s, to set the owner's credential:\n\n  %s\n\n",
+		time.Until(result.ExpiresAt).Round(time.Minute), result.SetupURL)
+	fmt.Fprintf(stderr,
+		"This link is shown once and is not recoverable: only its hash is stored.\n"+
+			"It expires at %s. Until it is used, the owner account exists but can do nothing.\n"+
+			"There is no default password to change, because there is no default password.\n",
+		result.ExpiresAt.Format(time.RFC3339))
+	return nil
 }
