@@ -20,6 +20,75 @@ SET row_security = off;
 CREATE SCHEMA public;
 
 --
+-- Name: warden_audit_append_only(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.warden_audit_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_event is append-only: % is not permitted', TG_OP
+        USING HINT = 'Correct a mistaken entry by appending a correcting one.';
+END;
+$$;
+
+--
+-- Name: warden_create_decision_partition(date); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.warden_create_decision_partition(month date) RETURNS text
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    start_at date := date_trunc('month', month)::date;
+    end_at   date := (date_trunc('month', month) + interval '1 month')::date;
+    name     text := format('decision_event_%s', to_char(start_at, 'YYYY_MM'));
+BEGIN
+    IF to_regclass('public.' || name) IS NOT NULL THEN
+        RETURN name;
+    END IF;
+    EXECUTE format(
+        'CREATE TABLE %I PARTITION OF decision_event FOR VALUES FROM (%L) TO (%L)',
+        name, start_at, end_at);
+    -- Creating a partition without protecting it would open the hole this function
+    -- exists to keep closed, on a schedule, months after anyone looked.
+    PERFORM warden_protect_partition(name);
+    RETURN name;
+END;
+$$;
+
+--
+-- Name: FUNCTION warden_create_decision_partition(month date); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.warden_create_decision_partition(month date) IS 'Creates the monthly partition covering the given date. Idempotent; called ahead of time by the worker role.';
+
+--
+-- Name: warden_protect_partition(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.warden_protect_partition(partition_name text) RETURNS void
+    LANGUAGE plpgsql
+    AS $_$
+BEGIN
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', partition_name);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', partition_name);
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policy p
+          JOIN pg_class c ON c.oid = p.polrelid
+         WHERE c.relname = partition_name AND p.polname = 'tenant_isolation'
+    ) THEN
+        EXECUTE format($p$
+            CREATE POLICY tenant_isolation ON %I
+                USING (tenant_id = current_setting('warden.tenant_id', true))
+                WITH CHECK (tenant_id = current_setting('warden.tenant_id', true))
+        $p$, partition_name);
+    END IF;
+END;
+$_$;
+
+--
 -- Name: warden_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -134,6 +203,53 @@ CREATE TABLE public.application (
 COMMENT ON COLUMN public.application.fail_mode IS 'PDP unreachable behaviour: closed denies, open_read allows previously-allowed reads, stale serves expired cache entries (SPEC §10.6).';
 
 --
+-- Name: audit_event; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.audit_event (
+    id text NOT NULL,
+    seq bigint NOT NULL,
+    tenant_id text,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    actor_user_id text,
+    actor_client_id text,
+    impersonator_id text,
+    action text NOT NULL,
+    target_type text,
+    target_id text,
+    before json,
+    after json,
+    reason text,
+    ip inet,
+    user_agent text,
+    request_id text,
+    prev_hash bytea,
+    hash bytea NOT NULL,
+    CONSTRAINT audit_event_hash_is_sha256 CHECK ((octet_length(hash) = 32)),
+    CONSTRAINT audit_event_id_check CHECK ((id ~~ 'aud\_%'::text)),
+    CONSTRAINT audit_event_prev_hash_is_sha256 CHECK (((prev_hash IS NULL) OR (octet_length(prev_hash) = 32)))
+);
+
+--
+-- Name: TABLE audit_event; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.audit_event IS 'Append-only, hash-chained record of every administrative mutation (SPEC §16.1). Enforced by trigger; verify the chain with `warden audit verify`.';
+
+--
+-- Name: audit_event_seq_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.audit_event ALTER COLUMN seq ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.audit_event_seq_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+--
 -- Name: credential; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -153,6 +269,101 @@ CREATE TABLE public.credential (
 );
 
 ALTER TABLE ONLY public.credential FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.decision_event (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    subject_id text NOT NULL,
+    application_id text,
+    permission_key public.citext NOT NULL,
+    resource_ref text,
+    allowed boolean NOT NULL,
+    reason text NOT NULL,
+    matched_grant text,
+    latency_us integer,
+    degraded boolean DEFAULT false NOT NULL,
+    revision bigint
+)
+PARTITION BY RANGE (occurred_at);
+
+ALTER TABLE ONLY public.decision_event FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: TABLE decision_event; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.decision_event IS 'One row per authorization decision, at the level the application configured (SPEC §16.2). Written through a buffered sink that never blocks a decision.';
+
+--
+-- Name: decision_event_2026_09; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.decision_event_2026_09 (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    subject_id text NOT NULL,
+    application_id text,
+    permission_key public.citext NOT NULL,
+    resource_ref text,
+    allowed boolean NOT NULL,
+    reason text NOT NULL,
+    matched_grant text,
+    latency_us integer,
+    degraded boolean DEFAULT false NOT NULL,
+    revision bigint
+);
+
+ALTER TABLE ONLY public.decision_event_2026_09 FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event_2026_10; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.decision_event_2026_10 (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    subject_id text NOT NULL,
+    application_id text,
+    permission_key public.citext NOT NULL,
+    resource_ref text,
+    allowed boolean NOT NULL,
+    reason text NOT NULL,
+    matched_grant text,
+    latency_us integer,
+    degraded boolean DEFAULT false NOT NULL,
+    revision bigint
+);
+
+ALTER TABLE ONLY public.decision_event_2026_10 FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event_default; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.decision_event_default (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    subject_id text NOT NULL,
+    application_id text,
+    permission_key public.citext NOT NULL,
+    resource_ref text,
+    allowed boolean NOT NULL,
+    reason text NOT NULL,
+    matched_grant text,
+    latency_us integer,
+    degraded boolean DEFAULT false NOT NULL,
+    revision bigint
+);
+
+ALTER TABLE ONLY public.decision_event_default FORCE ROW LEVEL SECURITY;
 
 --
 -- Name: denial; Type: TABLE; Schema: public; Owner: -
@@ -482,9 +693,16 @@ CREATE TABLE public.service_account (
     expires_at timestamp with time zone,
     last_used_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    may_explain boolean DEFAULT false NOT NULL,
     CONSTRAINT service_account_hash_is_sha256 CHECK ((octet_length(token_hash) = 32)),
     CONSTRAINT service_account_id_check CHECK ((id ~~ 'svc\_%'::text))
 );
+
+--
+-- Name: COLUMN service_account.may_explain; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.service_account.may_explain IS 'Permits POST /v1/authz/explain in production. Derivations leak policy structure (SPEC §10.3).';
 
 --
 -- Name: session; Type: TABLE; Schema: public; Owner: -
@@ -562,6 +780,24 @@ CREATE TABLE public.tenant_isolation_registry (
 COMMENT ON TABLE public.tenant_isolation_registry IS 'Declares, per table, whether it holds tenant-scoped data. The isolation test in internal/store cross-checks this against pg_class, so a new table cannot silently escape row-level security.';
 
 --
+-- Name: decision_event_2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event ATTACH PARTITION public.decision_event_2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
+
+--
+-- Name: decision_event_2026_10; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event ATTACH PARTITION public.decision_event_2026_10 FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00');
+
+--
+-- Name: decision_event_default; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event ATTACH PARTITION public.decision_event_default DEFAULT;
+
+--
 -- Name: action action_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -597,11 +833,46 @@ ALTER TABLE ONLY public.application
     ADD CONSTRAINT application_pkey PRIMARY KEY (id);
 
 --
+-- Name: audit_event audit_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.audit_event
+    ADD CONSTRAINT audit_event_pkey PRIMARY KEY (id);
+
+--
 -- Name: credential credential_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.credential
     ADD CONSTRAINT credential_pkey PRIMARY KEY (id);
+
+--
+-- Name: decision_event decision_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event
+    ADD CONSTRAINT decision_event_pkey PRIMARY KEY (occurred_at, id);
+
+--
+-- Name: decision_event_2026_09 decision_event_2026_09_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event_2026_09
+    ADD CONSTRAINT decision_event_2026_09_pkey PRIMARY KEY (occurred_at, id);
+
+--
+-- Name: decision_event_2026_10 decision_event_2026_10_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event_2026_10
+    ADD CONSTRAINT decision_event_2026_10_pkey PRIMARY KEY (occurred_at, id);
+
+--
+-- Name: decision_event_default decision_event_default_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.decision_event_default
+    ADD CONSTRAINT decision_event_default_pkey PRIMARY KEY (occurred_at, id);
 
 --
 -- Name: denial denial_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -787,6 +1058,30 @@ CREATE INDEX app_user_tenant_id_idx ON public.app_user USING btree (tenant_id);
 CREATE UNIQUE INDEX application_key_key ON public.application USING btree (key);
 
 --
+-- Name: audit_event_action_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX audit_event_action_idx ON public.audit_event USING btree (action, occurred_at DESC);
+
+--
+-- Name: audit_event_seq_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX audit_event_seq_key ON public.audit_event USING btree (seq);
+
+--
+-- Name: audit_event_target_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX audit_event_target_idx ON public.audit_event USING btree (target_type, target_id);
+
+--
+-- Name: audit_event_tenant_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX audit_event_tenant_time_idx ON public.audit_event USING btree (tenant_id, occurred_at DESC);
+
+--
 -- Name: credential_one_password_per_user; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -803,6 +1098,78 @@ CREATE INDEX credential_tenant_id_idx ON public.credential USING btree (tenant_i
 --
 
 CREATE INDEX credential_user_id_type_idx ON public.credential USING btree (user_id, type);
+
+--
+-- Name: decision_event_tenant_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_tenant_time_idx ON ONLY public.decision_event USING btree (tenant_id, occurred_at DESC);
+
+--
+-- Name: decision_event_2026_09_tenant_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_09_tenant_id_occurred_at_idx ON public.decision_event_2026_09 USING btree (tenant_id, occurred_at DESC);
+
+--
+-- Name: decision_event_denials_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_denials_idx ON ONLY public.decision_event USING btree (tenant_id, reason, occurred_at DESC) WHERE (NOT allowed);
+
+--
+-- Name: decision_event_2026_09_tenant_id_reason_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_09_tenant_id_reason_occurred_at_idx ON public.decision_event_2026_09 USING btree (tenant_id, reason, occurred_at DESC) WHERE (NOT allowed);
+
+--
+-- Name: decision_event_subject_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_subject_idx ON ONLY public.decision_event USING btree (tenant_id, subject_id, occurred_at DESC);
+
+--
+-- Name: decision_event_2026_09_tenant_id_subject_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_09_tenant_id_subject_id_occurred_at_idx ON public.decision_event_2026_09 USING btree (tenant_id, subject_id, occurred_at DESC);
+
+--
+-- Name: decision_event_2026_10_tenant_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_10_tenant_id_occurred_at_idx ON public.decision_event_2026_10 USING btree (tenant_id, occurred_at DESC);
+
+--
+-- Name: decision_event_2026_10_tenant_id_reason_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_10_tenant_id_reason_occurred_at_idx ON public.decision_event_2026_10 USING btree (tenant_id, reason, occurred_at DESC) WHERE (NOT allowed);
+
+--
+-- Name: decision_event_2026_10_tenant_id_subject_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_2026_10_tenant_id_subject_id_occurred_at_idx ON public.decision_event_2026_10 USING btree (tenant_id, subject_id, occurred_at DESC);
+
+--
+-- Name: decision_event_default_tenant_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_default_tenant_id_occurred_at_idx ON public.decision_event_default USING btree (tenant_id, occurred_at DESC);
+
+--
+-- Name: decision_event_default_tenant_id_reason_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_default_tenant_id_reason_occurred_at_idx ON public.decision_event_default USING btree (tenant_id, reason, occurred_at DESC) WHERE (NOT allowed);
+
+--
+-- Name: decision_event_default_tenant_id_subject_id_occurred_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX decision_event_default_tenant_id_subject_id_occurred_at_idx ON public.decision_event_default USING btree (tenant_id, subject_id, occurred_at DESC);
 
 --
 -- Name: denial_tenant_idx; Type: INDEX; Schema: public; Owner: -
@@ -1069,6 +1436,78 @@ CREATE INDEX session_user_active_idx ON public.session USING btree (user_id) WHE
 CREATE UNIQUE INDEX tenant_slug_key ON public.tenant USING btree (slug);
 
 --
+-- Name: decision_event_2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_pkey ATTACH PARTITION public.decision_event_2026_09_pkey;
+
+--
+-- Name: decision_event_2026_09_tenant_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_tenant_time_idx ATTACH PARTITION public.decision_event_2026_09_tenant_id_occurred_at_idx;
+
+--
+-- Name: decision_event_2026_09_tenant_id_reason_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_denials_idx ATTACH PARTITION public.decision_event_2026_09_tenant_id_reason_occurred_at_idx;
+
+--
+-- Name: decision_event_2026_09_tenant_id_subject_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_subject_idx ATTACH PARTITION public.decision_event_2026_09_tenant_id_subject_id_occurred_at_idx;
+
+--
+-- Name: decision_event_2026_10_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_pkey ATTACH PARTITION public.decision_event_2026_10_pkey;
+
+--
+-- Name: decision_event_2026_10_tenant_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_tenant_time_idx ATTACH PARTITION public.decision_event_2026_10_tenant_id_occurred_at_idx;
+
+--
+-- Name: decision_event_2026_10_tenant_id_reason_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_denials_idx ATTACH PARTITION public.decision_event_2026_10_tenant_id_reason_occurred_at_idx;
+
+--
+-- Name: decision_event_2026_10_tenant_id_subject_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_subject_idx ATTACH PARTITION public.decision_event_2026_10_tenant_id_subject_id_occurred_at_idx;
+
+--
+-- Name: decision_event_default_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_pkey ATTACH PARTITION public.decision_event_default_pkey;
+
+--
+-- Name: decision_event_default_tenant_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_tenant_time_idx ATTACH PARTITION public.decision_event_default_tenant_id_occurred_at_idx;
+
+--
+-- Name: decision_event_default_tenant_id_reason_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_denials_idx ATTACH PARTITION public.decision_event_default_tenant_id_reason_occurred_at_idx;
+
+--
+-- Name: decision_event_default_tenant_id_subject_id_occurred_at_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.decision_event_subject_idx ATTACH PARTITION public.decision_event_default_tenant_id_subject_id_occurred_at_idx;
+
+--
 -- Name: app_user app_user_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -1079,6 +1518,24 @@ CREATE TRIGGER app_user_set_updated_at BEFORE UPDATE ON public.app_user FOR EACH
 --
 
 CREATE TRIGGER application_set_updated_at BEFORE UPDATE ON public.application FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
+-- Name: audit_event audit_event_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_event_no_delete BEFORE DELETE ON public.audit_event FOR EACH STATEMENT EXECUTE FUNCTION public.warden_audit_append_only();
+
+--
+-- Name: audit_event audit_event_no_truncate; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_event_no_truncate BEFORE TRUNCATE ON public.audit_event FOR EACH STATEMENT EXECUTE FUNCTION public.warden_audit_append_only();
+
+--
+-- Name: audit_event audit_event_no_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_event_no_update BEFORE UPDATE ON public.audit_event FOR EACH STATEMENT EXECUTE FUNCTION public.warden_audit_append_only();
 
 --
 -- Name: group_ group_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
@@ -1137,6 +1594,13 @@ ALTER TABLE ONLY public.app_enrollment
 
 ALTER TABLE ONLY public.app_user
     ADD CONSTRAINT app_user_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: audit_event audit_event_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.audit_event
+    ADD CONSTRAINT audit_event_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
 
 --
 -- Name: credential credential_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -1444,6 +1908,30 @@ ALTER TABLE public.app_user ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.credential ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: decision_event; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.decision_event ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event_2026_09; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.decision_event_2026_09 ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event_2026_10; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.decision_event_2026_10 ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: decision_event_default; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.decision_event_default ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: denial; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -1538,6 +2026,30 @@ CREATE POLICY tenant_isolation ON public.app_user USING ((tenant_id = current_se
 --
 
 CREATE POLICY tenant_isolation ON public.credential USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: decision_event tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.decision_event USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: decision_event_2026_09 tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.decision_event_2026_09 USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: decision_event_2026_10 tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.decision_event_2026_10 USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: decision_event_default tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.decision_event_default USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
 
 --
 -- Name: denial tenant_isolation; Type: POLICY; Schema: public; Owner: -

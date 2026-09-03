@@ -37,6 +37,10 @@ type Request struct {
 	Attributes map[string]any
 	Context    map[string]any
 	Now        time.Time
+
+	// Explain asks the engine to record its derivation. It costs an AST walk and a
+	// map per condition, so a plain check leaves it false and pays nothing.
+	Explain bool
 }
 
 // Decision is the outcome, with the consistency token of the model it was evaluated
@@ -46,6 +50,10 @@ type Decision struct {
 	Reason       string
 	MatchedGrant string
 	Revision     int64
+
+	// Explanation is present only when the caller asked for one. It leaks policy
+	// structure, so it is returned from /v1/authz/explain and nowhere else.
+	Explanation *Explanation
 }
 
 // Evaluate implements SPEC §10.2 against an already-loaded model.
@@ -56,16 +64,19 @@ type Decision struct {
 // normative and documented in conformance/README.md; every implementation must follow
 // it or the corpus stops being portable between them.
 func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (Decision, error) {
+	tr := newTrace(req.Explain)
 	dec := func(reason string) Decision {
-		return Decision{Allowed: false, Reason: reason, Revision: m.Revision}
+		return Decision{Allowed: false, Reason: reason, Revision: m.Revision, Explanation: tr.result()}
 	}
 
 	// 1. Resolve the subject.
 	subject, ok := m.Subjects[req.Subject]
 	if !ok {
+		tr.note("no subject %q in this tenant", req.Subject)
 		return dec(ReasonSubjectNotFound), nil
 	}
 	if subject.Status != StatusActive {
+		tr.note("subject status is %q; only an active subject can be allowed anything", subject.Status)
 		return dec(ReasonSubjectInactive), nil
 	}
 
@@ -76,10 +87,14 @@ func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (
 		return Decision{}, err
 	}
 	if !m.DeclaredPermissions[req.Permission] {
+		tr.note("permission %q is not declared by any application; this is usually a typo", req.Permission)
 		return dec(ReasonUnknownPermission), nil
 	}
 
 	groups := m.GroupsOf[req.Subject]
+	if tr.enabled() {
+		tr.subject(m.roleKeysFor(req.Subject), sortedKeys(groups))
+	}
 	matchesSubject := func(userID, groupID string) bool {
 		if groupID != "" {
 			return groups[groupID]
@@ -95,8 +110,10 @@ func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (
 			continue
 		}
 		if m.scopeCovers(d.ScopeKind, d.ScopeRef, want, req) {
+			tr.denial(d, true)
 			return dec(ReasonExplicitDeny), nil
 		}
+		tr.denial(d, false)
 	}
 
 	// 5. Gather candidates: grants whose subject matches and whose role covers the
@@ -130,16 +147,22 @@ func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (
 
 		if !m.scopeCovers(g.ScopeKind, g.ScopeRef, want, req) {
 			sawOutOfScope = true
+			tr.grant(g, m.roleKey(g.RoleID), OutcomeOutOfScope,
+				"the grant does not reach "+resourceOrNothing(req.Resource), nil)
 			continue
 		}
 		if !validAt(g, req.Now) {
 			sawExpired = true
+			tr.grant(g, m.roleKey(g.RoleID), OutcomeExpired, validityDetail(g, req.Now), nil)
 			continue
 		}
 		candidates = append(candidates, candidate{grant: *g, condition: permCondition})
 	}
 
 	if len(candidates) == 0 {
+		if !anyGrantsIt {
+			tr.note("no grant gives %s to this subject", req.Permission)
+		}
 		switch {
 		case sawExpired:
 			return dec(ReasonGrantExpired), nil
@@ -155,44 +178,68 @@ func Evaluate(ctx context.Context, m *Model, conds *ConditionSet, req Request) (
 	// 6. Evaluate each candidate's constraints; the first that holds allows.
 	var sawMissing, sawMFA, sawFailed bool
 
+	allowedAt := -1
 	for i := range candidates {
 		c := &candidates[i]
+		if allowedAt >= 0 {
+			// Recorded but not evaluated: an earlier candidate already allowed. Say
+			// so rather than implying this one failed.
+			tr.grant(&c.grant, m.roleKey(c.grant.RoleID), OutcomeNotReached,
+				"an earlier grant already allowed", nil)
+			continue
+		}
+
 		role := m.Roles[c.grant.RoleID]
 		if role != nil && role.RequiresMFA && !hasSecondFactor(req.Context) {
 			sawMFA = true
+			tr.grant(&c.grant, m.roleKey(c.grant.RoleID), OutcomeMFARequired,
+				"the role requires a second factor and context.amr shows none", nil)
 			continue
 		}
 
 		// Both the grant's condition and any condition on the role's permission
 		// entry must hold: each narrows, neither widens (SPEC §9.6).
+		var traces []ConditionTrace
+		outcome := OutcomeMatched
 		failed := false
 		for _, expr := range []string{c.grant.Condition, c.condition} {
 			if expr == "" {
 				continue
 			}
-			result, err := conds.Eval(ctx, expr, m, want, req)
+			result, condTrace, err := conds.Eval(ctx, expr, m, want, req, tr.enabled())
 			if err != nil {
 				return Decision{}, err
+			}
+			if condTrace != nil {
+				traces = append(traces, *condTrace)
 			}
 			switch result {
 			case CondMissingAttribute:
 				sawMissing, failed = true, true
+				outcome = OutcomeMissingAttribute
 			case CondFalse:
 				sawFailed, failed = true, true
+				outcome = OutcomeConditionFailed
+			case CondTrue:
 			}
 			if failed {
 				break
 			}
 		}
+		tr.grant(&c.grant, m.roleKey(c.grant.RoleID), outcome, "", traces)
 		if failed {
 			continue
 		}
+		allowedAt = i
+	}
 
+	if allowedAt >= 0 {
 		return Decision{
 			Allowed:      true,
 			Reason:       ReasonGrantMatched,
-			MatchedGrant: c.grant.ID,
+			MatchedGrant: candidates[allowedAt].grant.ID,
 			Revision:     m.Revision,
+			Explanation:  tr.result(),
 		}, nil
 	}
 

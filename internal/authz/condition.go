@@ -33,7 +33,14 @@ type ConditionSet struct {
 	env *cel.Env
 
 	mu       sync.RWMutex
-	programs map[string]cel.Program
+	programs map[string]compiled
+}
+
+// compiled is a prepared expression plus the AST an explanation walks to find which
+// paths it reads.
+type compiled struct {
+	program cel.Program
+	paths   []string
 }
 
 // NewConditionSet builds an evaluator with the context of SPEC §9.6 declared.
@@ -49,7 +56,7 @@ func NewConditionSet() (*ConditionSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ConditionSet{env: env, programs: map[string]cel.Program{}}, nil
+	return &ConditionSet{env: env, programs: map[string]compiled{}}, nil
 }
 
 // Compile prepares an expression, returning an error the caller can surface at write
@@ -79,41 +86,65 @@ func (c *ConditionSet) Compile(expr string) error {
 	}
 
 	c.mu.Lock()
-	c.programs[expr] = program
+	c.programs[expr] = compiled{program: program, paths: referencedPaths(ast.NativeRep())}
 	c.mu.Unlock()
 	return nil
 }
 
 // Eval runs a condition against the assembled decision context.
-func (c *ConditionSet) Eval(_ context.Context, expr string, m *Model, want Permission, req Request) (CondResult, error) {
+//
+// When explain is true it also returns what the expression read: each path it
+// referenced and the value found there, including nils for paths that were absent —
+// which is usually the entire explanation for a missing_attribute.
+func (c *ConditionSet) Eval(
+	_ context.Context, expr string, m *Model, want Permission, req Request, explain bool,
+) (CondResult, *ConditionTrace, error) {
 	c.mu.RLock()
-	program, ok := c.programs[expr]
+	prepared, ok := c.programs[expr]
 	c.mu.RUnlock()
 	if !ok {
 		if err := c.Compile(expr); err != nil {
-			return CondFalse, err
+			return CondFalse, nil, err
 		}
 		c.mu.RLock()
-		program = c.programs[expr]
+		prepared = c.programs[expr]
 		c.mu.RUnlock()
 	}
 
-	out, _, err := program.Eval(buildActivation(m, want, req))
-	if err != nil {
-		if isMissingAttribute(err) {
-			return CondMissingAttribute, nil
+	activation := buildActivation(m, want, req)
+	out, _, err := prepared.program.Eval(activation)
+
+	var result CondResult
+	switch {
+	case err != nil && isMissingAttribute(err):
+		result = CondMissingAttribute
+	case err != nil:
+		return CondFalse, nil, fmt.Errorf("condition %q: %w", expr, err)
+	default:
+		asBool, isBool := out.Value().(bool)
+		if !isBool {
+			return CondFalse, nil, fmt.Errorf("condition %q returned %T, not a bool", expr, out.Value())
 		}
-		return CondFalse, fmt.Errorf("condition %q: %w", expr, err)
+		if asBool {
+			result = CondTrue
+		} else {
+			result = CondFalse
+		}
 	}
 
-	result, ok := out.Value().(bool)
-	if !ok {
-		return CondFalse, fmt.Errorf("condition %q returned %T, not a bool", expr, out.Value())
+	if !explain {
+		return result, nil, nil
 	}
-	if result {
-		return CondTrue, nil
+
+	values := make(map[string]any, len(prepared.paths))
+	for _, path := range prepared.paths {
+		values[path] = resolvePath(activation, path)
 	}
-	return CondFalse, nil
+	return result, &ConditionTrace{
+		Expression: expr,
+		Result:     map[CondResult]string{CondTrue: "true", CondFalse: "false", CondMissingAttribute: "missing_attribute"}[result],
+		Values:     values,
+	}, nil
 }
 
 // isMissingAttribute distinguishes "the expression asked for something that is not

@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/store"
 )
 
@@ -23,14 +27,19 @@ type Server struct {
 	engine *authz.Engine
 
 	// tenant serves decisions and is subject to row-level security. system exists
-	// only for the one lookup that cannot be tenant-scoped: resolving a token to the
-	// tenant it belongs to.
+	// for the lookups that cannot be tenant-scoped: resolving a token to the tenant
+	// it belongs to, and writing the decision log.
 	tenant *store.Store
 	system *store.Store
+
+	decisions *decisionlog.Sink
+	// level is the decision log level, read from the application's configuration.
+	// Cached per tenant so the hot path does not query for it on every decision.
+	levels sync.Map // tenant id -> decisionlog.Level
 }
 
 // New builds the server.
-func New(cfg *config.Config, log *slog.Logger, tenant, system *store.Store) (*Server, error) {
+func New(cfg *config.Config, log *slog.Logger, tenant, system *store.Store, decisions *decisionlog.Sink) (*Server, error) {
 	engine, err := authz.NewEngine(tenant)
 	if err != nil {
 		return nil, err
@@ -40,7 +49,75 @@ func New(cfg *config.Config, log *slog.Logger, tenant, system *store.Store) (*Se
 			"the decision API needs database.system_url: authenticating a service account " +
 				"means resolving a token to a tenant, which happens before any tenant scope exists")
 	}
-	return &Server{cfg: cfg, log: log, engine: engine, tenant: tenant, system: system}, nil
+	return &Server{
+		cfg: cfg, log: log, engine: engine,
+		tenant: tenant, system: system, decisions: decisions,
+	}, nil
+}
+
+// decisionLevel returns the log level configured for a tenant's applications.
+//
+// SPEC §16.2 makes this per application; with one decision endpoint and no
+// application in the request, the strictest level across the tenant's enrolled
+// applications is used — recording more than one application asked for is a cost,
+// while recording less would silently lose what someone configured it for.
+func (s *Server) decisionLevel(ctx context.Context, tenantID string) decisionlog.Level {
+	if cached, ok := s.levels.Load(tenantID); ok {
+		if level, isLevel := cached.(decisionlog.Level); isLevel {
+			return level
+		}
+	}
+
+	level := decisionlog.LevelDenies
+	err := s.system.InSystem(ctx, "reading the decision log level", func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT a.decision_log
+			  FROM application a JOIN app_enrollment e ON e.application_id = a.id
+			 WHERE e.tenant_id = $1`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		strictest := -1
+		for rows.Next() {
+			var raw string
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			parsed, err := decisionlog.ParseLevel(raw)
+			if err != nil {
+				s.log.Warn("unrecognised decision_log level; using denies", "value", raw)
+				continue
+			}
+			if rank := levelRank(parsed); rank > strictest {
+				strictest, level = rank, parsed
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Warn("could not read the decision log level; using denies", "error", err)
+		return decisionlog.LevelDenies
+	}
+
+	s.levels.Store(tenantID, level)
+	return level
+}
+
+// levelRank orders levels by how much they record.
+func levelRank(l decisionlog.Level) int {
+	switch l {
+	case decisionlog.LevelOff:
+		return 0
+	case decisionlog.LevelDenies:
+		return 1
+	case decisionlog.LevelSampled:
+		return 2
+	case decisionlog.LevelAll:
+		return 3
+	default:
+		return 1
+	}
 }
 
 // Handler returns the routes.
@@ -54,6 +131,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
+	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))
 
 	return s.withRequestLimits(mux)
 }

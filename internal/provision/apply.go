@@ -5,17 +5,38 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/warden-project/warden/internal/audit"
 	"github.com/warden-project/warden/internal/store"
 )
 
 // Provisioner performs administrative operations over the system pool.
-type Provisioner struct{ db *store.Store }
+//
+// Every operation writes an audit entry in the same transaction as the change it
+// describes. Writing it separately would permit a change that committed with no
+// record, or a record of a change that rolled back — and a log that is sometimes
+// wrong is worse than no log, because it is trusted.
+type Provisioner struct {
+	db    *store.Store
+	audit *audit.Writer
+	// Actor identifies who is performing these operations, for the audit trail.
+	// Empty means the CLI, which is recorded as such rather than as nobody.
+	actor string
+}
+
+// WithActor returns a provisioner that records a different actor on its audit
+// entries. The management API will use it once callers are authenticated.
+func (p *Provisioner) WithActor(actor string) *Provisioner {
+	clone := *p
+	clone.actor = actor
+	return &clone
+}
 
 // New builds a provisioner. It refuses a tenant-scoped pool: every operation here is
 // either cross-tenant or runs before a tenant scope exists, and a tenant-scoped
@@ -24,7 +45,14 @@ func New(db *store.Store) (*Provisioner, error) {
 	if db.Access() != store.SystemAccess {
 		return nil, fmt.Errorf("provisioning requires the system pool, not the %s pool", db.Access())
 	}
-	return &Provisioner{db: db}, nil
+	return &Provisioner{db: db, audit: audit.NewWriter(), actor: "cli"}, nil
+}
+
+// record appends an audit entry inside the caller's transaction.
+func (p *Provisioner) record(ctx context.Context, tx pgx.Tx, e audit.Entry) error {
+	e.ActorClientID = p.actor
+	_, err := p.audit.Append(ctx, tx, e)
+	return err
 }
 
 func id(prefix, key string) string {
@@ -200,6 +228,18 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 			}
 		}
 
+		if err := p.record(ctx, tx, audit.Entry{
+			Action:     "application.manifest_applied",
+			TargetType: "application",
+			TargetID:   appID,
+			After: map[string]any{
+				"key": m.Application, "version": m.Version,
+				"permissions": result.Permissions, "roles": result.Roles,
+			},
+			Reason: "warden apply",
+		}); err != nil {
+			return err
+		}
 		return bumpEveryTenant(ctx, tx)
 	})
 
@@ -234,10 +274,16 @@ func (p *Provisioner) CreateTenant(ctx context.Context, slug, name string) (stri
 			tenantID, slug, orKey(name, slug)); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO app_enrollment (tenant_id, application_id)
-			SELECT $1, id FROM application ON CONFLICT DO NOTHING`, tenantID)
-		return err
+			SELECT $1, id FROM application ON CONFLICT DO NOTHING`, tenantID); err != nil {
+			return err
+		}
+		return p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "tenant.created",
+			TargetType: "tenant", TargetID: tenantID,
+			After: map[string]any{"slug": slug, "name": orKey(name, slug)},
+		})
 	})
 	return tenantID, err
 }
@@ -250,10 +296,16 @@ func (p *Provisioner) CreateUser(ctx context.Context, tenantSlug, email string, 
 		attributes = map[string]any{}
 	}
 	err := p.db.InSystem(ctx, "creating user "+email, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO app_user (id, tenant_id, email, status, attributes)
-			VALUES ($1, $2, $3, 'active', $4)`, userID, tenantID, email, attributes)
-		return err
+			VALUES ($1, $2, $3, 'active', $4)`, userID, tenantID, email, attributes); err != nil {
+			return err
+		}
+		return p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "user.created",
+			TargetType: "user", TargetID: userID,
+			After: map[string]any{"email": email, "attributes": attributes},
+		})
 	})
 	return userID, err
 }
@@ -299,6 +351,18 @@ func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error)
 			kind, ref, condition, o.ValidUntil, o.Reason); execErr != nil {
 			return execErr
 		}
+		if recordErr := p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "role.granted",
+			TargetType: "grant", TargetID: grantID,
+			After: map[string]any{
+				"role": o.RoleKey, "scope": o.Scope, "subject_user": o.UserID,
+				"subject_group": o.GroupID, "condition": o.Condition,
+				"valid_until": o.ValidUntil,
+			},
+			Reason: o.Reason,
+		}); recordErr != nil {
+			return recordErr
+		}
 		return bumpTenant(ctx, tx, tenantID)
 	})
 	return grantID, err
@@ -308,12 +372,36 @@ func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error)
 func (p *Provisioner) Revoke(ctx context.Context, tenantSlug, grantID string) error {
 	tenantID := id("ten", tenantSlug)
 	return p.db.InSystem(ctx, "revoking "+grantID, func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `DELETE FROM grant_ WHERE id = $1 AND tenant_id = $2`, grantID, tenantID)
+		// Read the grant before deleting it. An audit entry saying only "a grant was
+		// revoked" cannot answer the question anyone actually asks a year later,
+		// which is what it granted.
+		var role, scopeKind, scopeRef string
+		var subjectUser, subjectGroup *string
+		err := tx.QueryRow(ctx, `
+			SELECT r.key, g.scope_kind, g.scope_ref, g.subject_user_id, g.subject_group_id
+			  FROM grant_ g JOIN role r ON r.id = g.role_id
+			 WHERE g.id = $1 AND g.tenant_id = $2`,
+			grantID, tenantID).Scan(&role, &scopeKind, &scopeRef, &subjectUser, &subjectGroup)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("no grant %s in tenant %s", grantID, tenantSlug)
+			}
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("no grant %s in tenant %s", grantID, tenantSlug)
+
+		if _, err := tx.Exec(ctx, `DELETE FROM grant_ WHERE id = $1 AND tenant_id = $2`,
+			grantID, tenantID); err != nil {
+			return err
+		}
+		if err := p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "role.revoked",
+			TargetType: "grant", TargetID: grantID,
+			Before: map[string]any{
+				"role": role, "scope_kind": scopeKind, "scope_ref": scopeRef,
+				"subject_user": subjectUser, "subject_group": subjectGroup,
+			},
+		}); err != nil {
+			return err
 		}
 		return bumpTenant(ctx, tx, tenantID)
 	})
@@ -338,6 +426,13 @@ func (p *Provisioner) RegisterResource(ctx context.Context, tenantSlug, ref, par
 			tenantID, ref, parent, attrs); err != nil {
 			return err
 		}
+		if err := p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "resource.registered",
+			TargetType: "resource", TargetID: ref,
+			After: map[string]any{"parent": parentRef, "attributes": attrs},
+		}); err != nil {
+			return err
+		}
 		return bumpTenant(ctx, tx, tenantID)
 	})
 }
@@ -345,7 +440,7 @@ func (p *Provisioner) RegisterResource(ctx context.Context, tenantSlug, ref, par
 // CreateServiceAccount mints a token for an application to authenticate with. The
 // token is returned once and never stored — only its SHA-256 is kept, so a copy of
 // the database does not confer the ability to impersonate the application.
-func (p *Provisioner) CreateServiceAccount(ctx context.Context, tenantSlug, name string) (token string, err error) {
+func (p *Provisioner) CreateServiceAccount(ctx context.Context, tenantSlug, name string, mayExplain bool) (token string, err error) {
 	raw := make([]byte, 32)
 	if _, readErr := rand.Read(raw); readErr != nil {
 		return "", readErr
@@ -356,10 +451,20 @@ func (p *Provisioner) CreateServiceAccount(ctx context.Context, tenantSlug, name
 	tenantID := id("ten", tenantSlug)
 	err = p.db.InSystem(ctx, "creating service account "+name, func(ctx context.Context, tx pgx.Tx) error {
 		_, execErr := tx.Exec(ctx, `
-			INSERT INTO service_account (id, tenant_id, name, token_hash)
-			VALUES ($1, $2, $3, $4)`,
-			id("svc", tenantSlug+"_"+name), tenantID, name, sum[:])
-		return execErr
+			INSERT INTO service_account (id, tenant_id, name, token_hash, may_explain)
+			VALUES ($1, $2, $3, $4, $5)`,
+			id("svc", tenantSlug+"_"+name), tenantID, name, sum[:], mayExplain)
+		if execErr != nil {
+			return execErr
+		}
+		// The token itself is deliberately absent from the entry. An audit log that
+		// records a credential has become a second copy of the credential store,
+		// with weaker access controls and longer retention.
+		return p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "service_account.created",
+			TargetType: "service_account", TargetID: id("svc", tenantSlug+"_"+name),
+			After: map[string]any{"name": name, "may_explain": mayExplain},
+		})
 	})
 	if err != nil {
 		return "", err
@@ -396,4 +501,61 @@ func randomSuffix() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// VerifyAudit recomputes the audit hash chain (SPEC §16.1).
+func (p *Provisioner) VerifyAudit(ctx context.Context) (audit.VerifyResult, error) {
+	var result audit.VerifyResult
+	err := p.db.InSystem(ctx, "verifying the audit chain", func(ctx context.Context, tx pgx.Tx) error {
+		var verifyErr error
+		result, verifyErr = audit.VerifyOrError(ctx, tx)
+		return verifyErr
+	})
+	return result, err
+}
+
+// AuditEntry is one row of the log, as displayed.
+type AuditEntry struct {
+	OccurredAt time.Time
+	Action     string
+	TargetType string
+	TargetID   string
+	TenantID   string
+	Reason     string
+}
+
+// RecentAudit returns the most recent entries, optionally for one tenant.
+func (p *Provisioner) RecentAudit(ctx context.Context, tenantSlug string, limit int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var tenantID *string
+	if tenantSlug != "" {
+		v := id("ten", tenantSlug)
+		tenantID = &v
+	}
+
+	var entries []AuditEntry
+	err := p.db.InSystem(ctx, "reading the audit log", func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT occurred_at, action, coalesce(target_type,''), coalesce(target_id,''),
+			       coalesce(tenant_id,''), coalesce(reason,'')
+			  FROM audit_event
+			 WHERE ($1::text IS NULL OR tenant_id = $1)
+			 ORDER BY seq DESC LIMIT $2`, tenantID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e AuditEntry
+			if err := rows.Scan(&e.OccurredAt, &e.Action, &e.TargetType,
+				&e.TargetID, &e.TenantID, &e.Reason); err != nil {
+				return err
+			}
+			entries = append(entries, e)
+		}
+		return rows.Err()
+	})
+	return entries, err
 }

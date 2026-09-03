@@ -33,13 +33,18 @@ func tenantScopedTables(t *testing.T, ctx context.Context, conn *pgx.Conn) []str
 	// tenant necessarily happens before any tenant scope exists. The registry forces
 	// that exemption to be written down with a reason, and
 	// TestEveryTableIsClassified fails on a table that has the column and no entry.
+	// relkind 'p' is a partitioned table and 'r' an ordinary one; both can hold
+	// tenant data. Partitions themselves are excluded here and covered by
+	// TestEveryPartitionOfAProtectedTableIsProtected, because they are not
+	// separately classified — they belong to their parent.
 	const discover = `
 		SELECT c.relname
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
 		  JOIN tenant_isolation_registry r ON r.table_name = c.relname
 		 WHERE n.nspname = 'public'
-		   AND c.relkind = 'r'
+		   AND c.relkind IN ('r', 'p')
+		   AND NOT c.relispartition
 		   AND r.tenant_scoped
 		   AND (c.relname = 'tenant'
 		        OR EXISTS (SELECT 1 FROM pg_attribute a
@@ -105,7 +110,7 @@ func TestEveryTableIsClassified(t *testing.T) {
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
 		  LEFT JOIN tenant_isolation_registry r ON r.table_name = c.relname
-		 WHERE n.nspname = 'public' AND c.relkind = 'r'
+		 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
 		 ORDER BY c.relname`)
 	if err != nil {
 		t.Fatalf("querying the registry: %v", err)
@@ -273,6 +278,9 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			{`INSERT INTO denial (id, tenant_id, subject_user_id, permission_key, scope_kind, scope_ref, reason)
 			  VALUES ($1, $2, $3, 'billing.invoice:void', 'tenant', $2, 'seeded for the isolation test')`,
 				[]any{"den_" + suffix, tn, "usr_" + suffix}},
+			{`INSERT INTO decision_event (id, tenant_id, subject_id, permission_key, allowed, reason)
+			  VALUES ($1, $2, $3, 'billing.invoice:read', true, 'grant_matched')`,
+				[]any{"dec_" + suffix, tn, "usr_" + suffix}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -637,6 +645,117 @@ func TestChildRowsCannotSpanTenants(t *testing.T) {
 	}
 }
 
+// A partitioned table's policies apply when a query names the parent, and NOT when it
+// names a partition directly. With the parent protected and its partitions bare,
+// `SELECT * FROM decision_event` correctly returns one tenant's rows while
+// `SELECT * FROM decision_event_2026_09` returns everyone's — and the partition is an
+// ordinary table with an ordinary grant, so any role that can read the parent can name
+// it.
+//
+// This was a real hole when the decision log was first written. It is the kind that
+// reopens by itself: a partition created next month by a maintenance job would arrive
+// unprotected, months after anyone last looked.
+func TestEveryPartitionOfAProtectedTableIsProtected(t *testing.T) {
+	ctx := context.Background()
+	systemURL, _ := setupDatabase(t)
+
+	conn, err := pgx.Connect(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx, `
+		SELECT child.relname, parent.relname,
+		       child.relrowsecurity, child.relforcerowsecurity,
+		       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = child.oid)
+		  FROM pg_inherits i
+		  JOIN pg_class child  ON child.oid  = i.inhrelid
+		  JOIN pg_class parent ON parent.oid = i.inhparent
+		 WHERE parent.relrowsecurity
+		 ORDER BY parent.relname, child.relname`)
+	if err != nil {
+		t.Fatalf("listing partitions: %v", err)
+	}
+	defer rows.Close()
+
+	found := 0
+	for rows.Next() {
+		var child, parent string
+		var enabled, forced bool
+		var policies int
+		if err := rows.Scan(&child, &parent, &enabled, &forced, &policies); err != nil {
+			t.Fatalf("scanning: %v", err)
+		}
+		found++
+		if !enabled || !forced || policies == 0 {
+			t.Errorf("partition %q of protected table %q is not protected "+
+				"(enabled=%v forced=%v policies=%d); reading it directly bypasses the parent's policy",
+				child, parent, enabled, forced, policies)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("listing partitions: %v", err)
+	}
+	if found == 0 {
+		t.Fatal("no partitions of a protected table were found; the query is wrong, " +
+			"or decision_event lost its partitions")
+	}
+	t.Logf("checked %d partitions", found)
+}
+
+// The behavioural half: a partition read directly must obey the tenant scope.
+func TestReadingAPartitionDirectlyRespectsTheTenantScope(t *testing.T) {
+	ctx := context.Background()
+	systemURL, applicationURL := setupDatabase(t)
+
+	sysConn, err := pgx.Connect(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	defer sysConn.Close(ctx)
+	seedTwoTenants(t, ctx, sysConn)
+
+	// One decision for each tenant, both landing in the current month's partition.
+	for _, tn := range []string{tenantA, tenantB} {
+		if _, err := sysConn.Exec(ctx, `
+			INSERT INTO decision_event (id, tenant_id, subject_id, permission_key, allowed, reason)
+			VALUES ($1, $2, 'usr_x', 'billing.invoice:read', true, 'grant_matched')`,
+			"dec_"+tn[4:8], tn); err != nil {
+			t.Fatalf("seeding a decision for %s: %v", tn, err)
+		}
+	}
+
+	var partition string
+	if err := sysConn.QueryRow(ctx, `
+		SELECT c.relname FROM pg_inherits i
+		  JOIN pg_class c ON c.oid = i.inhrelid
+		 WHERE i.inhparent = 'decision_event'::regclass
+		   AND EXISTS (SELECT 1 FROM decision_event_default) IS NOT NULL
+		 ORDER BY c.relname DESC LIMIT 1`).Scan(&partition); err != nil {
+		t.Fatalf("finding a partition: %v", err)
+	}
+
+	cfg := testConfig(t, systemURL, applicationURL, config.EnvProduction)
+	app := openStore(t, cfg, store.TenantScoped)
+
+	if err := app.InTenant(ctx, tenantA, func(ctx context.Context, tx pgx.Tx) error {
+		var theirs int
+		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE tenant_id = $1`,
+			pgx.Identifier{partition}.Sanitize())
+		if err := tx.QueryRow(ctx, q, tenantB).Scan(&theirs); err != nil {
+			return err
+		}
+		if theirs != 0 {
+			t.Errorf("reading partition %s directly, tenant A saw %d of tenant B's decisions",
+				partition, theirs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("querying the partition: %v", err)
+	}
+}
+
 func TestTenantListIsStable(t *testing.T) {
 	ctx := context.Background()
 	systemURL, _ := setupDatabase(t)
@@ -648,9 +767,10 @@ func TestTenantListIsStable(t *testing.T) {
 
 	got := tenantScopedTables(t, ctx, conn)
 	want := []string{
-		"app_enrollment", "app_user", "credential", "denial", "grant_", "group_",
-		"group_member", "identity", "idp_connection", "refresh_token", "resource_node",
-		"role", "role_inheritance", "role_permission", "session", "tenant",
+		"app_enrollment", "app_user", "credential", "decision_event", "denial",
+		"grant_", "group_", "group_member", "identity", "idp_connection",
+		"refresh_token", "resource_node", "role", "role_inheritance",
+		"role_permission", "session", "tenant",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {

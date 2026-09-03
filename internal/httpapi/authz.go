@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/warden-project/warden/internal/authz"
+	"github.com/warden-project/warden/internal/decisionlog"
 )
 
 // maxBatchChecks matches SPEC §10.1: up to 1000 decisions in one round trip. The cap
@@ -47,11 +49,12 @@ func (r *resourceRef) Ref() string {
 }
 
 type checkResponse struct {
-	Allowed          bool      `json:"allowed"`
-	Reason           string    `json:"reason"`
-	MatchedGrant     string    `json:"matched_grant,omitempty"`
-	ConsistencyToken string    `json:"consistency_token"`
-	Cache            cacheHint `json:"cache"`
+	Allowed          bool               `json:"allowed"`
+	Reason           string             `json:"reason"`
+	MatchedGrant     string             `json:"matched_grant,omitempty"`
+	ConsistencyToken string             `json:"consistency_token"`
+	Cache            cacheHint          `json:"cache"`
+	Explain          *authz.Explanation `json:"explain,omitempty"`
 }
 
 type cacheHint struct {
@@ -59,8 +62,33 @@ type cacheHint struct {
 	TTLSeconds int  `json:"ttl_seconds"`
 }
 
+// handleExplain answers the same question as check and returns the derivation with
+// it: which grants were considered, what became of each, and the values every
+// condition actually read.
+//
+// SPEC §10.3 restricts this, and the restriction is the point: an explanation
+// describes the policy — which roles exist, which grants reach which objects, which
+// attribute a condition compares. That is exactly what someone probing the service
+// would like to know. It is refused in production unless the service account is
+// marked as allowed to see it.
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFrom(r.Context())
+
+	if s.cfg.Environment.IsProduction() && !caller.MayExplain {
+		writeProblem(w, http.StatusForbidden, "explain_not_permitted",
+			"Explanations describe the policy itself, so outside development they are "+
+				"limited to service accounts marked may_explain. Grant it deliberately.")
+		return
+	}
+	s.check(w, r, caller, true)
+}
+
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFrom(r.Context())
+	s.check(w, r, caller, false)
+}
+
+func (s *Server) check(w http.ResponseWriter, r *http.Request, caller Caller, explain bool) {
 
 	var req checkRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -72,6 +100,7 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
 	decision, err := s.engine.Check(r.Context(), caller.TenantID, authz.Request{
 		Subject:     req.Subject.ID,
 		Permission:  req.Permission,
@@ -80,7 +109,12 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		Attributes:  attributesOf(req.Resource),
 		Context:     req.Context,
 		Now:         time.Now().UTC(),
+		Explain:     explain,
 	})
+	if err == nil {
+		s.recordDecision(r.Context(), caller, req.Subject.ID, req.Permission,
+			req.Resource.Ref(), decision, time.Since(started))
+	}
 	if err != nil {
 		s.log.Error("evaluating a check", "error", err, "tenant", caller.TenantID)
 		writeProblem(w, http.StatusInternalServerError, "internal_error",
@@ -154,6 +188,7 @@ func (s *Server) handleBatchCheck(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		started := time.Now()
 		decision, err := s.engine.Check(r.Context(), caller.TenantID, authz.Request{
 			Subject:     single.Subject.ID,
 			Permission:  single.Permission,
@@ -163,6 +198,10 @@ func (s *Server) handleBatchCheck(w http.ResponseWriter, r *http.Request) {
 			Context:     single.Context,
 			Now:         now,
 		})
+		if err == nil {
+			s.recordDecision(r.Context(), caller, single.Subject.ID, single.Permission,
+				single.Resource.Ref(), decision, time.Since(started))
+		}
 		if err != nil {
 			s.log.Error("evaluating a batch check", "error", err, "tenant", caller.TenantID, "ref", ref)
 			writeProblem(w, http.StatusInternalServerError, "internal_error",
@@ -184,6 +223,7 @@ func toResponse(d authz.Decision) checkResponse {
 		// against, so a caller can demand at least that freshness later (SPEC §10.5).
 		ConsistencyToken: fmt.Sprintf("zt_%012d", d.Revision),
 		Cache:            cacheHint{Cacheable: true, TTLSeconds: 60},
+		Explain:          d.Explanation,
 	}
 }
 
@@ -242,4 +282,32 @@ func decodeJSON(r *http.Request, dst any) error {
 		return fmt.Errorf("malformed request body: %w", err)
 	}
 	return nil
+}
+
+// recordDecision queues a decision for the log, if the tenant's configuration asks
+// for it. It never blocks and never returns an error: a decision that was correctly
+// made must not fail because it could not be written down.
+func (s *Server) recordDecision(
+	ctx context.Context, caller Caller,
+	subject, permission, resource string,
+	d authz.Decision, latency time.Duration,
+) {
+	if s.decisions == nil {
+		return
+	}
+	level := s.decisionLevel(ctx, caller.TenantID)
+	if !s.decisions.ShouldRecord(level, d.Allowed) {
+		return
+	}
+	s.decisions.Record(decisionlog.Record{
+		TenantID:     caller.TenantID,
+		SubjectID:    subject,
+		Permission:   permission,
+		ResourceRef:  resource,
+		Allowed:      d.Allowed,
+		Reason:       d.Reason,
+		MatchedGrant: d.MatchedGrant,
+		Latency:      latency,
+		Revision:     d.Revision,
+	})
 }

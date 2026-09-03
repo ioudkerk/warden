@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/warden-project/warden/internal/config"
@@ -265,6 +266,7 @@ func runToken(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	tenant := fs.String("tenant", "", "tenant slug")
 	name := fs.String("name", "", "a name for the service account, e.g. billing-api")
+	mayExplain := fs.Bool("may-explain", false, "allow POST /v1/authz/explain in production; derivations describe the policy")
 	own, rest := splitOwnFlags(fs, args)
 	if err := fs.Parse(own); err != nil {
 		return err
@@ -274,7 +276,7 @@ func runToken(args []string, stdout, stderr io.Writer) error {
 	}
 
 	return withProvisioner(rest, stderr, func(ctx context.Context, p *provision.Provisioner, _ *config.Config) error {
-		token, err := p.CreateServiceAccount(ctx, *tenant, *name)
+		token, err := p.CreateServiceAccount(ctx, *tenant, *name, *mayExplain)
 		if err != nil {
 			return err
 		}
@@ -282,6 +284,56 @@ func runToken(args []string, stdout, stderr io.Writer) error {
 		// is the point, but it means saying so plainly here.
 		fmt.Fprintf(stdout, "%s\n", token)
 		fmt.Fprintf(stderr, "\nThis token is shown once and is not recoverable: only its hash is stored.\n")
+		return nil
+	})
+}
+
+func runAudit(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("warden audit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	verify := fs.Bool("verify", false, "recompute the hash chain and report any break")
+	tenant := fs.String("tenant", "", "show only this tenant's entries")
+	limit := fs.Int("limit", 20, "how many entries to show, most recent first")
+	own, rest := splitOwnFlags(fs, args)
+	if err := fs.Parse(own); err != nil {
+		return err
+	}
+
+	return withProvisioner(rest, stderr, func(ctx context.Context, p *provision.Provisioner, _ *config.Config) error {
+		if *verify {
+			result, err := p.VerifyAudit(ctx)
+			if err != nil {
+				// A broken chain is a non-zero exit, not a line of output that a
+				// scheduled job would scroll past.
+				fmt.Fprintf(stdout, "audit log: %d entries, chain BROKEN\n", result.Entries)
+				for _, problem := range result.Problems {
+					fmt.Fprintf(stdout, "  %s\n", problem)
+				}
+				return err
+			}
+			fmt.Fprintf(stdout, "audit log verified: %d entries, chain intact\n", result.Entries)
+			if result.Entries > 0 {
+				fmt.Fprintf(stdout, "  from %s to %s\n",
+					result.First.Format(time.RFC3339), result.Last.Format(time.RFC3339))
+			}
+			return nil
+		}
+
+		entries, err := p.RecentAudit(ctx, *tenant, *limit)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			fmt.Fprintln(stdout, "no audit entries")
+			return nil
+		}
+		for _, e := range entries {
+			fmt.Fprintf(stdout, "%s  %-28s %-14s %s\n",
+				e.OccurredAt.Format(time.RFC3339), e.Action, e.TargetType, e.TargetID)
+			if e.Reason != "" {
+				fmt.Fprintf(stdout, "%s  reason: %s\n", strings.Repeat(" ", 20), e.Reason)
+			}
+		}
 		return nil
 	})
 }

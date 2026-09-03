@@ -19,6 +19,9 @@ type Caller struct {
 	ServiceAccountID string
 	TenantID         string
 	Name             string
+	// MayExplain allows this account to call /v1/authz/explain in production, where
+	// derivations are otherwise refused because they describe the policy itself.
+	MayExplain bool
 }
 
 type callerKey struct{}
@@ -61,9 +64,10 @@ func (s *Server) authenticate(ctx context.Context, r *http.Request) (Caller, err
 	)
 	err := s.system.InSystem(ctx, "authenticating a service account", func(ctx context.Context, tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT id, tenant_id, name, token_hash, disabled_at, expires_at
+			SELECT id, tenant_id, name, token_hash, disabled_at, expires_at, may_explain
 			  FROM service_account WHERE token_hash = $1`, sum[:],
-		).Scan(&caller.ServiceAccountID, &caller.TenantID, &caller.Name, &storedHash, &disabledAt, &expiresAt)
+		).Scan(&caller.ServiceAccountID, &caller.TenantID, &caller.Name,
+			&storedHash, &disabledAt, &expiresAt, &caller.MayExplain)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

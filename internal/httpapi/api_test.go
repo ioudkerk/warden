@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/provision"
 	"github.com/warden-project/warden/internal/secrets"
@@ -33,12 +34,15 @@ type fixture struct {
 	rivalTok string
 	maria    string
 	rival    string
+	sink     *decisionlog.Sink
 }
 
 // newFixture builds two tenants, each with a user and its own service-account token.
 // Two tenants rather than one on purpose: the property that matters most here is that
 // a token issued to one cannot ask about the other.
-func newFixture(t *testing.T) fixture {
+func newFixture(t *testing.T) fixture { return newFixtureWithExplain(t, true) }
+
+func newFixtureWithExplain(t *testing.T, mayExplain bool) fixture {
 	t.Helper()
 	dsn := os.Getenv(dsnEnv)
 	if dsn == "" {
@@ -137,7 +141,7 @@ func newFixture(t *testing.T) fixture {
 		}); grantErr != nil {
 			t.Fatalf("grant in %s: %v", tn, grantErr)
 		}
-		token, tokenErr := p.CreateServiceAccount(ctx, tn, "api")
+		token, tokenErr := p.CreateServiceAccount(ctx, tn, "api", mayExplain)
 		if tokenErr != nil {
 			t.Fatalf("token for %s: %v", tn, tokenErr)
 		}
@@ -148,7 +152,19 @@ func newFixture(t *testing.T) fixture {
 		}
 	}
 
-	server, err := httpapi.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), tenantPool, system)
+	sink, sinkErr := decisionlog.New(system, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		decisionlog.Options{FlushInterval: 20 * time.Millisecond})
+	if sinkErr != nil {
+		t.Fatalf("decision sink: %v", sinkErr)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = sink.Close(closeCtx) //nolint:errcheck // best effort at teardown
+	})
+	f.sink = sink
+
+	server, err := httpapi.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), tenantPool, system, sink)
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -400,5 +416,73 @@ func TestHealthAndReadinessNeedNoCredential(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s returned %d without a credential; a load balancer cannot hold one", path, rec.Code)
 		}
+	}
+}
+
+// --- explain --------------------------------------------------------------------
+
+// A derivation describes the policy itself, which is exactly what someone probing the
+// service would like to know. SPEC §10.3 restricts it; this is that restriction.
+func TestExplainIsRefusedInProductionWithoutPermission(t *testing.T) {
+	f := newFixtureWithExplain(t, false)
+	body := fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read"}`, f.maria)
+
+	status, resp := f.post(t, "/v1/authz/explain", f.acmeTok, body)
+	if status != http.StatusForbidden {
+		t.Fatalf("got %d, want 403", status)
+	}
+	detail, _ := resp["detail"].(string) //nolint:errcheck // absence fails the assertion
+	if !strings.Contains(detail, "may_explain") {
+		t.Errorf("the refusal should name what would permit it, got %q", detail)
+	}
+}
+
+func TestExplainReturnsTheDerivation(t *testing.T) {
+	f := newFixture(t) // its accounts are created with may_explain
+	body := fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read"}`, f.maria)
+
+	status, resp := f.post(t, "/v1/authz/explain", f.acmeTok, body)
+	if status != http.StatusOK {
+		t.Fatalf("got %d: %v", status, resp)
+	}
+	explain, ok := resp["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("no explain in the response: %v", resp)
+	}
+
+	// The roles a subject holds are frequently the whole answer — the user is not in
+	// the group they believed they were.
+	roles, rolesOK := explain["subject_roles"].([]any)
+	if !rolesOK || len(roles) == 0 {
+		t.Fatalf("subject_roles missing or empty: %v", explain)
+	}
+	// Slices must marshal as [] and never as null; a client should not have to
+	// handle both spellings of "nothing here".
+	if _, ok := explain["considered_grants"].([]any); !ok {
+		t.Errorf("considered_grants is %T, want an array", explain["considered_grants"])
+	}
+}
+
+// A plain check must never carry a derivation, whatever the caller's permissions.
+// The endpoint is the boundary, not a flag on the request.
+func TestPlainCheckNeverExplains(t *testing.T) {
+	f := newFixture(t)
+	body := fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read"}`, f.maria)
+
+	status, resp := f.post(t, "/v1/authz/check", f.acmeTok, body)
+	if status != http.StatusOK {
+		t.Fatalf("got %d", status)
+	}
+	if _, present := resp["explain"]; present {
+		t.Fatal("a plain check returned a derivation")
+	}
+}
+
+func TestExplainRequiresAuthentication(t *testing.T) {
+	f := newFixture(t)
+	status, _ := f.post(t, "/v1/authz/explain", "",
+		`{"subject":{"id":"x"},"permission":"billing.invoice:read"}`)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("got %d, want 401", status)
 	}
 }

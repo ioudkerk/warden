@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
@@ -67,6 +68,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runResource(rest, stdout, stderr)
 	case "token":
 		return runToken(rest, stdout, stderr)
+	case "audit":
+		return runAudit(rest, stdout, stderr)
 
 	default:
 		usage(stderr)
@@ -189,7 +192,30 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 
-	server, err := httpapi.New(cfg, log, db, system)
+	// The decision log writes through the system pool. Without one it is simply
+	// absent, and the server says so rather than silently recording nothing.
+	var decisions *decisionlog.Sink
+	if system != nil {
+		decisions, err = decisionlog.New(system, log, decisionlog.Options{})
+		if err != nil {
+			return err
+		}
+		defer func() {
+			drainCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+			defer cancel()
+			if closeErr := decisions.Close(drainCtx); closeErr != nil {
+				log.Warn("the decision log did not drain before shutdown", "error", closeErr)
+			}
+			stats := decisions.Stats()
+			log.Info("decision log stopped",
+				"written", stats.Written.Load(), "dropped", stats.Dropped.Load(),
+				"failed", stats.Failed.Load())
+		}()
+	} else {
+		log.Warn("no decision log: database.system_url is not configured, so decisions are not recorded")
+	}
+
+	server, err := httpapi.New(cfg, log, db, system, decisions)
 	if err != nil {
 		return err
 	}
@@ -243,6 +269,8 @@ Administration (until the console arrives in M6). Each needs database.system_url
   warden grant -tenant <slug> -revoke <id>     remove a grant
   warden resource -tenant <slug> -ref <app.type:id> [-parent <ref>] [-attributes <json>]
   warden token -tenant <slug> -name <name>     mint a service-account token, shown once
+  warden audit [-tenant <slug>] [-limit N]     show recent administrative changes
+  warden audit -verify                         recompute the hash chain; non-zero exit if broken
 
 Configuration is read from a file, then the environment, then flags, each layer
 overriding the one before it. The file is selected with -config or WARDEN_CONFIG.

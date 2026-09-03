@@ -174,6 +174,15 @@ dev-roles: ## Create the local warden_app and warden_system roles (idempotent)
 dev-setup: dev-up migrate-up dev-roles ## Start the dependencies, migrate, and create the roles
 	@echo "the development database is ready"
 
+# The integration tests rebuild the schema by applying the migration files directly,
+# which leaves no schema_migrations row and no grants — so a later `migrate-up` fails
+# on objects that already exist. This puts the database back to a known state.
+.PHONY: dev-reset-db
+dev-reset-db: dev-up ## Drop and rebuild the development schema, then re-grant the roles
+	@docker compose -f deploy/docker-compose.yml exec -T postgres \
+		psql -U warden -d warden -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+	@$(MAKE) --no-print-directory migrate-up dev-roles
+
 .PHONY: dev-down
 dev-down: ## Stop the local development dependencies
 	docker compose -f deploy/docker-compose.yml down
