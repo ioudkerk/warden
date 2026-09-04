@@ -10,6 +10,7 @@ import (
 
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/decisionlog"
+	"github.com/warden-project/warden/internal/metrics"
 )
 
 // maxBatchChecks matches SPEC §10.1: up to 1000 decisions in one round trip. The cap
@@ -100,8 +101,13 @@ func (s *Server) check(w http.ResponseWriter, r *http.Request, caller Caller, ex
 		return
 	}
 
+	// The span continues the caller's trace when they propagated one, which is what
+	// makes an application's trace show warden.check inline (SPEC §16.3).
+	ctx, span := s.tracer.Start(r.Context(), "warden.check")
+	defer span.End()
+
 	started := time.Now()
-	decision, err := s.engine.Check(r.Context(), caller.TenantID, authz.Request{
+	decision, err := s.engine.Check(ctx, caller.TenantID, authz.Request{
 		Subject:     req.Subject.ID,
 		Permission:  req.Permission,
 		Resource:    req.Resource.Ref(),
@@ -111,9 +117,15 @@ func (s *Server) check(w http.ResponseWriter, r *http.Request, caller Caller, ex
 		Now:         time.Now().UTC(),
 		Explain:     explain,
 	})
+	elapsed := time.Since(started)
 	if err == nil {
-		s.recordDecision(r.Context(), caller, req.Subject.ID, req.Permission,
-			req.Resource.Ref(), decision, time.Since(started))
+		span.SetAttributes(metrics.CheckAttributes(
+			req.Subject.ID, req.Permission, decision.Reason, decision.Allowed)...)
+		if s.metrics != nil {
+			s.metrics.ObserveCheck(decision.Allowed, decision.Reason, elapsed.Seconds())
+		}
+		s.recordDecision(ctx, caller, req.Subject.ID, req.Permission,
+			req.Resource.Ref(), decision, elapsed)
 	}
 	if err != nil {
 		s.log.Error("evaluating a check", "error", err, "tenant", caller.TenantID)
@@ -198,9 +210,13 @@ func (s *Server) handleBatchCheck(w http.ResponseWriter, r *http.Request) {
 			Context:     single.Context,
 			Now:         now,
 		})
+		elapsed := time.Since(started)
 		if err == nil {
+			if s.metrics != nil {
+				s.metrics.ObserveCheck(decision.Allowed, decision.Reason, elapsed.Seconds())
+			}
 			s.recordDecision(r.Context(), caller, single.Subject.ID, single.Permission,
-				single.Resource.Ref(), decision, time.Since(started))
+				single.Resource.Ref(), decision, elapsed)
 		}
 		if err != nil {
 			s.log.Error("evaluating a batch check", "error", err, "tenant", caller.TenantID, "ref", ref)

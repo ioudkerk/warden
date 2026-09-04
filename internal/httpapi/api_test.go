@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,9 +19,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
+	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/provision"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
@@ -35,14 +38,23 @@ type fixture struct {
 	maria    string
 	rival    string
 	sink     *decisionlog.Sink
+	metrics  *metrics.Metrics
 }
 
 // newFixture builds two tenants, each with a user and its own service-account token.
 // Two tenants rather than one on purpose: the property that matters most here is that
 // a token issued to one cannot ask about the other.
-func newFixture(t *testing.T) fixture { return newFixtureWithExplain(t, true) }
+func newFixture(t *testing.T) fixture { return build(t, true, nil) }
 
 func newFixtureWithExplain(t *testing.T, mayExplain bool) fixture {
+	return build(t, mayExplain, nil)
+}
+
+func newFixtureWithCache(t *testing.T, c cache.Cache) fixture {
+	return build(t, true, c)
+}
+
+func build(t *testing.T, mayExplain bool, c cache.Cache) fixture {
 	t.Helper()
 	dsn := os.Getenv(dsnEnv)
 	if dsn == "" {
@@ -165,7 +177,9 @@ func newFixtureWithExplain(t *testing.T, mayExplain bool) fixture {
 	})
 	f.sink = sink
 
-	server, err := httpapi.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), tenantPool, system, sink)
+	f.metrics = metrics.New("test")
+	server, err := httpapi.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tenantPool, system, sink, f.metrics, c, nil)
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -485,5 +499,141 @@ func TestExplainRequiresAuthentication(t *testing.T) {
 		`{"subject":{"id":"x"},"permission":"billing.invoice:read"}`)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("got %d, want 401", status)
+	}
+}
+
+// --- readiness --------------------------------------------------------------------
+
+// failingCache stands in for an unreachable cache tier.
+type failingCache struct{ backend string }
+
+func (c failingCache) Ping(context.Context) error { return errors.New("connection refused") }
+func (c failingCache) Backend() string            { return c.backend }
+func (c failingCache) Close() error               { return nil }
+
+type healthyCache struct{ backend string }
+
+func (c healthyCache) Ping(context.Context) error { return nil }
+func (c healthyCache) Backend() string            { return c.backend }
+func (c healthyCache) Close() error               { return nil }
+
+// The M0-10 exit condition, and the reason /readyz names each dependency separately:
+// "not ready" alone sends an operator to look at everything.
+func TestReadinessNamesTheFailingDependency(t *testing.T) {
+	f := newFixtureWithCache(t, failingCache{backend: "redis"})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503 with a dependency down", rec.Code)
+	}
+
+	var body struct {
+		Ready  bool              `json:"ready"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not JSON: %s", rec.Body.String())
+	}
+	if body.Ready {
+		t.Error("ready is true with a dependency unreachable")
+	}
+	if body.Checks["cache:redis"] != "unreachable" {
+		t.Errorf("the failing dependency is not named: %v", body.Checks)
+	}
+	// The dependencies that are fine must still say so, or an operator cannot tell
+	// which one to look at.
+	if body.Checks["database"] != "ok" {
+		t.Errorf("a healthy dependency was not reported as ok: %v", body.Checks)
+	}
+}
+
+func TestReadinessIsOKWhenEverythingIsReachable(t *testing.T) {
+	f := newFixtureWithCache(t, healthyCache{backend: "redis"})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"ready":true`) {
+		t.Errorf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+// A readiness probe is unauthenticated, so its body must not describe why a
+// connection failed — an error can name hosts, users and ports.
+func TestReadinessDoesNotLeakConnectionDetail(t *testing.T) {
+	f := newFixtureWithCache(t, failingCache{backend: "redis"})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), "connection refused") {
+		t.Errorf("the readiness body carries the underlying error: %s", rec.Body.String())
+	}
+}
+
+// --- request ids over the wire ------------------------------------------------------
+
+func TestEveryResponseCarriesARequestID(t *testing.T) {
+	f := newFixture(t)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if rec.Header().Get(httpapi.RequestIDHeader) == "" {
+		t.Error("no request id on the response; nothing can be correlated")
+	}
+
+	// A caller's own id is preserved, so their trace and Warden's log line about the
+	// same request can be joined.
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+	req.Header.Set(httpapi.RequestIDHeader, "caller-supplied-1")
+	rec = httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if got := rec.Header().Get(httpapi.RequestIDHeader); got != "caller-supplied-1" {
+		t.Errorf("request id = %q, want the caller's", got)
+	}
+}
+
+// --- metrics ---------------------------------------------------------------------
+
+func TestChecksAreCounted(t *testing.T) {
+	f := newFixture(t)
+
+	body := fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read"}`, f.maria)
+	if status, _ := f.post(t, "/v1/authz/check", f.acmeTok, body); status != http.StatusOK {
+		t.Fatalf("check returned %d", status)
+	}
+
+	rec := httptest.NewRecorder()
+	f.metrics.Handler().ServeHTTP(rec,
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
+	scrape := rec.Body.String()
+
+	if !strings.Contains(scrape, `warden_checks_total{allowed="true",reason="grant_matched"}`) {
+		t.Errorf("the decision was not counted")
+	}
+	if !strings.Contains(scrape, `warden_http_requests_total{route="/v1/authz/check",status="2xx"}`) {
+		t.Errorf("the request was not counted by route")
+	}
+}
+
+func TestRejectedCredentialsAreCounted(t *testing.T) {
+	f := newFixture(t)
+	f.post(t, "/v1/authz/check", "wsk_not-a-token",
+		`{"subject":{"id":"x"},"permission":"billing.invoice:read"}`)
+
+	rec := httptest.NewRecorder()
+	f.metrics.Handler().ServeHTTP(rec,
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
+	if !strings.Contains(rec.Body.String(), "warden_auth_failures_total 1") {
+		t.Error("a rejected credential was not counted")
 	}
 }

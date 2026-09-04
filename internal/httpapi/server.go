@@ -11,10 +11,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/warden-project/warden/internal/authz"
+	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
+	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/store"
 )
 
@@ -33,13 +37,20 @@ type Server struct {
 	system *store.Store
 
 	decisions *decisionlog.Sink
+	metrics   *metrics.Metrics
+	cache     cache.Cache
+	tracer    trace.Tracer
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
 }
 
 // New builds the server.
-func New(cfg *config.Config, log *slog.Logger, tenant, system *store.Store, decisions *decisionlog.Sink) (*Server, error) {
+func New(
+	cfg *config.Config, log *slog.Logger,
+	tenant, system *store.Store,
+	decisions *decisionlog.Sink, m *metrics.Metrics, c cache.Cache, tracing *metrics.Tracing,
+) (*Server, error) {
 	engine, err := authz.NewEngine(tenant)
 	if err != nil {
 		return nil, err
@@ -52,7 +63,17 @@ func New(cfg *config.Config, log *slog.Logger, tenant, system *store.Store, deci
 	return &Server{
 		cfg: cfg, log: log, engine: engine,
 		tenant: tenant, system: system, decisions: decisions,
+		metrics: m, cache: c, tracer: tracerOf(tracing),
 	}, nil
+}
+
+// tracerOf returns a tracer that is always safe to call. A no-op rather than a nil
+// check at every span means one fewer thing to remember at a call site.
+func tracerOf(t *metrics.Tracing) trace.Tracer {
+	if t == nil || t.Tracer == nil {
+		return noop.NewTracerProvider().Tracer(metrics.TracerName)
+	}
+	return t.Tracer
 }
 
 // decisionLevel returns the log level configured for a tenant's applications.
@@ -133,7 +154,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
 	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))
 
-	return s.withRequestLimits(mux)
+	// observe wraps withRequestLimits rather than the reverse, so a request rejected
+	// for an oversized body is still logged and counted. A limit that silently drops
+	// traffic is indistinguishable from an outage.
+	return s.observe(s.withRequestLimits(mux))
 }
 
 // withRequestLimits applies the protections that must not depend on a handler
@@ -199,19 +223,36 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
+	// Each dependency is named individually. "not ready" alone sends an operator to
+	// look at everything; naming the one that failed sends them to the right place.
 	checks := map[string]string{}
 	ready := true
-	if err := s.tenant.Ping(ctx); err != nil {
-		checks["database"] = "unreachable"
-		ready = false
-	} else {
-		checks["database"] = "ok"
+	check := func(name string, probe func(context.Context) error) {
+		if probe == nil {
+			checks[name] = "not configured"
+			return
+		}
+		if err := probe(ctx); err != nil {
+			checks[name] = "unreachable"
+			ready = false
+			// The error itself is logged rather than returned: /readyz is
+			// unauthenticated, and a connection error can name hosts and users.
+			s.log.Warn("readiness probe failed", "dependency", name, "error", err)
+			return
+		}
+		checks[name] = "ok"
 	}
-	if err := s.system.Ping(ctx); err != nil {
-		checks["database_system"] = "unreachable"
-		ready = false
+
+	check("database", s.tenant.Ping)
+	if s.system != nil {
+		check("database_system", s.system.Ping)
 	} else {
-		checks["database_system"] = "ok"
+		checks["database_system"] = "not configured"
+	}
+	if s.cache != nil {
+		check("cache:"+s.cache.Backend(), s.cache.Ping)
+	} else {
+		checks["cache"] = "not configured"
 	}
 
 	status := http.StatusOK

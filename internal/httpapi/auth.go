@@ -98,6 +98,9 @@ func (s *Server) requireCaller(next http.HandlerFunc) http.HandlerFunc {
 		caller, err := s.authenticate(r.Context(), r)
 		if err != nil {
 			if errors.Is(err, errUnauthenticated) {
+				if s.metrics != nil {
+					s.metrics.AuthFailures.Inc()
+				}
 				w.Header().Set("WWW-Authenticate", `Bearer realm="warden"`)
 				writeProblem(w, http.StatusUnauthorized, "unauthenticated",
 					"A valid service-account token is required in the Authorization header.")

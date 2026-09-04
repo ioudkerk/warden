@@ -12,10 +12,13 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"syscall"
+	"time"
 
+	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
+	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 )
@@ -217,11 +220,50 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		log.Warn("no decision log: database.system_url is not configured, so decisions are not recorded")
 	}
 
-	server, err := httpapi.New(cfg, log, db, system, decisions)
+	metricSet := metrics.New(buildVersion())
+
+	tracing, err := metrics.StartTracing(ctx, cfg.Telemetry.TracingOTLP, buildVersion(),
+		cfg.Telemetry.TraceSampler, log)
 	if err != nil {
 		return err
 	}
-	return server.ListenAndServe(ctx)
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if flushErr := tracing.Shutdown(flushCtx); flushErr != nil {
+			log.Warn("flushing traces", "error", flushErr)
+		}
+	}()
+
+	// The cache is opened eagerly: an unreachable one should stop the process coming
+	// up, not surface later as a request that needed it.
+	cacheClient, err := cache.Open(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := cacheClient.Close(); closeErr != nil {
+			log.Warn("closing the cache", "error", closeErr)
+		}
+	}()
+	log.Info("cache connected", "backend", cacheClient.Backend())
+
+	server, err := httpapi.New(cfg, log, db, system, decisions, metricSet, cacheClient, tracing)
+	if err != nil {
+		return err
+	}
+
+	// The metrics listener and the API run together; either failing stops the other,
+	// because a process serving decisions with no way to observe them is not a
+	// healthy state to leave running.
+	errs := make(chan error, 2)
+	go func() { errs <- metricSet.Serve(ctx, cfg.Telemetry.MetricsAddr, log) }()
+	go func() { errs <- server.ListenAndServe(ctx) }()
+
+	if err := <-errs; err != nil {
+		return err
+	}
+	return <-errs
 }
 
 func newLogger(cfg *config.Config, out io.Writer) *slog.Logger {

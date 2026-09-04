@@ -62,7 +62,8 @@ test-go: ## Run the Go tests with the race detector
 test-integration: ## Run the tests that need PostgreSQL (starts it if needed)
 	@docker compose -f deploy/docker-compose.yml up -d postgres >/dev/null
 	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U warden -d warden >/dev/null 2>&1; do :; done
-	WARDEN_TEST_DATABASE_URL="$(DATABASE_URL)" $(GO) test -race -count=1 -p 1 ./internal/...
+	WARDEN_TEST_DATABASE_URL="$(DATABASE_URL)" WARDEN_TEST_REDIS_URL="$(REDIS_URL)" \
+		$(GO) test -race -count=1 -p 1 ./internal/...
 
 .PHONY: test-isolation
 test-isolation: ## Run only the tenant-isolation suite, verbosely
@@ -109,6 +110,7 @@ tidy: ## Tidy go.mod and fail if it was not already tidy
 # Migrations arrive with task M0-5; the tooling is wired now so that the target
 # exists from the first commit and CI can exercise the up/down round trip.
 DATABASE_URL ?= postgres://warden:warden@localhost:5432/warden?sslmode=disable
+REDIS_URL    ?= redis://localhost:6379/0
 MIGRATIONS   := internal/store/migrations
 
 .PHONY: migrate-up

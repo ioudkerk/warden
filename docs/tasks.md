@@ -126,6 +126,7 @@ owner, prints a one-time setup URL. **No default credentials, ever** (§20.2).
 it twice is refused; grep of the codebase finds no hardcoded credential.
 
 ### M0-10 [P] Health, metrics, structured logging
+**Status: done.**
 `/healthz`, `/readyz` (checks Postgres and Redis), `/metrics`, structured JSON logs with a
 request id, OpenTelemetry tracer setup.
 **Exit:** `/readyz` returns 503 with a named failing dependency when Postgres is stopped.
