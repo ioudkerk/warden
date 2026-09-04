@@ -73,6 +73,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runResource(rest, stdout, stderr)
 	case "token":
 		return runToken(rest, stdout, stderr)
+	case "ui":
+		return runUI(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
 
@@ -314,6 +316,7 @@ Administration (until the console arrives in M6). Each needs database.system_url
   warden grant -tenant <slug> -revoke <id>     remove a grant
   warden resource -tenant <slug> -ref <app.type:id> [-parent <ref>] [-attributes <json>]
   warden token -tenant <slug> -name <name>     mint a service-account token, shown once
+  warden ui -tenant <slug> -application <key> -element <key> -requires <json> [-mode <mode>]
   warden audit [-tenant <slug>] [-limit N]     show recent administrative changes
   warden audit -verify                         recompute the hash chain; non-zero exit if broken
 

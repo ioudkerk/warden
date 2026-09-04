@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/warden-project/warden/internal/uibind"
 )
 
 // Manifest is an application's declared authorization surface (SPEC §11.2, §15.2).
@@ -59,8 +61,7 @@ type ManifestRoleCons struct {
 	MaxAssignees *int     `yaml:"max_assignees"`
 }
 
-// UI elements are parsed but not yet stored: the tables arrive with M5. Accepting
-// them now means an application's manifest does not have to change when they do.
+// The UI surface an application declares (SPEC §11.2).
 type ManifestUI struct {
 	Elements []ManifestUIElement `yaml:"elements"`
 }
@@ -85,6 +86,10 @@ type ManifestSettings struct {
 }
 
 var keyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// Element keys are dotted paths — invoices.approve_button — so they carry a little
+// structure for the console's tree without needing a separate field.
+var elementKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
 
 // LoadManifest reads and validates an application manifest.
 func LoadManifest(path string) (*Manifest, error) {
@@ -176,6 +181,43 @@ func (m *Manifest) Validate() error {
 		for _, parent := range r.Inherits {
 			if !roles[parent] {
 				addf("role %q inherits %q, which is not declared in this manifest", r.Key, parent)
+			}
+		}
+	}
+
+	seenElements := map[string]bool{}
+	for i := range m.UI.Elements {
+		e := &m.UI.Elements[i]
+		switch {
+		case e.Key == "":
+			addf("a ui element has no key")
+		case !elementKeyPattern.MatchString(e.Key):
+			addf("ui element key %q must match %s", e.Key, elementKeyPattern)
+		case seenElements[e.Key]:
+			addf("ui element %q is declared twice", e.Key)
+		}
+		seenElements[e.Key] = true
+
+		if e.Label == "" {
+			addf("ui element %q has no label; the console shows it to an administrator "+
+				"who has never seen your code", e.Key)
+		}
+		switch e.DefaultMode {
+		case "", uibind.ModeHidden, uibind.ModeDisabled, uibind.ModeReadOnly:
+		default:
+			addf("ui element %q: default_mode %q; want hidden, disabled or read_only", e.Key, e.DefaultMode)
+		}
+		// A suggested permission naming something the manifest does not declare is a
+		// typo that would otherwise surface as a button nobody can ever see.
+		if p := e.Suggests.Permission; p != "" {
+			if err := checkPermission(m.Application, p, declared); err != nil {
+				addf("ui element %s: suggests %v", e.Key, err)
+			}
+		}
+		if rt := e.Suggests.ResourceType; rt != "" {
+			want := m.Application + "." + strings.TrimPrefix(rt, m.Application+".")
+			if !types[strings.TrimPrefix(want, m.Application+".")] {
+				addf("ui element %s: resource_type %q is not declared by this manifest", e.Key, rt)
 			}
 		}
 	}

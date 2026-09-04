@@ -115,7 +115,8 @@ func sanitiseRequestID(id string) string {
 func routeOf(r *http.Request) string {
 	switch r.URL.Path {
 	case "/healthz", "/readyz",
-		"/v1/authz/check", "/v1/authz/batch-check", "/v1/authz/explain":
+		"/v1/authz/check", "/v1/authz/batch-check", "/v1/authz/explain", "/v1/authz/filter",
+		"/v1/ui/bundle", "/v1/ui/resolve":
 		return r.URL.Path
 	default:
 		return "other"

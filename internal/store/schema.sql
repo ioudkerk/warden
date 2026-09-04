@@ -840,6 +840,67 @@ CREATE TABLE public.tenant_isolation_registry (
 COMMENT ON TABLE public.tenant_isolation_registry IS 'Declares, per table, whether it holds tenant-scoped data. The isolation test in internal/store cross-checks this against pg_class, so a new table cannot silently escape row-level security.';
 
 --
+-- Name: ui_binding; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ui_binding (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    ui_element_id text NOT NULL,
+    environment_id text,
+    requires jsonb NOT NULL,
+    mode text DEFAULT 'hidden'::text NOT NULL,
+    condition text,
+    message text,
+    version integer DEFAULT 1 NOT NULL,
+    updated_by text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ui_binding_id_check CHECK ((id ~~ 'uib\_%'::text)),
+    CONSTRAINT ui_binding_mode_valid CHECK ((mode = ANY (ARRAY['hidden'::text, 'disabled'::text, 'read_only'::text]))),
+    CONSTRAINT ui_binding_requires_well_formed CHECK ((((requires ? 'any_of'::text) AND (jsonb_typeof((requires -> 'any_of'::text)) = 'array'::text)) OR ((requires ? 'all_of'::text) AND (jsonb_typeof((requires -> 'all_of'::text)) = 'array'::text))))
+);
+
+ALTER TABLE ONLY public.ui_binding FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: ui_element; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ui_element (
+    id text NOT NULL,
+    application_id text NOT NULL,
+    key public.citext NOT NULL,
+    label text NOT NULL,
+    description text,
+    surface text DEFAULT 'web'::text NOT NULL,
+    path text,
+    suggested_permission public.citext,
+    resource_type_id text,
+    default_mode text DEFAULT 'hidden'::text NOT NULL,
+    status text DEFAULT 'declared'::text NOT NULL,
+    first_seen_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ui_element_default_mode_valid CHECK ((default_mode = ANY (ARRAY['hidden'::text, 'disabled'::text, 'read_only'::text]))),
+    CONSTRAINT ui_element_id_check CHECK ((id ~~ 'uie\_%'::text)),
+    CONSTRAINT ui_element_key_well_formed CHECK (((key OPERATOR(public.~) '^[a-z0-9][a-z0-9_.-]*$'::public.citext) AND (length((key)::text) > 0))),
+    CONSTRAINT ui_element_status_valid CHECK ((status = ANY (ARRAY['declared'::text, 'discovered'::text, 'deprecated'::text])))
+);
+
+--
+-- Name: COLUMN ui_element.resource_type_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.ui_element.resource_type_id IS 'Non-null means per-object evaluation: the element is returned in the bundle''s deferred list and resolved through POST /v1/ui/resolve.';
+
+--
+-- Name: COLUMN ui_element.default_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.ui_element.default_mode IS 'Applies until an administrator binds the element, so an application works the moment it is enrolled (SPEC §11.2).';
+
+--
 -- Name: decision_event_2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
@@ -1094,6 +1155,20 @@ ALTER TABLE ONLY public.tenant_isolation_registry
 
 ALTER TABLE ONLY public.tenant
     ADD CONSTRAINT tenant_pkey PRIMARY KEY (id);
+
+--
+-- Name: ui_binding ui_binding_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_binding
+    ADD CONSTRAINT ui_binding_pkey PRIMARY KEY (id);
+
+--
+-- Name: ui_element ui_element_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_element
+    ADD CONSTRAINT ui_element_pkey PRIMARY KEY (id);
 
 --
 -- Name: action_resource_type_key_key; Type: INDEX; Schema: public; Owner: -
@@ -1540,6 +1615,30 @@ CREATE UNIQUE INDEX signing_key_one_active ON public.signing_key USING btree (st
 CREATE UNIQUE INDEX tenant_slug_key ON public.tenant USING btree (slug);
 
 --
+-- Name: ui_binding_scope_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ui_binding_scope_key ON public.ui_binding USING btree (tenant_id, ui_element_id, environment_id) NULLS NOT DISTINCT;
+
+--
+-- Name: ui_binding_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ui_binding_tenant_idx ON public.ui_binding USING btree (tenant_id);
+
+--
+-- Name: ui_element_application_key_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ui_element_application_key_key ON public.ui_element USING btree (application_id, key);
+
+--
+-- Name: ui_element_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ui_element_status_idx ON public.ui_element USING btree (status) WHERE (status <> 'declared'::text);
+
+--
 -- Name: decision_event_2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
@@ -1682,6 +1781,18 @@ CREATE TRIGGER role_set_updated_at BEFORE UPDATE ON public.role FOR EACH ROW EXE
 --
 
 CREATE TRIGGER tenant_set_updated_at BEFORE UPDATE ON public.tenant FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
+-- Name: ui_binding ui_binding_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER ui_binding_set_updated_at BEFORE UPDATE ON public.ui_binding FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
+-- Name: ui_element ui_element_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER ui_element_set_updated_at BEFORE UPDATE ON public.ui_element FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
 
 --
 -- Name: action action_resource_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -2020,6 +2131,48 @@ ALTER TABLE ONLY public.setup_token
     ADD CONSTRAINT setup_token_user_fkey FOREIGN KEY (user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
 
 --
+-- Name: ui_binding ui_binding_environment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_binding
+    ADD CONSTRAINT ui_binding_environment_id_fkey FOREIGN KEY (environment_id) REFERENCES public.environment(id);
+
+--
+-- Name: ui_binding ui_binding_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_binding
+    ADD CONSTRAINT ui_binding_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: ui_binding ui_binding_ui_element_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_binding
+    ADD CONSTRAINT ui_binding_ui_element_id_fkey FOREIGN KEY (ui_element_id) REFERENCES public.ui_element(id) ON DELETE CASCADE;
+
+--
+-- Name: ui_binding ui_binding_user_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_binding
+    ADD CONSTRAINT ui_binding_user_fkey FOREIGN KEY (updated_by, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE SET NULL (updated_by);
+
+--
+-- Name: ui_element ui_element_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_element
+    ADD CONSTRAINT ui_element_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(id) ON DELETE CASCADE;
+
+--
+-- Name: ui_element ui_element_resource_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ui_element
+    ADD CONSTRAINT ui_element_resource_type_id_fkey FOREIGN KEY (resource_type_id) REFERENCES public.resource_type(id);
+
+--
 -- Name: app_enrollment; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2258,6 +2411,18 @@ CREATE POLICY tenant_isolation ON public.session USING ((tenant_id = current_set
 --
 
 CREATE POLICY tenant_isolation ON public.tenant USING ((id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: ui_binding tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.ui_binding USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: ui_binding; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.ui_binding ENABLE ROW LEVEL SECURITY;
 
 --
 -- PostgreSQL database dump complete

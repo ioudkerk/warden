@@ -637,3 +637,156 @@ func TestRejectedCredentialsAreCounted(t *testing.T) {
 		t.Error("a rejected credential was not counted")
 	}
 }
+
+// --- filter and UI binding -----------------------------------------------------------
+
+func TestFilterReturnsTheAllowedSubset(t *testing.T) {
+	f := newFixture(t)
+	body := fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read",
+		"resources":[{"type":"billing.invoice","id":"a"},{"type":"billing.invoice","id":"b"}]}`, f.maria)
+
+	status, resp := f.post(t, "/v1/authz/filter", f.acmeTok, body)
+	if status != http.StatusOK {
+		t.Fatalf("got %d: %v", status, resp)
+	}
+	// The viewer role permits read tenant-wide, so both are allowed — and both lists
+	// must be arrays rather than null, whichever is empty.
+	allowed, ok := resp["allowed"].([]any)
+	if !ok || len(allowed) != 2 {
+		t.Errorf("allowed = %v", resp["allowed"])
+	}
+	if _, ok := resp["denied"].([]any); !ok {
+		t.Errorf("denied is %T, want an array even when empty", resp["denied"])
+	}
+}
+
+func TestFilterRejectsAnOversizedRequest(t *testing.T) {
+	f := newFixture(t)
+	var resources bytes.Buffer
+	for i := 0; i < 1001; i++ {
+		if i > 0 {
+			resources.WriteString(",")
+		}
+		fmt.Fprintf(&resources, `{"type":"billing.invoice","id":"i%d"}`, i)
+	}
+	status, resp := f.post(t, "/v1/authz/filter", f.acmeTok,
+		fmt.Sprintf(`{"subject":{"id":%q},"permission":"billing.invoice:read","resources":[%s]}`,
+			f.maria, resources.String()))
+	if status != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", status)
+	}
+	if detail, _ := resp["detail"].(string); !strings.Contains(detail, "1000") { //nolint:errcheck // absence fails below
+		t.Errorf("detail %q should state the cap", detail)
+	}
+}
+
+func TestFilterRequiresAuthentication(t *testing.T) {
+	f := newFixture(t)
+	status, _ := f.post(t, "/v1/authz/filter", "",
+		`{"subject":{"id":"x"},"permission":"billing.invoice:read","resources":[{"type":"a.b","id":"1"}]}`)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("got %d, want 401", status)
+	}
+}
+
+// The bundle answers what it can eagerly and defers what needs an object. Guessing at
+// a resource-scoped element would answer "can you approve invoices" when the question
+// is always "can you approve this one".
+func TestTheBundleDefersResourceScopedElements(t *testing.T) {
+	f := newFixture(t)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/v1/ui/bundle?subject="+f.maria+"&application=billing&environment=prod", nil)
+	req.Header.Set("Authorization", "Bearer "+f.acmeTok)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Elements map[string]map[string]any `json:"elements"`
+		Deferred []string                  `json:"deferred"`
+		Etag     string                    `json:"etag"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("not JSON: %s", rec.Body.String())
+	}
+
+	// examples/warden.yaml marks the approve and void buttons resource-scoped.
+	if len(body.Deferred) != 2 {
+		t.Errorf("deferred = %v, want the two resource-scoped elements", body.Deferred)
+	}
+	for _, key := range body.Deferred {
+		if _, answered := body.Elements[key]; answered {
+			t.Errorf("%q was answered eagerly despite needing an object", key)
+		}
+	}
+	if body.Etag == "" || rec.Header().Get("ETag") == "" {
+		t.Error("no ETag; the client cannot avoid re-fetching an unchanged bundle")
+	}
+
+	// An unchanged bundle is not re-sent.
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/v1/ui/bundle?subject="+f.maria+"&application=billing&environment=prod", nil)
+	req.Header.Set("Authorization", "Bearer "+f.acmeTok)
+	req.Header.Set("If-None-Match", rec.Header().Get("ETag"))
+	rec2 := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusNotModified {
+		t.Errorf("a matching If-None-Match returned %d, want 304", rec2.Code)
+	}
+}
+
+// Using a resource-scoped element without an object is a development error
+// (SPEC §11.3). Answering anyway would be confidently wrong for every row.
+func TestResolveRefusesAResourceScopedElementWithNoResource(t *testing.T) {
+	f := newFixture(t)
+	status, resp := f.post(t, "/v1/ui/resolve", f.acmeTok, fmt.Sprintf(
+		`{"subject":{"id":%q},"application":"billing",
+		  "items":[{"ref":"a","element":"invoices.approve_button"}]}`, f.maria))
+	if status != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", status)
+	}
+	if detail, _ := resp["detail"].(string); !strings.Contains(detail, "resource-scoped") { //nolint:errcheck // absence fails below
+		t.Errorf("detail %q should explain what is missing", detail)
+	}
+}
+
+// An undeclared element resolves to hidden — the safe rendering — and says so, because
+// a silently missing button is half an hour of debugging.
+func TestResolveNamesAnUndeclaredElement(t *testing.T) {
+	f := newFixture(t)
+	status, resp := f.post(t, "/v1/ui/resolve", f.acmeTok, fmt.Sprintf(
+		`{"subject":{"id":%q},"application":"billing",
+		  "items":[{"ref":"typo","element":"invoices.aprove_button"}]}`, f.maria))
+	if status != http.StatusOK {
+		t.Fatalf("got %d: %v", status, resp)
+	}
+	results, _ := resp["results"].(map[string]any) //nolint:errcheck // checked below
+	entry, ok := results["typo"].(map[string]any)
+	if !ok {
+		t.Fatalf("no result for the item: %v", resp)
+	}
+	if entry["mode"] != "hidden" {
+		t.Errorf("an undeclared element resolved to %v, want hidden", entry["mode"])
+	}
+	if msg, _ := entry["message"].(string); !strings.Contains(msg, "not declared") { //nolint:errcheck // absence fails below
+		t.Errorf("message %q should say the element is undeclared", msg)
+	}
+}
+
+func TestUIEndpointsRequireAuthentication(t *testing.T) {
+	f := newFixture(t)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/v1/ui/bundle?subject=x&application=billing", nil)
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("bundle without a credential returned %d", rec.Code)
+	}
+	if status, _ := f.post(t, "/v1/ui/resolve", "",
+		`{"subject":{"id":"x"},"application":"billing","items":[{"ref":"a","element":"b"}]}`); status != http.StatusUnauthorized {
+		t.Errorf("resolve without a credential returned %d", status)
+	}
+}

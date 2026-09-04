@@ -281,6 +281,9 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			{`INSERT INTO decision_event (id, tenant_id, subject_id, permission_key, allowed, reason)
 			  VALUES ($1, $2, $3, 'billing.invoice:read', true, 'grant_matched')`,
 				[]any{"dec_" + suffix, tn, "usr_" + suffix}},
+			{`INSERT INTO ui_binding (id, tenant_id, ui_element_id, requires, mode)
+			  VALUES ($1, $2, 'uie_shared', '{"any_of":[{"permission":"billing.invoice:read"}]}', 'hidden')`,
+				[]any{"uib_" + suffix, tn}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -293,6 +296,8 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 				 VALUES ('rol_global', NULL, 'app_shared', 'billing.viewer', 'Billing Viewer', 'application_template')`,
 				`INSERT INTO role_permission (role_id, tenant_id, permission_key)
 				 VALUES ('rol_global', NULL, 'billing.invoice:read')`,
+				`INSERT INTO ui_element (id, application_id, key, label, default_mode)
+				 VALUES ('uie_shared', 'app_shared', 'nav.reports', 'Reports', 'hidden')`,
 			} {
 				if _, err := conn.Exec(ctx, stmt); err != nil {
 					t.Fatalf("seeding the shared application: %v", err)
@@ -770,7 +775,7 @@ func TestTenantListIsStable(t *testing.T) {
 		"app_enrollment", "app_user", "credential", "decision_event", "denial",
 		"grant_", "group_", "group_member", "identity", "idp_connection",
 		"refresh_token", "resource_node", "role", "role_inheritance",
-		"role_permission", "session", "tenant",
+		"role_permission", "session", "tenant", "ui_binding",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {

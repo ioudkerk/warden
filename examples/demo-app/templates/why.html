@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Why?{% endblock %}
+{% block body %}
+<p><a href="/">&larr; All invoices</a></p>
+<div class="panel">
+  <h2 style="margin-top:0">
+    {{ user.name }} &rarr; approve invoice {{ invoice_id }}:
+    <span class="{{ 'allow' if decision.allowed else 'deny' }}">
+      {{ 'ALLOWED' if decision.allowed else 'DENIED' }}
+    </span>
+  </h2>
+  <p class="note">Reason code: <code>{{ decision.reason }}</code></p>
+
+  {% if decision.explain %}
+    <p class="note">Roles held: {{ decision.explain.subject_roles | join(', ') or 'none' }}</p>
+    {% for g in decision.explain.considered_grants %}
+      <div class="why">grant {{ g.grant_id }}  role={{ g.role }}  scope={{ g.scope }}
+  &rarr; {{ g.outcome }}{% if g.detail %}
+     {{ g.detail }}{% endif %}
+{% for c in g.conditions or [] %}     {{ c.expression }}  =>  {{ c.result }}
+{% for k, v in (c.values or {}).items() %}       {{ k }} = {{ v }}
+{% endfor %}{% endfor %}</div>
+    {% endfor %}
+    {% for n in decision.explain.notes or [] %}<p class="note">{{ n }}</p>{% endfor %}
+  {% else %}
+    <p class="note">
+      No derivation was returned. Explanations describe the policy itself, so outside
+      development they need a service account marked <code>may_explain</code>.
+    </p>
+  {% endif %}
+</div>
+{% endblock %}

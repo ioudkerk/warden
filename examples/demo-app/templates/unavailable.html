@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Authorization unavailable{% endblock %}
+{% block body %}
+<div class="panel">
+  <h2 style="margin-top:0" class="deny">Authorization unavailable</h2>
+  <p>This page cannot be shown, because Warden could not be reached.</p>
+  <p class="note"><code>{{ detail }}</code></p>
+  <p class="note">
+    Failing closed is deliberate. A service that cannot answer "may they?" has not
+    said yes, and rendering an interface from guesses would be worse than this page.
+  </p>
+</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Not permitted{% endblock %}
+{% block body %}
+<div class="panel">
+  <h2 style="margin-top:0" class="deny">Not permitted</h2>
+  <p>You may not {{ what }}.</p>
+  <p class="note">Warden's reason: <code>{{ reason }}</code></p>
+  <p class="note">
+    This check runs whether or not the button was shown. Hiding a control is a
+    rendering decision; this is the enforcement point.
+  </p>
+  <p><a href="/">&larr; All invoices</a></p>
+</div>
+{% endblock %}

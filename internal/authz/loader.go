@@ -555,3 +555,29 @@ func loadResources(ctx context.Context, tx pgx.Tx, m *Model) error {
 	}
 	return rows.Err()
 }
+
+// HoldsRole reports whether a subject holds a role, by key, right now. A UI binding
+// may require a role rather than a permission (SPEC §11.3), and "holds the role" is a
+// different question from "may do the thing the role permits".
+func (e *Engine) HoldsRole(ctx context.Context, tenantID, subject, roleKey string) (bool, error) {
+	m, err := e.modelFor(ctx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+	groups := m.GroupsOf[subject]
+
+	for i := range m.Grants {
+		g := &m.Grants[i]
+		if g.UserID != subject && (g.GroupID == "" || !groups[g.GroupID]) {
+			continue
+		}
+		if !validAt(g, now) {
+			continue
+		}
+		if role, ok := m.Roles[g.RoleID]; ok && role.Key == roleKey {
+			return true, nil
+		}
+	}
+	return false, nil
+}

@@ -25,6 +25,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+examples/demo-app/.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

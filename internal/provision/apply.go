@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/warden-project/warden/internal/audit"
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/store"
+	"github.com/warden-project/warden/internal/uibind"
 )
 
 // Provisioner performs administrative operations over the system pool.
@@ -67,7 +69,88 @@ type ApplyResult struct {
 	Application string
 	Permissions int
 	Roles       int
+	UIElements  int
 	Created     bool
+}
+
+// applyUIElements syncs the manifest's declared UI surface (SPEC §11.2).
+//
+// Elements are upserted, never deleted. One removed from a manifest has its status
+// set to 'deprecated' instead, because a tenant may have bound it and dropping the row
+// would take their binding with it — silently changing what their staff can see as a
+// side effect of someone else's refactor.
+func applyUIElements(ctx context.Context, tx pgx.Tx, m *Manifest, appID string, result *ApplyResult) error {
+	declared := map[string]bool{}
+
+	for i := range m.UI.Elements {
+		e := &m.UI.Elements[i]
+		declared[e.Key] = true
+
+		mode := e.DefaultMode
+		if mode == "" {
+			mode = uibind.ModeHidden
+		}
+		surface := e.Surface
+		if surface == "" {
+			surface = "web"
+		}
+
+		var resourceTypeID *string
+		if rt := e.Suggests.ResourceType; rt != "" {
+			v := id("rst", m.Application+"_"+strings.TrimPrefix(rt, m.Application+"."))
+			resourceTypeID = &v
+		}
+		var suggested *string
+		if e.Suggests.Permission != "" {
+			suggested = &e.Suggests.Permission
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ui_element (id, application_id, key, label, description, surface, path,
+			                        suggested_permission, resource_type_id, default_mode, status)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'declared')
+			ON CONFLICT (application_id, key) DO UPDATE SET
+				label = EXCLUDED.label, description = EXCLUDED.description,
+				surface = EXCLUDED.surface, path = EXCLUDED.path,
+				suggested_permission = EXCLUDED.suggested_permission,
+				resource_type_id = EXCLUDED.resource_type_id,
+				default_mode = EXCLUDED.default_mode, status = 'declared'`,
+			id("uie", m.Application+"_"+e.Key), appID, e.Key, e.Label, nullIfEmpty(e.Description),
+			surface, nullIfEmpty(e.Path), suggested, resourceTypeID, mode); err != nil {
+			return fmt.Errorf("ui element %s: %w", e.Key, err)
+		}
+		result.UIElements++
+	}
+
+	// Anything this application declared before and no longer does.
+	rows, err := tx.Query(ctx,
+		`SELECT key FROM ui_element WHERE application_id = $1 AND status = 'declared'`, appID)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var key string
+		if scanErr := rows.Scan(&key); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		if !declared[key] {
+			stale = append(stale, key)
+		}
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return rows.Err()
+	}
+	for _, key := range stale {
+		if _, err := tx.Exec(ctx,
+			`UPDATE ui_element SET status = 'deprecated' WHERE application_id = $1 AND key = $2`,
+			appID, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Apply syncs an application manifest: its resource types, actions, the materialized
@@ -231,6 +314,10 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 			}
 		}
 
+		if err := applyUIElements(ctx, tx, m, appID, &result); err != nil {
+			return err
+		}
+
 		if err := p.record(ctx, tx, audit.Entry{
 			Action:     "application.manifest_applied",
 			TargetType: "application",
@@ -238,6 +325,7 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 			After: map[string]any{
 				"key": m.Application, "version": m.Version,
 				"permissions": result.Permissions, "roles": result.Roles,
+				"ui_elements": result.UIElements,
 			},
 			Reason: "warden apply",
 		}); err != nil {
@@ -681,4 +769,108 @@ func nullIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// BindOptions describes a UI element binding (SPEC §11.3).
+type BindOptions struct {
+	Actor       Actor
+	TenantSlug  string
+	Application string
+	ElementKey  string
+	Environment string
+	// Requires is the clause set as JSON: {"any_of":[{"permission":"..."}]}.
+	Requires string
+	Mode     string
+	Message  string
+	Reason   string
+}
+
+// BindUIElement sets what a UI element requires in one tenant.
+//
+// Deliberately not subject to the escalation guard. A binding decides what an
+// interface looks like, never what anybody may do — an administrator who hides a
+// button they can see themselves has widened nothing, and one who reveals a button
+// has revealed a control whose action is still checked server-side (SPEC §2.3).
+// Requiring warden.ui:bind is the whole of the authorization here.
+func (p *Provisioner) BindUIElement(ctx context.Context, o BindOptions) error {
+	if err := o.Actor.validate(); err != nil {
+		return err
+	}
+	switch o.Mode {
+	case uibind.ModeHidden, uibind.ModeDisabled, uibind.ModeReadOnly:
+	case "":
+		o.Mode = uibind.ModeHidden
+	default:
+		return fmt.Errorf("mode %q; want hidden, disabled or read_only", o.Mode)
+	}
+
+	var requires map[string]any
+	if err := json.Unmarshal([]byte(o.Requires), &requires); err != nil {
+		return fmt.Errorf("-requires is not valid JSON: %w", err)
+	}
+	if _, hasAny := requires["any_of"]; !hasAny {
+		if _, hasAll := requires["all_of"]; !hasAll {
+			return fmt.Errorf(`-requires must contain any_of or all_of, e.g. ` +
+				`'{"any_of":[{"permission":"billing.invoice:approve"}]}'`)
+		}
+	}
+
+	tenantID := id("ten", o.TenantSlug)
+	elementID := id("uie", o.Application+"_"+o.ElementKey)
+
+	return p.db.InSystem(ctx, "binding ui element "+o.ElementKey, func(ctx context.Context, tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ui_element WHERE id = $1)`, elementID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("application %q declares no ui element %q; run `warden apply` first",
+				o.Application, o.ElementKey)
+		}
+
+		var environmentID *string
+		if o.Environment != "" {
+			var envID string
+			err := tx.QueryRow(ctx, `
+				SELECT e.id FROM environment e JOIN application a ON a.id = e.application_id
+				 WHERE a.key = $1 AND e.name = $2`, o.Application, o.Environment).Scan(&envID)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("application %q has no environment %q", o.Application, o.Environment)
+				}
+				return err
+			}
+			environmentID = &envID
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ui_binding (id, tenant_id, ui_element_id, environment_id,
+			                        requires, mode, message, updated_by, version)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)
+			ON CONFLICT (tenant_id, ui_element_id, environment_id) DO UPDATE SET
+				requires = EXCLUDED.requires, mode = EXCLUDED.mode,
+				message = EXCLUDED.message, updated_by = EXCLUDED.updated_by,
+				version = ui_binding.version + 1`,
+			"uib_"+randomSuffix(), tenantID, elementID, environmentID,
+			o.Requires, o.Mode, nullIfEmpty(o.Message), nullIfEmpty(o.Actor.SubjectID)); err != nil {
+			return fmt.Errorf("binding %s: %w", o.ElementKey, err)
+		}
+
+		if err := p.record(ctx, tx, audit.Entry{
+			TenantID: tenantID, Action: "ui_element.bound",
+			TargetType: "ui_element", TargetID: elementID,
+			ActorUserID: o.Actor.SubjectID,
+			After: map[string]any{
+				"element": o.ElementKey, "requires": requires,
+				"mode": o.Mode, "environment": o.Environment, "message": o.Message,
+			},
+			Reason: o.Reason,
+		}); err != nil {
+			return err
+		}
+		// A binding change alters what an interface looks like, so a cached UI
+		// bundle must be rebuilt — the revision is what tells it to.
+		return bumpTenant(ctx, tx, tenantID)
+	})
 }

@@ -153,6 +153,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
 	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))
+	mux.HandleFunc("POST /v1/authz/filter", s.requireCaller(s.handleFilter))
+
+	mux.HandleFunc("GET /v1/ui/bundle", s.requireCaller(s.handleUIBundle))
+	mux.HandleFunc("POST /v1/ui/resolve", s.requireCaller(s.handleUIResolve))
 
 	// observe wraps withRequestLimits rather than the reverse, so a request rejected
 	// for an oversized body is still logged and counted. A limit that silently drops

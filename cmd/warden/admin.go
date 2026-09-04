@@ -116,8 +116,8 @@ func runApply(args []string, stdout, stderr io.Writer) error {
 		if result.Created {
 			verb = "created"
 		}
-		fmt.Fprintf(stdout, "application %q %s: %d permissions, %d role templates\n",
-			result.Application, verb, result.Permissions, result.Roles)
+		fmt.Fprintf(stdout, "application %q %s: %d permissions, %d role templates, %d ui elements\n",
+			result.Application, verb, result.Permissions, result.Roles, result.UIElements)
 		return nil
 	})
 }
@@ -406,4 +406,43 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 			"There is no default password to change, because there is no default password.\n",
 		result.ExpiresAt.Format(time.RFC3339))
 	return nil
+}
+
+func runUI(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("warden ui", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	tenant := fs.String("tenant", "", "tenant slug")
+	application := fs.String("application", "", "application key, e.g. billing")
+	element := fs.String("element", "", "element key, e.g. invoices.approve_button")
+	requires := fs.String("requires", "", `what the element requires, as JSON: '{"any_of":[{"permission":"billing.invoice:approve"}]}'`)
+	mode := fs.String("mode", "hidden", "what not-allowed looks like: hidden, disabled or read_only")
+	message := fs.String("message", "", "tooltip shown when the mode is disabled")
+	environment := fs.String("environment", "", "bind only in this environment; empty means all")
+	as := fs.String("as", "", "the administrator making the change; recorded for audit")
+	reason := fs.String("reason", "", "why; recorded for audit")
+	own, rest := splitOwnFlags(fs, args)
+	if err := fs.Parse(own); err != nil {
+		return err
+	}
+	if *tenant == "" || *application == "" || *element == "" || *requires == "" {
+		return fmt.Errorf(`usage: warden ui -tenant <slug> -application <key> -element <key> ` +
+			`-requires '{"any_of":[{"permission":"..."}]}' [-mode hidden|disabled|read_only]`)
+	}
+
+	actor := provision.Actor{SystemOperator: true}
+	if *as != "" {
+		actor = provision.Actor{SubjectID: *as}
+	}
+
+	return withProvisioner(rest, stderr, func(ctx context.Context, p *provision.Provisioner, _ *config.Config) error {
+		if err := p.BindUIElement(ctx, provision.BindOptions{
+			Actor: actor, TenantSlug: *tenant, Application: *application,
+			ElementKey: *element, Environment: *environment,
+			Requires: *requires, Mode: *mode, Message: *message, Reason: *reason,
+		}); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "%s bound: not-allowed renders as %s\n", *element, *mode)
+		return nil
+	})
 }

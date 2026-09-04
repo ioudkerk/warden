@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block body %}
+<p class="note">
+  This list came back from one <code>POST /v1/authz/filter</code>. The buttons on each
+  row came back from one <code>POST /v1/ui/resolve</code>.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Invoice</th><th>Supplier</th><th>Project</th>
+      {# Even a column can be an element. Warden decides whether it renders.        #}
+      {% if element(chrome, 'invoices.amount_column').visible %}<th class="num">Amount</th>{% endif %}
+      <th>Status</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    {% set approve = row.elements.get('invoices.approve_button') %}
+    {% set void = row.elements.get('invoices.void_button') %}
+    <tr>
+      <td><a href="/invoices/{{ row.id }}">{{ row.id }}</a></td>
+      <td>{{ row.supplier }}</td>
+      <td>{{ row.project }}</td>
+      {% set amount = element(chrome, 'invoices.amount_column') %}
+      {% if amount.visible %}
+        <td class="num {% if amount.read_only %}readonly{% endif %}">{{ '{:,}'.format(row.amount) }}</td>
+      {% endif %}
+      <td><span class="tag {{ row.status }}">{{ row.status }}</span></td>
+      <td>
+        {% if approve and approve.visible %}
+          <form method="post" action="/invoices/{{ row.id }}/approve" style="display:inline">
+            <button {% if not approve.interactive %}disabled title="{{ approve.message or 'Not available to you' }}"{% endif %}>
+              Approve
+            </button>
+          </form>
+        {% endif %}
+        {% if void and void.visible %}
+          <button {% if not void.interactive %}disabled title="{{ void.message or 'Not available to you' }}"{% endif %}>Void</button>
+        {% endif %}
+        <a class="note" href="/why/{{ row.id }}">why?</a>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if hidden_count %}
+  <p class="note">{{ hidden_count }} invoice(s) are not shown: Warden filtered them out.</p>
+{% endif %}
+{% endblock %}

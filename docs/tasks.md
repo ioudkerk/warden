@@ -184,7 +184,7 @@ the corpus covers all of §9.
 | M2-4 [B] | Scope matching: tenant / app / environment / instance / subtree | Every scope form in §9.5 has corpus cases including near-miss negatives |
 | M2-5 | Explicit denies with precedence `deny > allow > implicit deny`, admin-only, justification required, always audited | Property test: an explicit deny always wins, whatever the grant set |
 | M2-6 [B] | `POST /v1/authz/check` and `/batch-check` (1 000 per call) | §18 latency targets met on the reference hardware |
-| M2-7 | **Status: done (explain).** `/effective-permissions`, `/explain` with the §10.3 derivation shape | `explain` is refused in prod for non-admins (it leaks policy structure) |
+| M2-7 | **Status: done (explain, filter).** `/effective-permissions`, `/explain` with the §10.3 derivation shape | `explain` is refused in prod for non-admins (it leaks policy structure) |
 | M2-8 | **Status: done.** Decision log: `off`/`denies`/`sampled`/`all`, buffered async sink that never blocks the decision path | Sink saturation drops records and increments a metric; it never adds latency |
 | M2-9 | Groups: local and IdP-sourced, nesting DAG, assignments | IdP group membership is *replaced* per login (§9.4) |
 | M2-10 [B] | **Status: done.** **Privilege-escalation guard**: a subject may not assign a role containing permissions they lack, absent `tenant.role:assign_any` (§17.1 threat 3) | Dedicated test suite; this is a named threat, not a nice-to-have |
@@ -224,7 +224,9 @@ the corpus covers all of §9.
   connection test harness. Mock OIDC OP and SAML IdP in `testing/` are prerequisites.
   *Open:* §23 Q4 — whether SAML ships here or one milestone later. Decide before M4 starts;
   it is roughly a third of the milestone.
-- **M5 UI binding + React SDK.** Element declarations, bindings, UI bundle with ETag,
+- **M5 UI binding + React SDK.** *Server half done:* ui_element/ui_binding, manifest
+  sync, GET /v1/ui/bundle, POST /v1/ui/resolve, and `warden ui`. Remaining: discovery
+  mode, the unprotected-endpoint detector, and the browser/React packages. Element declarations, bindings, UI bundle with ETag,
   per-frame batched `/ui/resolve`, `@warden/browser`, `@warden/react`, `<Guard>` with
   fail-closed loading, discovery mode (refused in prod), and the **unprotected-endpoint
   detector** (§11.6) — the genuinely novel safety feature, do not let it slip.

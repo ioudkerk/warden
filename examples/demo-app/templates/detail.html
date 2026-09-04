@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Invoice {{ invoice.id }}{% endblock %}
+{% block body %}
+<p><a href="/">&larr; All invoices</a></p>
+<div class="panel">
+  <h2 style="margin-top:0">Invoice {{ invoice.id }}</h2>
+  <p>{{ invoice.supplier }} · project {{ invoice.project }} ·
+     <span class="tag {{ invoice.status }}">{{ invoice.status }}</span></p>
+  {% set amount = element(chrome, 'invoices.amount_column') %}
+  {% if amount.visible %}
+    <p>Amount: <strong class="{% if amount.read_only %}readonly{% endif %}">{{ '{:,}'.format(invoice.amount) }}</strong></p>
+  {% endif %}
+
+  {% set approve = element(elements, 'invoices.approve_button') %}
+  {% if approve.visible %}
+    <form method="post" action="/invoices/{{ invoice.id }}/approve" style="display:inline">
+      <button {% if not approve.interactive %}disabled title="{{ approve.message or 'Not available to you' }}"{% endif %}>
+        Approve invoice
+      </button>
+    </form>
+  {% endif %}
+  {% set void = element(elements, 'invoices.void_button') %}
+  {% if void.visible %}
+    <button {% if not void.interactive %}disabled title="{{ void.message or 'Not available to you' }}"{% endif %}>Void invoice</button>
+  {% endif %}
+  <p><a class="note" href="/why/{{ invoice.id }}">Why can I (or can't I) approve this?</a></p>
+</div>
+{% endblock %}

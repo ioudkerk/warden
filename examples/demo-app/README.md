@@ -1,54 +1,46 @@
-# Demo application
+# Demo application — FastAPI
 
-A small invoice service that asks Warden what its users may do. Standard library
-only — no SDK, because the point is that the integration is a JSON POST.
+An invoice service protected by Warden, server-rendered so you can watch the UI
+change without a browser console.
 
-```bash
-# Warden must be running with a tenant, an application and some grants; see below.
-export WARDEN_TOKEN="$(warden token -tenant acme -name billing-api)"
-export MARIA_ID=usr_maria_acme
-export BOB_ID=usr_bob_acme
-python3 app.py
-```
+Two files matter: `warden_client.py` is everything Warden-specific and is what the
+Python SDK (SPEC §12.2, M3) will replace; `main.py` is the application and mentions no
+role, no permission holder and no visibility rule.
 
-```bash
-curl -s localhost:8000/invoices -H 'X-Demo-User: bob'
-curl -s localhost:8000/invoices/4711 -H 'X-Demo-User: maria'
-curl -s -X POST localhost:8000/invoices/4711/approve -H 'X-Demo-User: maria'
-curl -s -X POST localhost:8000/invoices/4712/approve -H 'X-Demo-User: maria'
-```
+## What to look for
 
-## What to notice
+**Nothing in `main.py` says who may approve an invoice.** It says approving is
+`billing.invoice:approve`, and asks.
 
-**Nothing in `app.py` says who may approve an invoice.** It says only that approving
-is `billing.invoice:approve`. Which roles carry that permission, under what
-conditions, and on which projects, lives in Warden — change a grant and the app's
-behaviour changes with no deploy.
+**Nothing in the templates decides which controls exist.** Each names an element key
+declared in `../warden.yaml`. Whether it renders — and whether "no" means hidden,
+greyed out or read-only — comes back from Warden. An administrator changes that with
+`warden ui` and neither file moves.
 
-**The app keeps its own authentication.** Warden does not issue tokens until M1, and
-does not need to here: the app passes the subject id it already trusts and asks only
-the authorization question. ADR-0002 separates identity from decisions on purpose, so
-adding real tokens later changes the `subject` field of the call and nothing else.
+**Three calls build a page.** `POST /v1/authz/filter` for which rows are visible,
+`GET /v1/ui/bundle` for the chrome, and one batched `POST /v1/ui/resolve` for the
+per-row controls. A table of 200 rows with two buttons each is one request, not 400.
 
-**The list view uses `batch-check`.** One question per row would be N round trips.
+**The buttons are not the enforcement.** `POST /invoices/{id}/approve` asks again.
+Hiding a control is a UX decision (SPEC §2.3); posting the URL with no button gets a
+403 with Warden's reason.
 
-**`GET /invoices/{id}` returns a `may` object** — what this user could do next. That
-is the same data the React `<Guard>` component will consume in M5; today the app asks
-for it explicitly.
+**Warden being unreachable denies.** `WardenUnavailable` is an exception, not a falsy
+result, so a caller who forgets to check fails rather than continues.
 
-**Warden being unreachable denies.** An authorization service that cannot answer is
-not permission to proceed. The SDK will do this properly with circuit breakers and the
-`fail_mode` of SPEC §10.6; doing it by hand is the one thing an integration must not
-get wrong.
+## Running it
 
-## Setting Warden up for this
+Warden must be initialised and serving. From the repository root:
 
 ```bash
-warden apply  -f ../warden.yaml
-warden tenant -slug acme -name "ACME Corp"
-MARIA=$(warden user -tenant acme -email maria@acme.test \
-          -attributes '{"department":"finance","approval_limit":50000}')
-BOB=$(warden user -tenant acme -email bob@acme.test)
+make dev-setup                                   # Postgres, Redis, migrations, roles
+export WARDEN_KEK="$(make -s kek)" WARDEN_CONFIG=deploy/warden-server.example.yaml
+warden init  -owner you@example.com
+warden apply -f examples/warden.yaml             # publishes permissions AND ui elements
+warden tenant -slug acme
+
+MARIA=$(warden user -tenant acme -email maria@acme.test -attributes '{"approval_limit":50000}')
+BOB=$(warden user   -tenant acme -email bob@acme.test)
 
 warden resource -tenant acme -ref billing.project:acme-2026
 warden resource -tenant acme -ref billing.invoice:4711 -parent billing.project:acme-2026 \
@@ -59,8 +51,80 @@ warden grant -tenant acme -user "$MARIA" -role billing.viewer
 warden grant -tenant acme -user "$MARIA" -role billing.approver \
   -scope 'billing.project:acme-2026/**' \
   -condition 'resource.attributes.amount <= subject.attributes.approval_limit'
+
+TOKEN=$(warden token -tenant acme -name demo-app -may-explain)
+warden serve
 ```
 
-Note `billing.approver` in `../warden.yaml` declares `requires_mfa: true`, so a check
-with no second factor in `context.amr` denies with `mfa_required`. That is why the
-demo's users carry an `amr` list.
+Then:
+
+```bash
+cd examples/demo-app
+python3 -m venv .venv && .venv/bin/pip install fastapi 'uvicorn[standard]' jinja2 python-multipart
+WARDEN_TOKEN="$TOKEN" MARIA_ID="$MARIA" BOB_ID="$BOB" \
+  .venv/bin/uvicorn main:app --port 8000
+```
+
+Open <http://localhost:8000>, sign in as either user.
+
+## What each user sees, and why
+
+| | Maria | Bob |
+| --- | --- | --- |
+| Invoices listed | all she may read | all he may read |
+| Approve on 4711 (30 000) | **active** | disabled |
+| Approve on 4712 (90 000) | disabled — over her 50 000 limit | disabled |
+| Approve on 9002 (other project) | disabled — outside her subtree | disabled |
+| Void | hidden | hidden |
+
+Maria's approver grant is scoped to one project and carries a CEL condition on the
+amount, and `billing.approver` declares `requires_mfa`. Her session's `amr` says she
+used a second factor; Bob's does not. Every difference above follows from those facts
+and none of them is in the application.
+
+## Change the interface without a deploy
+
+With the app running, in another terminal:
+
+```bash
+# Reports is hidden for Bob — he has no billing.report:read.
+warden ui -tenant acme -application billing -element nav.reports \
+  -requires '{"any_of":[{"role":"billing.viewer"}]}' -mode hidden
+
+# Reload as Bob. The tab is there now.
+
+warden ui -tenant acme -application billing -element nav.reports \
+  -requires '{"any_of":[{"permission":"billing.report:schedule"}]}' \
+  -mode disabled -message "Ask an administrator for reporting access"
+
+# Reload again. Visible, greyed out, with the tooltip.
+```
+
+Nothing restarted. The bundle is cached against the tenant's permission revision,
+which a binding change bumps.
+
+## The "why?" link
+
+Every row links to a derivation from `POST /v1/authz/explain` — which grants were
+considered, what became of each, and the values every condition read:
+
+```
+grant grn_ZVC8xbNTExU  role=billing.approver  scope=billing.project:acme-2026/**
+  → condition_failed
+     resource.attributes.amount <= subject.attributes.approval_limit  =>  false
+       resource.attributes.amount = 90000
+       subject.attributes.approval_limit = 50000
+```
+
+This is restricted in production to a service account marked `may_explain`, because a
+derivation describes the policy itself (SPEC §10.3). The demo's token has it.
+
+## What this demo still fakes
+
+- **Authentication.** Warden issues no tokens until M1, so the app passes a subject id
+  from its own session and states the session's `amr` itself. With M1 the `amr` is a
+  claim on the access token, which a client cannot assert about itself.
+- **Caching.** Every page makes live calls. The SDK's decision cache and change-stream
+  invalidation are M3; this is what the uncached shape looks like.
+- **`<Guard>`.** The React SDK (M5) consumes the same bundle. Here the server renders
+  it, which shows the same decisions with less machinery.
