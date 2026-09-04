@@ -41,8 +41,9 @@ worse.
 
 ### Of particular interest
 
-These are the failures that would matter most, and the ones the threat model
-(`docs/threat-model.md`) is built around:
+These are the failures that would matter most, and the ones the
+[threat model](docs/threat-model.md) is built around — it also records, per threat,
+what is not yet mitigated:
 
 - **Authorization bypass** — any path where `check` returns allow without a grant
   that justifies it, or where an explicit deny is not honoured.

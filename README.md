@@ -33,6 +33,8 @@ Work is broken down in [`docs/tasks.md`](./docs/tasks.md).
 | [docs/sdk-backend-python.md](./docs/sdk-backend-python.md) | Python SDK design |
 | [docs/sdk-frontend-react.md](./docs/sdk-frontend-react.md) | React SDK and UI element binding |
 | [docs/tasks.md](./docs/tasks.md) | Milestone task breakdown with exit conditions |
+| [docs/threat-model.md](./docs/threat-model.md) | Threats, what mitigates each, and what does not yet |
+| [docs/design-email.md](./docs/design-email.md) | Email delivery: providers, templates, bounces, enumeration |
 | [docs/adr/](./docs/adr/) | Architecture decision records |
 
 ## Contributing

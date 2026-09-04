@@ -254,9 +254,10 @@ role templates as a starting point and may fork/extend them.
   is enabled with `tenant_id = current_setting('warden.tenant_id')`; the application sets it
   per connection/transaction. This is defence-in-depth behind application-level filtering.
 - A subject exists within exactly one tenant. Cross-tenant identity (one human, several
-  tenants) is modelled as **one `person` with several `user` records linked by a verified
-  email or an external `idp_subject`** — this keeps decision evaluation single-tenant and
-  simple. *(open: whether v1 exposes the `person` linkage in the UI at all.)*
+  tenants) is *conceptually* one person with several `user` records, linked by a verified
+  email or an external `idp_subject` — this keeps decision evaluation single-tenant and
+  simple. **v1 stores no `person` entity**: the linkage is derived on demand, so nothing
+  in the schema spans tenants. See [ADR-0004](docs/adr/0004-cross-tenant-person.md).
 - Tenant deletion is a soft delete with a configurable retention window, then a hard purge
   job.
 

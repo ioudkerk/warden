@@ -137,6 +137,7 @@ demo tenant and the `billing` app from `examples/warden.yaml`.
 **Exit:** clean clone → `docker compose up` → a seeded, reachable server in under two minutes.
 
 ### M0-12 [P] Missing design artifacts named by the spec but not yet written
+**Status: done.**
 - `docs/threat-model.md` — required by §17 as a release gate, referenced but absent.
 - `docs/design-email.md` — M1 needs verification, magic links, invitations and resets;
   provider abstraction (SMTP + pluggable), templating, i18n hooks, bounce handling and
@@ -144,7 +145,9 @@ demo tenant and the `billing` app from `examples/warden.yaml`.
 - Resolve the cross-tenant **`person`** linkage (§6.2, marked *(open)*): today `user` is
   unique on `(tenant_id, email)` and no `person` table exists. Decide whether v1 has the
   table at all, and record it as ADR-0004.
-**Exit:** three documents merged; §6.2's *(open)* marker removed or narrowed.
+**Exit:** three documents merged; §6.2's *(open)* marker removed or narrowed. — Done:
+[`docs/threat-model.md`](threat-model.md), [`docs/design-email.md`](design-email.md),
+[ADR-0004](adr/0004-cross-tenant-person.md); §6.2's marker is resolved.
 
 ---
 
