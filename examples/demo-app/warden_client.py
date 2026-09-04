@@ -92,6 +92,11 @@ class Warden:
             raise WardenUnavailable(f"warden returned {e.code}: {detail}") from e
         except urllib.error.URLError as e:
             raise WardenUnavailable(f"warden unreachable: {e.reason}") from e
+        except OSError as e:
+            # A read timeout arrives here rather than as a URLError: urllib only wraps
+            # failures from opening the connection, not from reading the response. A
+            # hung authorization service has to fail closed exactly like a missing one.
+            raise WardenUnavailable(f"warden unreachable: {e}") from e
 
     # --- authorization -----------------------------------------------------------
 

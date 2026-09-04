@@ -7,11 +7,9 @@
     Each one maps to a Warden subject id and an <code>amr</code> describing what its
     sign-in actually proved.
   </p>
-  <form method="post" action="/login">
-    {% for key, u in users.items() %}
-      <p><button name="who" value="{{ key }}">Sign in as {{ u.name }}</button>
-        <span class="note">amr: {{ u.amr | join(', ') }}</span></p>
-    {% endfor %}
-  </form>
+  {% for key, u in users.items() %}
+    <p><a class="btn" href="/login/{{ key }}">Sign in as {{ u.name }}</a>
+      <span class="note">amr: {{ u.amr | join(', ') }}</span></p>
+  {% endfor %}
 </div>
 {% endblock %}

@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -76,10 +76,25 @@ def login(request: Request) -> Any:
     return templates.TemplateResponse(request=request, name="login.html", context={"users": USERS})
 
 
-@app.post("/login")
-def do_login(who: str = Form(...)) -> RedirectResponse:
-    response = RedirectResponse("/", status_code=303)
-    response.set_cookie("who", who, httponly=True, samesite="lax")
+@app.get("/login/{who}")
+def login_as(who: str, next: str = "/") -> RedirectResponse:
+    """Sign in by link, so the demo can be driven without a form.
+
+    `next` is restricted to a local path. An open redirect is not something to ship
+    even in an example, because examples are what people copy.
+    """
+    if not next.startswith("/") or next.startswith("//"):
+        next = "/"
+    return _sign_in(who, next)
+
+
+def _sign_in(who: str, destination: str) -> RedirectResponse:
+    if who not in USERS:
+        raise HTTPException(status_code=404, detail="no such demo user")
+    response = RedirectResponse(destination, status_code=303)
+    # max_age so the cookie survives a browser restart; this is a demo session, not a
+    # credential, and Warden issues no tokens until M1.
+    response.set_cookie("who", who, httponly=True, samesite="lax", max_age=86400)
     return response
 
 

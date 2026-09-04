@@ -18,7 +18,7 @@
   &rarr; {{ g.outcome }}{% if g.detail %}
      {{ g.detail }}{% endif %}
 {% for c in g.conditions or [] %}     {{ c.expression }}  =>  {{ c.result }}
-{% for k, v in (c.values or {}).items() %}       {{ k }} = {{ v }}
+{% for k, v in (c.get('values') or {}).items() %}       {{ k }} = {{ v }}
 {% endfor %}{% endfor %}</div>
     {% endfor %}
     {% for n in decision.explain.notes or [] %}<p class="note">{{ n }}</p>{% endfor %}
