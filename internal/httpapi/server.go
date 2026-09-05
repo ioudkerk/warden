@@ -20,6 +20,7 @@ import (
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/store"
+	"github.com/warden-project/warden/internal/store/db"
 )
 
 // Server is Warden's HTTP surface. Today that is the decision API of SPEC §10.1 plus
@@ -91,20 +92,12 @@ func (s *Server) decisionLevel(ctx context.Context, tenantID string) decisionlog
 
 	level := decisionlog.LevelDenies
 	err := s.system.InSystem(ctx, "reading the decision log level", func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT DISTINCT a.decision_log
-			  FROM application a JOIN app_enrollment e ON e.application_id = a.id
-			 WHERE e.tenant_id = $1`, tenantID)
+		levels, err := db.New(tx).TenantDecisionLogLevels(ctx, tenantID)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		strictest := -1
-		for rows.Next() {
-			var raw string
-			if err := rows.Scan(&raw); err != nil {
-				return err
-			}
+		for _, raw := range levels {
 			parsed, err := decisionlog.ParseLevel(raw)
 			if err != nil {
 				s.log.Warn("unrecognised decision_log level; using denies", "value", raw)
@@ -114,7 +107,7 @@ func (s *Server) decisionLevel(ctx context.Context, tenantID string) decisionlog
 				strictest, level = rank, parsed
 			}
 		}
-		return rows.Err()
+		return nil
 	})
 	if err != nil {
 		s.log.Warn("could not read the decision log level; using denies", "error", err)

@@ -1,0 +1,50 @@
+# sqlc turns internal/store/queries/*.sql into the typed accessors in
+# internal/store/db. Regenerate with `make sqlc`; CI runs `make sqlc-check`, which
+# regenerates and fails on a diff, so the checked-in code cannot drift from the SQL.
+#
+# The schema is read from the migrations rather than from the committed schema.sql
+# dump: the migrations are the source of truth that CI already round-trips, and a
+# pg_dump carries partitions and plpgsql bodies that only exist to be replayed.
+version: "2"
+sql:
+  - engine: postgresql
+    schema: internal/store/migrations
+    queries: internal/store/queries
+    gen:
+      go:
+        package: db
+        out: internal/store/db
+        sql_package: pgx/v5
+        emit_interface: true
+        emit_empty_slices: true
+        # Nullable columns become pointers, which is what the hand-written scans
+        # already used. pgtype wrappers would have made every call site unwrap a
+        # value it currently reads directly.
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true
+          - db_type: "jsonb"
+            go_type: "github.com/warden-project/warden/internal/store/dbtypes.JSONMap"
+          - db_type: "jsonb"
+            nullable: true
+            go_type: "github.com/warden-project/warden/internal/store/dbtypes.JSONMap"
+          - db_type: "inet"
+            go_type: "string"
+          - db_type: "inet"
+            nullable: true
+            go_type:
+              type: "string"
+              pointer: true
+          # The clause set is parsed into uibind.Requires by uibind.ParseRequires,
+          # which validates that exactly one of any_of/all_of is populated. Handing it
+          # a map would mean re-marshalling what the database already stored as text.
+          - column: "ui_binding.requires"
+            go_type:
+              type: "byte"
+              slice: true

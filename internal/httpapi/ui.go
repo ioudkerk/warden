@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/authz"
+	"github.com/warden-project/warden/internal/store/db"
 	"github.com/warden-project/warden/internal/uibind"
 )
 
@@ -365,43 +366,26 @@ func (s *Server) handleUIResolve(w http.ResponseWriter, r *http.Request) {
 // An environment-specific binding wins over the one that applies to all environments,
 // which is what makes a change testable in staging before it is promoted (§11.3).
 func (s *Server) loadElements(ctx context.Context, tenantID, application, environment, surface string) ([]uibind.Element, error) {
-	const q = `
-		SELECT e.key, e.label, e.default_mode, coalesce(e.suggested_permission, ''),
-		       (e.resource_type_id IS NOT NULL),
-		       b.requires, b.mode, coalesce(b.condition, ''), coalesce(b.message, ''),
-		       coalesce(b.version, 0)
-		  FROM ui_element e
-		  JOIN application a ON a.id = e.application_id
-		  LEFT JOIN LATERAL (
-		      SELECT ub.* FROM ui_binding ub
-		       LEFT JOIN environment env ON env.id = ub.environment_id
-		       WHERE ub.ui_element_id = e.id
-		         AND (ub.environment_id IS NULL OR env.name = $3)
-		       ORDER BY (ub.environment_id IS NOT NULL) DESC
-		       LIMIT 1
-		  ) b ON true
-		 WHERE a.key = $1 AND e.surface = $2 AND e.status <> 'deprecated'
-		 ORDER BY e.key`
-
 	var elements []uibind.Element
 	err := s.tenant.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, q, application, surface, environment)
+		rows, err := db.New(tx).UIElementsWithBindings(ctx, db.UIElementsWithBindingsParams{
+			Environment: environment, Application: application, Surface: surface,
+		})
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 
-		for rows.Next() {
-			var e uibind.Element
-			var requires []byte
-			var mode, condition, message *string
-			var version int
-			if err := rows.Scan(&e.Key, &e.Label, &e.DefaultMode, &e.SuggestedPermission,
-				&e.ResourceScoped, &requires, &mode, &condition, &message, &version); err != nil {
-				return err
+		for i := range rows {
+			r := &rows[i]
+			e := uibind.Element{
+				Key: r.Key, Label: r.Label, DefaultMode: r.DefaultMode,
+				SuggestedPermission: r.SuggestedPermission, ResourceScoped: r.ResourceScoped,
 			}
-			if len(requires) > 0 && mode != nil {
-				parsed, parseErr := uibind.ParseRequires(requires)
+			// An empty mode means the lateral join matched no binding; the column is
+			// NOT NULL and constrained to hidden/disabled/read_only, so it cannot be
+			// the empty string for a binding that exists.
+			if len(r.Requires) > 0 && r.Mode != "" {
+				parsed, parseErr := uibind.ParseRequires(r.Requires)
 				if parseErr != nil {
 					// A malformed binding is not a reason to fail the whole bundle;
 					// the element falls back to its default and the problem is
@@ -409,21 +393,14 @@ func (s *Server) loadElements(ctx context.Context, tenantID, application, enviro
 					s.log.Warn("ignoring a malformed ui binding", "element", e.Key, "error", parseErr)
 				} else {
 					e.Binding = &uibind.Binding{
-						Requires: parsed, Mode: *mode,
-						Condition: deref(condition), Message: deref(message), Version: version,
+						Requires: parsed, Mode: r.Mode,
+						Condition: r.Condition, Message: r.Message, Version: int(r.Version),
 					}
 				}
 			}
 			elements = append(elements, e)
 		}
-		return rows.Err()
+		return nil
 	})
 	return elements, err
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/warden-project/warden/internal/audit"
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/store"
+	"github.com/warden-project/warden/internal/store/db"
 	"github.com/warden-project/warden/internal/uibind"
 )
 
@@ -44,11 +45,11 @@ func (p *Provisioner) WithActor(actor string) *Provisioner {
 // New builds a provisioner. It refuses a tenant-scoped pool: every operation here is
 // either cross-tenant or runs before a tenant scope exists, and a tenant-scoped
 // connection would simply see nothing and report success on zero rows.
-func New(db *store.Store) (*Provisioner, error) {
-	if db.Access() != store.SystemAccess {
-		return nil, fmt.Errorf("provisioning requires the system pool, not the %s pool", db.Access())
+func New(st *store.Store) (*Provisioner, error) {
+	if st.Access() != store.SystemAccess {
+		return nil, fmt.Errorf("provisioning requires the system pool, not the %s pool", st.Access())
 	}
-	return &Provisioner{db: db, audit: audit.NewWriter(), actor: "cli"}, nil
+	return &Provisioner{db: st, audit: audit.NewWriter(), actor: "cli"}, nil
 }
 
 // record appends an audit entry inside the caller's transaction.
@@ -79,7 +80,7 @@ type ApplyResult struct {
 // set to 'deprecated' instead, because a tenant may have bound it and dropping the row
 // would take their binding with it — silently changing what their staff can see as a
 // side effect of someone else's refactor.
-func applyUIElements(ctx context.Context, tx pgx.Tx, m *Manifest, appID string, result *ApplyResult) error {
+func applyUIElements(ctx context.Context, q *db.Queries, m *Manifest, appID string, result *ApplyResult) error {
 	declared := map[string]bool{}
 
 	for i := range m.UI.Elements {
@@ -105,48 +106,29 @@ func applyUIElements(ctx context.Context, tx pgx.Tx, m *Manifest, appID string, 
 			suggested = &e.Suggests.Permission
 		}
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO ui_element (id, application_id, key, label, description, surface, path,
-			                        suggested_permission, resource_type_id, default_mode, status)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'declared')
-			ON CONFLICT (application_id, key) DO UPDATE SET
-				label = EXCLUDED.label, description = EXCLUDED.description,
-				surface = EXCLUDED.surface, path = EXCLUDED.path,
-				suggested_permission = EXCLUDED.suggested_permission,
-				resource_type_id = EXCLUDED.resource_type_id,
-				default_mode = EXCLUDED.default_mode, status = 'declared'`,
-			id("uie", m.Application+"_"+e.Key), appID, e.Key, e.Label, nullIfEmpty(e.Description),
-			surface, nullIfEmpty(e.Path), suggested, resourceTypeID, mode); err != nil {
+		if err := q.UpsertUIElement(ctx, db.UpsertUIElementParams{
+			ID: id("uie", m.Application+"_"+e.Key), ApplicationID: appID,
+			Key: e.Key, Label: e.Label, Description: nullIfEmpty(e.Description),
+			Surface: surface, Path: nullIfEmpty(e.Path),
+			SuggestedPermission: suggested, ResourceTypeID: resourceTypeID, DefaultMode: mode,
+		}); err != nil {
 			return fmt.Errorf("ui element %s: %w", e.Key, err)
 		}
 		result.UIElements++
 	}
 
 	// Anything this application declared before and no longer does.
-	rows, err := tx.Query(ctx,
-		`SELECT key FROM ui_element WHERE application_id = $1 AND status = 'declared'`, appID)
+	keys, err := q.DeclaredUIElementKeys(ctx, appID)
 	if err != nil {
 		return err
 	}
-	var stale []string
-	for rows.Next() {
-		var key string
-		if scanErr := rows.Scan(&key); scanErr != nil {
-			rows.Close()
-			return scanErr
+	for _, key := range keys {
+		if declared[key] {
+			continue
 		}
-		if !declared[key] {
-			stale = append(stale, key)
-		}
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return rows.Err()
-	}
-	for _, key := range stale {
-		if _, err := tx.Exec(ctx,
-			`UPDATE ui_element SET status = 'deprecated' WHERE application_id = $1 AND key = $2`,
-			appID, key); err != nil {
+		if err := q.DeprecateUIElement(ctx, db.DeprecateUIElementParams{
+			ApplicationID: appID, Key: key,
+		}); err != nil {
 			return err
 		}
 	}
@@ -164,11 +146,11 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 	result := ApplyResult{Application: m.Application}
 
 	err := p.db.InSystem(ctx, "applying the manifest for "+m.Application, func(ctx context.Context, tx pgx.Tx) error {
+		q := db.New(tx)
 		appID := id("app", m.Application)
 
-		var existed bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM application WHERE id = $1)`, appID).Scan(&existed); err != nil {
+		existed, err := q.ApplicationExists(ctx, appID)
+		if err != nil {
 			return err
 		}
 		result.Created = !existed
@@ -184,23 +166,18 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 			settings.DecisionLog = "denies"
 		}
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO application (id, key, name, manifest_version, fail_mode, cache_mode, decision_log)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (id) DO UPDATE SET
-				name = EXCLUDED.name, manifest_version = EXCLUDED.manifest_version,
-				fail_mode = EXCLUDED.fail_mode, cache_mode = EXCLUDED.cache_mode,
-				decision_log = EXCLUDED.decision_log`,
-			appID, m.Application, m.Name, m.Version,
-			settings.FailMode, settings.CacheMode, settings.DecisionLog); err != nil {
+		if err := q.UpsertApplication(ctx, db.UpsertApplicationParams{
+			ID: appID, Key: m.Application, Name: m.Name, ManifestVersion: int32(m.Version),
+			FailMode: settings.FailMode, CacheMode: settings.CacheMode,
+			DecisionLog: settings.DecisionLog,
+		}); err != nil {
 			return fmt.Errorf("application: %w", err)
 		}
 
 		for _, env := range []string{"dev", "staging", "prod"} {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO environment (id, application_id, name) VALUES ($1, $2, $3)
-				ON CONFLICT (application_id, name) DO NOTHING`,
-				id("env", m.Application+"_"+env), appID, env); err != nil {
+			if err := q.UpsertEnvironment(ctx, db.UpsertEnvironmentParams{
+				ID: id("env", m.Application+"_"+env), ApplicationID: appID, Name: env,
+			}); err != nil {
 				return fmt.Errorf("environment %s: %w", env, err)
 			}
 		}
@@ -211,12 +188,10 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 			if schema == nil {
 				schema = map[string]any{}
 			}
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO resource_type (id, application_id, key, name, attribute_schema)
-				VALUES ($1, $2, $3, $4, $5)
-				ON CONFLICT (application_id, key) DO UPDATE SET
-					name = EXCLUDED.name, attribute_schema = EXCLUDED.attribute_schema`,
-				id("rst", m.Application+"_"+rt.Key), appID, rt.Key, orKey(rt.Name, rt.Key), schema); err != nil {
+			if err := q.UpsertResourceType(ctx, db.UpsertResourceTypeParams{
+				ID: id("rst", m.Application+"_"+rt.Key), ApplicationID: appID,
+				Key: rt.Key, Name: orKey(rt.Name, rt.Key), AttributeSchema: schema,
+			}); err != nil {
 				return fmt.Errorf("resource %s: %w", rt.Key, err)
 			}
 		}
@@ -226,8 +201,9 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 				v := id("rst", m.Application+"_"+rt.Parent)
 				parent = &v
 			}
-			if _, err := tx.Exec(ctx, `UPDATE resource_type SET parent_type_id = $1 WHERE id = $2`,
-				parent, id("rst", m.Application+"_"+rt.Key)); err != nil {
+			if err := q.SetResourceTypeParent(ctx, db.SetResourceTypeParentParams{
+				ParentTypeID: parent, ID: id("rst", m.Application+"_"+rt.Key),
+			}); err != nil {
 				return fmt.Errorf("resource %s parent: %w", rt.Key, err)
 			}
 		}
@@ -241,18 +217,18 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 					implies = []string{}
 				}
 				actionID := id("act", m.Application+"_"+rt.Key+"_"+a.Key)
-				if _, err := tx.Exec(ctx, `
-					INSERT INTO action (id, resource_type_id, key, name, implies) VALUES ($1, $2, $3, $4, $5)
-					ON CONFLICT (resource_type_id, key) DO UPDATE SET
-						name = EXCLUDED.name, implies = EXCLUDED.implies`,
-					actionID, typeID, a.Key, orKey(a.Name, a.Key), implies); err != nil {
+				if err := q.UpsertAction(ctx, db.UpsertActionParams{
+					ID: actionID, ResourceTypeID: typeID,
+					Key: a.Key, Name: orKey(a.Name, a.Key), Implies: implies,
+				}); err != nil {
 					return fmt.Errorf("action %s:%s: %w", rt.Key, a.Key, err)
 				}
-				if _, err := tx.Exec(ctx, `
-					INSERT INTO permission (id, application_id, key, resource_type_id, action_id)
-					VALUES ($1, $2, $3, $4, $5) ON CONFLICT (application_id, key) DO NOTHING`,
-					id("prm", m.Application+"_"+rt.Key+"_"+a.Key), appID,
-					fmt.Sprintf("%s.%s:%s", m.Application, rt.Key, a.Key), typeID, actionID); err != nil {
+				if err := q.InsertPermission(ctx, db.InsertPermissionParams{
+					ID:             id("prm", m.Application+"_"+rt.Key+"_"+a.Key),
+					ApplicationID:  appID,
+					Key:            fmt.Sprintf("%s.%s:%s", m.Application, rt.Key, a.Key),
+					ResourceTypeID: typeID, ActionID: actionID,
+				}); err != nil {
 					return fmt.Errorf("permission %s:%s: %w", rt.Key, a.Key, err)
 				}
 				result.Permissions++
@@ -273,31 +249,29 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 				constraints["max_assignees"] = *r.Constraints.MaxAssignees
 			}
 
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO role (id, tenant_id, application_id, key, name, description, type,
-				                  template_version, constraints)
-				VALUES ($1, NULL, $2, $3, $4, $5, 'application_template', $6, $7)
-				ON CONFLICT (id) DO UPDATE SET
-					name = EXCLUDED.name, description = EXCLUDED.description,
-					template_version = EXCLUDED.template_version, constraints = EXCLUDED.constraints`,
-				roleID, appID, r.Key, orKey(r.Name, r.Key), r.Description, m.Version, constraints); err != nil {
+			templateVersion := int32(m.Version)
+			if err := q.UpsertTemplateRole(ctx, db.UpsertTemplateRoleParams{
+				ID: roleID, ApplicationID: &appID, Key: r.Key, Name: orKey(r.Name, r.Key),
+				Description: nullIfEmpty(r.Description), TemplateVersion: &templateVersion,
+				Constraints: constraints,
+			}); err != nil {
 				return fmt.Errorf("role %s: %w", r.Key, err)
 			}
 
 			// Replace the permission set rather than merging: a permission removed
 			// from the manifest must actually be removed, or a role keeps granting
 			// something its declaration no longer mentions.
-			if _, err := tx.Exec(ctx, `DELETE FROM role_permission WHERE role_id = $1`, roleID); err != nil {
+			if err := q.DeleteRolePermissions(ctx, roleID); err != nil {
 				return err
 			}
 			for _, perm := range r.Permissions {
-				if _, err := tx.Exec(ctx,
-					`INSERT INTO role_permission (role_id, tenant_id, permission_key) VALUES ($1, NULL, $2)`,
-					roleID, perm); err != nil {
+				if err := q.InsertRolePermission(ctx, db.InsertRolePermissionParams{
+					RoleID: roleID, PermissionKey: perm,
+				}); err != nil {
 					return fmt.Errorf("role %s permission %s: %w", r.Key, perm, err)
 				}
 			}
-			if _, err := tx.Exec(ctx, `DELETE FROM role_inheritance WHERE role_id = $1`, roleID); err != nil {
+			if err := q.DeleteRoleInheritance(ctx, roleID); err != nil {
 				return err
 			}
 			result.Roles++
@@ -305,16 +279,15 @@ func (p *Provisioner) Apply(ctx context.Context, m *Manifest) (ApplyResult, erro
 		for i := range m.Roles {
 			r := &m.Roles[i]
 			for _, parent := range r.Inherits {
-				if _, err := tx.Exec(ctx,
-					`INSERT INTO role_inheritance (role_id, parent_role_id, tenant_id) VALUES ($1, $2, NULL)
-					 ON CONFLICT DO NOTHING`,
-					id("rol", r.Key), id("rol", parent)); err != nil {
+				if err := q.InsertRoleInheritance(ctx, db.InsertRoleInheritanceParams{
+					RoleID: id("rol", r.Key), ParentRoleID: id("rol", parent),
+				}); err != nil {
 					return fmt.Errorf("role %s inherits %s: %w", r.Key, parent, err)
 				}
 			}
 		}
 
-		if err := applyUIElements(ctx, tx, m, appID, &result); err != nil {
+		if err := applyUIElements(ctx, q, m, appID, &result); err != nil {
 			return err
 		}
 
@@ -347,27 +320,24 @@ func orKey(name, key string) string {
 // A change to the global permission surface can change any tenant's decisions, so
 // every tenant's revision moves and every cached model is rebuilt (SPEC §10.5).
 func bumpEveryTenant(ctx context.Context, tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `UPDATE tenant SET permission_rev = permission_rev + 1`)
-	return err
+	return db.New(tx).BumpEveryTenantRevision(ctx)
 }
 
 func bumpTenant(ctx context.Context, tx pgx.Tx, tenantID string) error {
-	_, err := tx.Exec(ctx, `UPDATE tenant SET permission_rev = permission_rev + 1 WHERE id = $1`, tenantID)
-	return err
+	return db.New(tx).BumpTenantRevision(ctx, tenantID)
 }
 
 // CreateTenant creates a tenant and enrols it in every registered application.
 func (p *Provisioner) CreateTenant(ctx context.Context, slug, name string) (string, error) {
 	tenantID := id("ten", slug)
 	err := p.db.InSystem(ctx, "creating tenant "+slug, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO tenant (id, slug, name) VALUES ($1, $2, $3)`,
-			tenantID, slug, orKey(name, slug)); err != nil {
+		q := db.New(tx)
+		if err := q.InsertTenant(ctx, db.InsertTenantParams{
+			ID: tenantID, Slug: slug, Name: orKey(name, slug),
+		}); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO app_enrollment (tenant_id, application_id)
-			SELECT $1, id FROM application ON CONFLICT DO NOTHING`, tenantID); err != nil {
+		if err := q.EnrolTenantInEveryApplication(ctx, tenantID); err != nil {
 			return err
 		}
 		return p.record(ctx, tx, audit.Entry{
@@ -387,9 +357,10 @@ func (p *Provisioner) CreateUser(ctx context.Context, tenantSlug, email string, 
 		attributes = map[string]any{}
 	}
 	err := p.db.InSystem(ctx, "creating user "+email, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO app_user (id, tenant_id, email, status, attributes)
-			VALUES ($1, $2, $3, 'active', $4)`, userID, tenantID, email, attributes); err != nil {
+		if err := db.New(tx).InsertUser(ctx, db.InsertUserParams{
+			ID: userID, TenantID: tenantID, Email: email,
+			Status: "active", Attributes: attributes,
+		}); err != nil {
 			return err
 		}
 		return p.record(ctx, tx, audit.Entry{
@@ -479,17 +450,17 @@ func (p *Provisioner) Grant(ctx context.Context, o GrantOptions) (string, error)
 	}
 
 	err = p.db.InSystem(ctx, "granting "+o.RoleKey, func(ctx context.Context, tx pgx.Tx) error {
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO grant_ (id, tenant_id, subject_user_id, subject_group_id, role_id,
-			                    scope_kind, scope_ref, condition, valid_from, valid_until, reason)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'0001-01-01T00:00:00Z',$9,$10)`,
-			grantID, tenantID, user, group, id("rol", o.RoleKey),
-			kind, ref, condition, o.ValidUntil, o.Reason); execErr != nil {
+		q := db.New(tx)
+		if execErr := q.InsertGrant(ctx, db.InsertGrantParams{
+			ID: grantID, TenantID: tenantID, SubjectUserID: user, SubjectGroupID: group,
+			RoleID: id("rol", o.RoleKey), ScopeKind: kind, ScopeRef: ref,
+			Condition: condition, ValidUntil: o.ValidUntil, Reason: nullIfEmpty(o.Reason),
+		}); execErr != nil {
 			return execErr
 		}
-		if _, execErr := tx.Exec(ctx,
-			`UPDATE grant_ SET granted_by = $1 WHERE id = $2`,
-			nullIfEmpty(o.Actor.SubjectID), grantID); execErr != nil {
+		if execErr := q.SetGrantGrantedBy(ctx, db.SetGrantGrantedByParams{
+			GrantedBy: nullIfEmpty(o.Actor.SubjectID), ID: grantID,
+		}); execErr != nil {
 			return execErr
 		}
 		if recordErr := p.record(ctx, tx, audit.Entry{
@@ -579,22 +550,22 @@ func (p *Provisioner) Revoke(ctx context.Context, tenantSlug, grantID string) er
 		// Read the grant before deleting it. An audit entry saying only "a grant was
 		// revoked" cannot answer the question anyone actually asks a year later,
 		// which is what it granted.
-		var role, scopeKind, scopeRef string
-		var subjectUser, subjectGroup *string
-		err := tx.QueryRow(ctx, `
-			SELECT r.key, g.scope_kind, g.scope_ref, g.subject_user_id, g.subject_group_id
-			  FROM grant_ g JOIN role r ON r.id = g.role_id
-			 WHERE g.id = $1 AND g.tenant_id = $2`,
-			grantID, tenantID).Scan(&role, &scopeKind, &scopeRef, &subjectUser, &subjectGroup)
+		q := db.New(tx)
+		g, err := q.GrantBeingRevoked(ctx, db.GrantBeingRevokedParams{
+			ID: grantID, TenantID: tenantID,
+		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("no grant %s in tenant %s", grantID, tenantSlug)
 			}
 			return err
 		}
+		role, scopeKind, scopeRef := g.Key, g.ScopeKind, g.ScopeRef
+		subjectUser, subjectGroup := g.SubjectUserID, g.SubjectGroupID
 
-		if _, err := tx.Exec(ctx, `DELETE FROM grant_ WHERE id = $1 AND tenant_id = $2`,
-			grantID, tenantID); err != nil {
+		if err := q.DeleteGrant(ctx, db.DeleteGrantParams{
+			ID: grantID, TenantID: tenantID,
+		}); err != nil {
 			return err
 		}
 		if err := p.record(ctx, tx, audit.Entry{
@@ -623,11 +594,9 @@ func (p *Provisioner) RegisterResource(ctx context.Context, tenantSlug, ref, par
 		parent = &parentRef
 	}
 	return p.db.InSystem(ctx, "registering "+ref, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO resource_node (tenant_id, ref, parent_ref, attributes) VALUES ($1,$2,$3,$4)
-			ON CONFLICT (tenant_id, ref) DO UPDATE SET
-				parent_ref = EXCLUDED.parent_ref, attributes = EXCLUDED.attributes`,
-			tenantID, ref, parent, attrs); err != nil {
+		if err := db.New(tx).UpsertResourceNode(ctx, db.UpsertResourceNodeParams{
+			TenantID: tenantID, Ref: ref, ParentRef: parent, Attributes: attrs,
+		}); err != nil {
 			return err
 		}
 		if err := p.record(ctx, tx, audit.Entry{
@@ -654,10 +623,10 @@ func (p *Provisioner) CreateServiceAccount(ctx context.Context, tenantSlug, name
 
 	tenantID := id("ten", tenantSlug)
 	err = p.db.InSystem(ctx, "creating service account "+name, func(ctx context.Context, tx pgx.Tx) error {
-		_, execErr := tx.Exec(ctx, `
-			INSERT INTO service_account (id, tenant_id, name, token_hash, may_explain)
-			VALUES ($1, $2, $3, $4, $5)`,
-			id("svc", tenantSlug+"_"+name), tenantID, name, sum[:], mayExplain)
+		execErr := db.New(tx).InsertServiceAccount(ctx, db.InsertServiceAccountParams{
+			ID: id("svc", tenantSlug+"_"+name), TenantID: tenantID, Name: name,
+			TokenHash: sum[:], MayExplain: mayExplain,
+		})
 		if execErr != nil {
 			return execErr
 		}
@@ -741,25 +710,20 @@ func (p *Provisioner) RecentAudit(ctx context.Context, tenantSlug string, limit 
 
 	var entries []AuditEntry
 	err := p.db.InSystem(ctx, "reading the audit log", func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT occurred_at, action, coalesce(target_type,''), coalesce(target_id,''),
-			       coalesce(tenant_id,''), coalesce(reason,'')
-			  FROM audit_event
-			 WHERE ($1::text IS NULL OR tenant_id = $1)
-			 ORDER BY seq DESC LIMIT $2`, tenantID, limit)
+		rows, err := db.New(tx).RecentAuditEvents(ctx, db.RecentAuditEventsParams{
+			TenantID: tenantID, RowLimit: int32(limit),
+		})
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var e AuditEntry
-			if err := rows.Scan(&e.OccurredAt, &e.Action, &e.TargetType,
-				&e.TargetID, &e.TenantID, &e.Reason); err != nil {
-				return err
-			}
-			entries = append(entries, e)
+		for _, r := range rows {
+			entries = append(entries, AuditEntry{
+				OccurredAt: r.OccurredAt, Action: r.Action,
+				TargetType: r.TargetType, TargetID: r.TargetID,
+				TenantID: r.TenantID, Reason: r.Reason,
+			})
 		}
-		return rows.Err()
+		return nil
 	})
 	return entries, err
 }
@@ -819,9 +783,9 @@ func (p *Provisioner) BindUIElement(ctx context.Context, o BindOptions) error {
 	elementID := id("uie", o.Application+"_"+o.ElementKey)
 
 	return p.db.InSystem(ctx, "binding ui element "+o.ElementKey, func(ctx context.Context, tx pgx.Tx) error {
-		var exists bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM ui_element WHERE id = $1)`, elementID).Scan(&exists); err != nil {
+		q := db.New(tx)
+		exists, err := q.UIElementExists(ctx, elementID)
+		if err != nil {
 			return err
 		}
 		if !exists {
@@ -831,10 +795,9 @@ func (p *Provisioner) BindUIElement(ctx context.Context, o BindOptions) error {
 
 		var environmentID *string
 		if o.Environment != "" {
-			var envID string
-			err := tx.QueryRow(ctx, `
-				SELECT e.id FROM environment e JOIN application a ON a.id = e.application_id
-				 WHERE a.key = $1 AND e.name = $2`, o.Application, o.Environment).Scan(&envID)
+			envID, err := q.EnvironmentID(ctx, db.EnvironmentIDParams{
+				Key: o.Application, Name: o.Environment,
+			})
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return fmt.Errorf("application %q has no environment %q", o.Application, o.Environment)
@@ -844,16 +807,11 @@ func (p *Provisioner) BindUIElement(ctx context.Context, o BindOptions) error {
 			environmentID = &envID
 		}
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO ui_binding (id, tenant_id, ui_element_id, environment_id,
-			                        requires, mode, message, updated_by, version)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)
-			ON CONFLICT (tenant_id, ui_element_id, environment_id) DO UPDATE SET
-				requires = EXCLUDED.requires, mode = EXCLUDED.mode,
-				message = EXCLUDED.message, updated_by = EXCLUDED.updated_by,
-				version = ui_binding.version + 1`,
-			"uib_"+randomSuffix(), tenantID, elementID, environmentID,
-			o.Requires, o.Mode, nullIfEmpty(o.Message), nullIfEmpty(o.Actor.SubjectID)); err != nil {
+		if err := q.UpsertUIBinding(ctx, db.UpsertUIBindingParams{
+			ID: "uib_" + randomSuffix(), TenantID: tenantID, UiElementID: elementID,
+			EnvironmentID: environmentID, Requires: []byte(o.Requires), Mode: o.Mode,
+			Message: nullIfEmpty(o.Message), UpdatedBy: nullIfEmpty(o.Actor.SubjectID),
+		}); err != nil {
 			return fmt.Errorf("binding %s: %w", o.ElementKey, err)
 		}
 

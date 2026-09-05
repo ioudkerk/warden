@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/store"
+	"github.com/warden-project/warden/internal/store/db"
 )
 
 // Engine answers checks, loading each tenant's model from the database and caching it
@@ -29,17 +30,17 @@ type Engine struct {
 }
 
 // NewEngine builds an engine over a tenant-scoped store.
-func NewEngine(db *store.Store) (*Engine, error) {
-	if db.Access() != store.TenantScoped {
+func NewEngine(st *store.Store) (*Engine, error) {
+	if st.Access() != store.TenantScoped {
 		// A PDP on the system pool would evaluate against every tenant's rows at
 		// once. Refusing here is cheaper than discovering it from a decision.
-		return nil, fmt.Errorf("the decision engine requires the tenant-scoped pool, not the %s pool", db.Access())
+		return nil, fmt.Errorf("the decision engine requires the tenant-scoped pool, not the %s pool", st.Access())
 	}
 	conds, err := NewConditionSet()
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{db: db, conds: conds, cached: map[string]*Model{}}, nil
+	return &Engine{db: st, conds: conds, cached: map[string]*Model{}}, nil
 }
 
 // Check answers one authorization question.
@@ -98,7 +99,9 @@ func (e *Engine) modelFor(ctx context.Context, tenantID string) (*Model, error) 
 func (e *Engine) currentRevision(ctx context.Context, tenantID string) (int64, error) {
 	var rev int64
 	err := e.db.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT permission_rev FROM tenant WHERE id = $1`, tenantID).Scan(&rev)
+		var err error
+		rev, err = db.New(tx).TenantRevision(ctx, tenantID)
+		return err
 	})
 	if err != nil {
 		// InTenant wraps whatever the callback returns, so a direct comparison would
@@ -166,176 +169,114 @@ func LoadModelInto(ctx context.Context, tx pgx.Tx, m *Model) error {
 	if m.TenantID == "" {
 		return fmt.Errorf("loading a model requires a tenant")
 	}
-	for _, load := range []func(context.Context, pgx.Tx, *Model) error{
+	q := db.New(tx)
+	for _, load := range []func(context.Context, *db.Queries, *Model) error{
 		loadPermissionSurface, loadSubjects, loadGroups,
 		loadRoles, loadGrantsAndDenials, loadResources,
 	} {
-		if err := load(ctx, tx, m); err != nil {
+		if err := load(ctx, q, m); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func loadPermissionSurface(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx, `SELECT key FROM permission`)
+func loadPermissionSurface(ctx context.Context, q *db.Queries, m *Model) error {
+	keys, err := q.PermissionSurface(ctx)
 	if err != nil {
 		return fmt.Errorf("loading the permission surface: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return err
-		}
+	for _, key := range keys {
 		m.DeclaredPermissions[key] = true
 	}
-	return rows.Err()
+	return nil
 }
 
-func loadSubjects(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx,
-		`SELECT id, status, attributes FROM app_user WHERE tenant_id = $1 AND deleted_at IS NULL`,
-		m.TenantID)
+func loadSubjects(ctx context.Context, q *db.Queries, m *Model) error {
+	rows, err := q.ModelSubjects(ctx, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading subjects: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var s Subject
-		if err := rows.Scan(&s.ID, &s.Status, &s.Attributes); err != nil {
-			return err
-		}
-		m.Subjects[s.ID] = s
+	for _, r := range rows {
+		m.Subjects[r.ID] = Subject{ID: r.ID, Status: r.Status, Attributes: r.Attributes}
 	}
-	return rows.Err()
+	return nil
 }
 
 // Group membership is resolved with a recursive CTE walking nesting outward: a member
 // of a nested group holds the outer group's roles too (SPEC §9.4).
-func loadGroups(ctx context.Context, tx pgx.Tx, m *Model) error {
-	const q = `
-		WITH RECURSIVE membership AS (
-			SELECT member_user_id AS user_id, group_id
-			  FROM group_member
-			 WHERE member_user_id IS NOT NULL AND tenant_id = $1
-			UNION
-			SELECT ms.user_id, gm.group_id
-			  FROM group_member gm
-			  JOIN membership ms ON gm.member_group_id = ms.group_id
-			 WHERE gm.tenant_id = $1
-		)
-		SELECT user_id, group_id FROM membership`
-
-	rows, err := tx.Query(ctx, q, m.TenantID)
+func loadGroups(ctx context.Context, q *db.Queries, m *Model) error {
+	rows, err := q.ModelGroupMembership(ctx, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading group membership: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var userID, groupID string
-		if err := rows.Scan(&userID, &groupID); err != nil {
-			return err
+	for _, r := range rows {
+		// The CTE's base term selects only rows where member_user_id is not null, so
+		// this never fires; sqlc types the column from the schema, which does not
+		// know that, and a silent nil dereference here would be a poor trade for one
+		// branch.
+		if r.UserID == nil {
+			continue
 		}
-		if m.GroupsOf[userID] == nil {
-			m.GroupsOf[userID] = map[string]bool{}
+		if m.GroupsOf[*r.UserID] == nil {
+			m.GroupsOf[*r.UserID] = map[string]bool{}
 		}
-		m.GroupsOf[userID][groupID] = true
+		m.GroupsOf[*r.UserID][r.GroupID] = true
 	}
-	return rows.Err()
+	return nil
 }
 
-func loadRoles(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx,
-		`SELECT id, key, constraints FROM role WHERE tenant_id = $1 OR tenant_id IS NULL`,
-		m.TenantID)
+func loadRoles(ctx context.Context, q *db.Queries, m *Model) error {
+	roleRows, err := q.ModelRoles(ctx, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading roles: %w", err)
-	}
-	defer rows.Close()
-
-	type raw struct {
-		id, key    string
-		constraint map[string]any
-	}
-	var all []raw
-	for rows.Next() {
-		var r raw
-		if err := rows.Scan(&r.id, &r.key, &r.constraint); err != nil {
-			return err
-		}
-		all = append(all, r)
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 
 	own := map[string][]string{}                 // role id -> permission keys as written
 	conditions := map[string]map[string]string{} // role id -> permission key -> condition
-	permRows, permErr := tx.Query(ctx,
-		`SELECT role_id, permission_key, condition FROM role_permission
-		  WHERE tenant_id = $1 OR tenant_id IS NULL`, m.TenantID)
+	permRows, permErr := q.ModelRolePermissions(ctx, m.TenantID)
 	if permErr != nil {
 		return fmt.Errorf("loading role permissions: %w", permErr)
 	}
-	defer permRows.Close()
-	for permRows.Next() {
-		var roleID, key string
-		var cond *string
-		if scanErr := permRows.Scan(&roleID, &key, &cond); scanErr != nil {
-			return scanErr
-		}
-		own[roleID] = append(own[roleID], key)
-		if cond != nil && *cond != "" {
-			if conditions[roleID] == nil {
-				conditions[roleID] = map[string]string{}
+	for _, r := range permRows {
+		own[r.RoleID] = append(own[r.RoleID], r.PermissionKey)
+		if r.Condition != nil && *r.Condition != "" {
+			if conditions[r.RoleID] == nil {
+				conditions[r.RoleID] = map[string]string{}
 			}
-			conditions[roleID][key] = *cond
+			conditions[r.RoleID][r.PermissionKey] = *r.Condition
 		}
-	}
-	if permRows.Err() != nil {
-		return fmt.Errorf("loading role permissions: %w", permRows.Err())
 	}
 
 	inherits := map[string][]string{}
-	inhRows, inhErr := tx.Query(ctx,
-		`SELECT role_id, parent_role_id FROM role_inheritance
-		  WHERE tenant_id = $1 OR tenant_id IS NULL`, m.TenantID)
+	inhRows, inhErr := q.ModelRoleInheritance(ctx, m.TenantID)
 	if inhErr != nil {
 		return fmt.Errorf("loading role inheritance: %w", inhErr)
 	}
-	defer inhRows.Close()
-	for inhRows.Next() {
-		var child, parent string
-		if scanErr := inhRows.Scan(&child, &parent); scanErr != nil {
-			return scanErr
-		}
-		inherits[child] = append(inherits[child], parent)
-	}
-	if inhRows.Err() != nil {
-		return fmt.Errorf("loading role inheritance: %w", inhRows.Err())
+	for _, r := range inhRows {
+		inherits[r.RoleID] = append(inherits[r.RoleID], r.ParentRoleID)
 	}
 
-	implied, impErr := loadImplications(ctx, tx)
+	implied, impErr := loadImplications(ctx, q)
 	if impErr != nil {
 		return impErr
 	}
 
-	for i := range all {
-		r := &all[i]
+	for i := range roleRows {
+		r := &roleRows[i]
 		// A constraints value that is present but not a boolean is a malformed
 		// role, not a role without the constraint. Resolving it toward "no MFA
 		// needed" would quietly relax a control someone meant to apply.
 		requiresMFA := false
-		if raw, present := r.constraint["requires_mfa"]; present {
+		if raw, present := r.Constraints["requires_mfa"]; present {
 			asBool, isBool := raw.(bool)
 			if !isBool {
-				return fmt.Errorf("role %s: constraints.requires_mfa is %T, want a boolean", r.id, raw)
+				return fmt.Errorf("role %s: constraints.requires_mfa is %T, want a boolean", r.ID, raw)
 			}
 			requiresMFA = asBool
 		}
-		m.Roles[r.id] = &Role{
-			ID: r.id, Key: r.key, RequiresMFA: requiresMFA,
+		m.Roles[r.ID] = &Role{
+			ID: r.ID, Key: r.Key, RequiresMFA: requiresMFA,
 			PermissionConditions: map[string]string{},
 		}
 	}
@@ -355,35 +296,20 @@ func loadRoles(ctx context.Context, tx pgx.Tx, m *Model) error {
 
 // loadImplications maps a concrete permission to every permission it also grants,
 // following `implies` transitively (SPEC §9.2).
-func loadImplications(ctx context.Context, tx pgx.Tx) (map[string][]string, error) {
-	const q = `
-		SELECT app.key, rt.key, a.key, a.implies
-		  FROM action a
-		  JOIN resource_type rt ON rt.id = a.resource_type_id
-		  JOIN application app ON app.id = rt.application_id`
-
-	rows, err := tx.Query(ctx, q)
+func loadImplications(ctx context.Context, q *db.Queries) (map[string][]string, error) {
+	rows, err := q.ModelActionImplications(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading action implications: %w", err)
 	}
-	defer rows.Close()
 
 	// (app, type) -> action -> directly implied actions
 	direct := map[string]map[string][]string{}
-	for rows.Next() {
-		var appKey, typeKey, actionKey string
-		var implies []string
-		if err := rows.Scan(&appKey, &typeKey, &actionKey, &implies); err != nil {
-			return nil, err
-		}
-		owner := appKey + "." + typeKey
+	for _, r := range rows {
+		owner := r.AppKey + "." + r.TypeKey
 		if direct[owner] == nil {
 			direct[owner] = map[string][]string{}
 		}
-		direct[owner][actionKey] = implies
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		direct[owner][r.ActionKey] = r.Implies
 	}
 
 	out := map[string][]string{}
@@ -474,86 +400,74 @@ func expandRole(
 	return out, conds, nil
 }
 
-func loadGrantsAndDenials(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx, `
-		SELECT id, seq, subject_user_id, subject_group_id, role_id,
-		       scope_kind, scope_ref, condition, valid_from, valid_until
-		  FROM grant_ WHERE tenant_id = $1 ORDER BY seq`, m.TenantID)
+func loadGrantsAndDenials(ctx context.Context, q *db.Queries, m *Model) error {
+	grantRows, err := q.ModelGrants(ctx, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading grants: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var g Grant
-		var user, group, condition *string
-		if err := rows.Scan(&g.ID, &g.Seq, &user, &group, &g.RoleID,
-			&g.ScopeKind, &g.ScopeRef, &condition, &g.ValidFrom, &g.ValidUntil); err != nil {
-			return err
+	for i := range grantRows {
+		r := &grantRows[i]
+		g := Grant{
+			ID: r.ID, RoleID: r.RoleID,
+			ScopeKind: r.ScopeKind, ScopeRef: r.ScopeRef,
+			ValidFrom: r.ValidFrom, ValidUntil: r.ValidUntil,
 		}
-		if user != nil {
-			g.UserID = *user
+		// grant_.seq is an identity column and so NOT NULL in the database — the
+		// committed schema dump says as much. sqlc infers nullability from the
+		// column definition alone and does not read GENERATED ALWAYS AS IDENTITY as
+		// implying it, so the generated field is a pointer that is never nil.
+		if r.Seq != nil {
+			g.Seq = *r.Seq
 		}
-		if group != nil {
-			g.GroupID = *group
+		if r.SubjectUserID != nil {
+			g.UserID = *r.SubjectUserID
 		}
-		if condition != nil {
-			g.Condition = *condition
+		if r.SubjectGroupID != nil {
+			g.GroupID = *r.SubjectGroupID
+		}
+		if r.Condition != nil {
+			g.Condition = *r.Condition
 		}
 		m.Grants = append(m.Grants, g)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
 
-	denialRows, denialErr := tx.Query(ctx, `
-		SELECT id, subject_user_id, subject_group_id, permission_key, scope_kind, scope_ref
-		  FROM denial WHERE tenant_id = $1`, m.TenantID)
+	denialRows, denialErr := q.ModelDenials(ctx, m.TenantID)
 	if denialErr != nil {
 		return fmt.Errorf("loading denials: %w", denialErr)
 	}
-	defer denialRows.Close()
-	for denialRows.Next() {
-		var d Denial
-		var user, group *string
-		var permission string
-		if scanErr := denialRows.Scan(&d.ID, &user, &group, &permission, &d.ScopeKind, &d.ScopeRef); scanErr != nil {
-			return scanErr
-		}
-		p, parseErr := ParsePermission(permission)
+	for _, r := range denialRows {
+		p, parseErr := ParsePermission(r.PermissionKey)
 		if parseErr != nil {
-			return fmt.Errorf("denial %s: %w", d.ID, parseErr)
+			return fmt.Errorf("denial %s: %w", r.ID, parseErr)
 		}
-		d.Permission = p
-		if user != nil {
-			d.UserID = *user
+		d := Denial{
+			ID: r.ID, Permission: p,
+			ScopeKind: r.ScopeKind, ScopeRef: r.ScopeRef,
 		}
-		if group != nil {
-			d.GroupID = *group
+		if r.SubjectUserID != nil {
+			d.UserID = *r.SubjectUserID
+		}
+		if r.SubjectGroupID != nil {
+			d.GroupID = *r.SubjectGroupID
 		}
 		m.Denials = append(m.Denials, d)
 	}
-	return denialRows.Err()
+	return nil
 }
 
-func loadResources(ctx context.Context, tx pgx.Tx, m *Model) error {
-	rows, err := tx.Query(ctx,
-		`SELECT ref, parent_ref, attributes FROM resource_node WHERE tenant_id = $1`, m.TenantID)
+func loadResources(ctx context.Context, q *db.Queries, m *Model) error {
+	rows, err := q.ModelResources(ctx, m.TenantID)
 	if err != nil {
 		return fmt.Errorf("loading resources: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var r Resource
-		var parent *string
-		if err := rows.Scan(&r.Ref, &parent, &r.Attributes); err != nil {
-			return err
-		}
-		if parent != nil {
-			r.ParentRef = *parent
+	for _, row := range rows {
+		r := Resource{Ref: row.Ref, Attributes: row.Attributes}
+		if row.ParentRef != nil {
+			r.ParentRef = *row.ParentRef
 		}
 		m.Resources[r.Ref] = r
 	}
-	return rows.Err()
+	return nil
 }
 
 // HoldsRole reports whether a subject holds a role, by key, right now. A UI binding

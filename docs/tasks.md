@@ -103,9 +103,27 @@ tenant-scoped table returns zero of tenant B's rows — table list generated fro
 new tables cannot be forgotten.
 
 ### M0-7 Store layer and query generation
-`sqlc` (or equivalent) wiring, connection pooling, transaction helper, retry classification
-for serialization failures.
-**Exit:** generated code compiles in CI and is verified up to date (regenerate → `git diff --exit-code`).
+**Status: query generation done; retry classification outstanding.**
+`sqlc` wiring, connection pooling, transaction helper, retry classification for
+serialization failures.
+
+Every query in the server is now generated from [`internal/store/queries`](../internal/store/queries)
+into `internal/store/db` — 57 of them, across the model loader, provisioning, the HTTP
+surface, the audit log and the signing keys. One deliberate exception remains and is
+documented where it lives: `store.describeRole` reads the PostgreSQL catalog rather
+than Warden's schema, and sqlc's catalog is built from the migrations, so generating it
+would mean pointing code generation at a live database and breaking M0-1's promise that
+a clean clone needs only Go, Node and Python.
+
+Two type mappings are load-bearing and worth knowing about before editing
+[`sqlc.yaml`](../sqlc.yaml): `jsonb` becomes `dbtypes.JSONMap`, a named map type that
+stays assignable from a plain `map[string]any`; and `audit_event.before/after` are
+`json`, not `jsonb`, so they generate as `[]byte` and the hash chain still verifies over
+the exact bytes written.
+
+**Exit:** met for generation — `make sqlc-check` regenerates and fails on a diff, wired
+into `make lint` and called out as its own CI step. **Still open:** retry classification
+for serialization failures (40001/40P01), which nothing in the store distinguishes yet.
 
 ### M0-8 [B] Conformance corpus format and runner ★
 **Status: done.** 10 cases, 87 checks, validated by a reference evaluator (`conformance/reference`).

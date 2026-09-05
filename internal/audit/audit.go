@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/warden-project/warden/internal/store/db"
 )
 
 // Entry is one administrative mutation.
@@ -84,13 +86,12 @@ func (w *Writer) Append(ctx context.Context, tx pgx.Tx, e Entry) (string, error)
 	// the transaction.
 	//
 	// The constant is arbitrary but fixed; every appender must use the same one.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, auditChainLockKey); err != nil {
+	q := db.New(tx)
+	if err := q.LockAuditChain(ctx, auditChainLockKey); err != nil {
 		return "", fmt.Errorf("locking the audit chain: %w", err)
 	}
 
-	var prevHash []byte
-	err := tx.QueryRow(ctx, `
-		SELECT hash FROM audit_event ORDER BY seq DESC LIMIT 1`).Scan(&prevHash)
+	prevHash, err := q.AuditChainHead(ctx)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", fmt.Errorf("reading the audit chain head: %w", err)
 	}
@@ -115,17 +116,15 @@ func (w *Writer) Append(ctx context.Context, tx pgx.Tx, e Entry) (string, error)
 
 	hash := chainHash(prevHash, canonical(id, occurredAt, e, before, after))
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO audit_event (
-			id, tenant_id, occurred_at, actor_user_id, actor_client_id, impersonator_id,
-			action, target_type, target_id, before, after, reason, ip, user_agent,
-			request_id, prev_hash, hash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-		id, nullIfEmpty(e.TenantID), occurredAt,
-		nullIfEmpty(e.ActorUserID), nullIfEmpty(e.ActorClientID), nullIfEmpty(e.ImpersonatorID),
-		e.Action, nullIfEmpty(e.TargetType), nullIfEmpty(e.TargetID),
-		before, after, nullIfEmpty(e.Reason), nullIfEmpty(e.IP), nullIfEmpty(e.UserAgent),
-		nullIfEmpty(e.RequestID), prevHash, hash)
+	err = q.AppendAuditEvent(ctx, db.AppendAuditEventParams{
+		ID: id, TenantID: nullIfEmpty(e.TenantID), OccurredAt: occurredAt,
+		ActorUserID: nullIfEmpty(e.ActorUserID), ActorClientID: nullIfEmpty(e.ActorClientID),
+		ImpersonatorID: nullIfEmpty(e.ImpersonatorID),
+		Action:         e.Action, TargetType: nullIfEmpty(e.TargetType), TargetID: nullIfEmpty(e.TargetID),
+		Before: before, After: after, Reason: nullIfEmpty(e.Reason),
+		Ip: nullIfEmpty(e.IP), UserAgent: nullIfEmpty(e.UserAgent),
+		RequestID: nullIfEmpty(e.RequestID), PrevHash: prevHash, Hash: hash,
+	})
 	if err != nil {
 		return "", fmt.Errorf("appending to the audit log: %w", err)
 	}

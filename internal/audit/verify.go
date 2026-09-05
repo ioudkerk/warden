@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/warden-project/warden/internal/store/db"
 )
 
 // VerifyResult reports the state of the chain.
@@ -43,36 +45,29 @@ func (r VerifyResult) OK() bool { return len(r.Problems) == 0 }
 // chain spans tenants, and a connection that could see only some entries would
 // compute a different chain and report tampering that had not happened.
 func Verify(ctx context.Context, tx pgx.Tx) (VerifyResult, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT seq, id, tenant_id, occurred_at, actor_user_id, actor_client_id,
-		       impersonator_id, action, target_type, target_id, before, after,
-		       reason, ip, user_agent, request_id, prev_hash, hash
-		  FROM audit_event ORDER BY seq`)
+	rows, err := db.New(tx).AuditEventsInOrder(ctx)
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("reading the audit log: %w", err)
 	}
-	defer rows.Close()
 
 	var (
 		result   VerifyResult
 		expected []byte // the hash the next entry must claim as its predecessor
 	)
 
-	for rows.Next() {
-		var (
-			seq                                 int64
-			id, action                          string
-			tenantID, actorUser, actorClient    *string
-			impersonator, targetType, targetID  *string
-			reason, ip, userAgent, requestID    *string
-			before, after, prevHash, storedHash []byte
-			occurredAt                          time.Time
-		)
-		if err := rows.Scan(&seq, &id, &tenantID, &occurredAt, &actorUser, &actorClient,
-			&impersonator, &action, &targetType, &targetID, &before, &after,
-			&reason, &ip, &userAgent, &requestID, &prevHash, &storedHash); err != nil {
-			return VerifyResult{}, err
+	for i := range rows {
+		r := &rows[i]
+		// seq is an identity column and NOT NULL in the database; sqlc does not
+		// infer that from GENERATED ALWAYS AS IDENTITY, so it arrives as a pointer
+		// that is never nil.
+		var seq int64
+		if r.Seq != nil {
+			seq = *r.Seq
 		}
+		id, action := r.ID, r.Action
+		occurredAt := r.OccurredAt
+		before, after := r.Before, r.After
+		prevHash, storedHash := r.PrevHash, r.Hash
 
 		if result.Entries == 0 {
 			result.First = occurredAt
@@ -93,17 +88,17 @@ func Verify(ctx context.Context, tx pgx.Tx) (VerifyResult, error) {
 		}
 
 		recomputed := chainHash(prevHash, canonical(id, occurredAt, Entry{
-			TenantID:       deref(tenantID),
+			TenantID:       deref(r.TenantID),
 			Action:         action,
-			TargetType:     deref(targetType),
-			TargetID:       deref(targetID),
-			ActorUserID:    deref(actorUser),
-			ActorClientID:  deref(actorClient),
-			ImpersonatorID: deref(impersonator),
-			Reason:         deref(reason),
-			IP:             deref(ip),
-			UserAgent:      deref(userAgent),
-			RequestID:      deref(requestID),
+			TargetType:     deref(r.TargetType),
+			TargetID:       deref(r.TargetID),
+			ActorUserID:    deref(r.ActorUserID),
+			ActorClientID:  deref(r.ActorClientID),
+			ImpersonatorID: deref(r.ImpersonatorID),
+			Reason:         deref(r.Reason),
+			IP:             deref(r.Ip),
+			UserAgent:      deref(r.UserAgent),
+			RequestID:      deref(r.RequestID),
 		}, before, after))
 
 		// And the entry's own hash must match its content. This is what catches an
@@ -116,9 +111,6 @@ func Verify(ctx context.Context, tx pgx.Tx) (VerifyResult, error) {
 		}
 
 		expected = storedHash
-	}
-	if err := rows.Err(); err != nil {
-		return VerifyResult{}, fmt.Errorf("reading the audit log: %w", err)
 	}
 	return result, nil
 }

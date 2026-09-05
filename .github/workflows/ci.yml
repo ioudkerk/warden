@@ -72,6 +72,13 @@ jobs:
       - name: Lint
         run: make lint
 
+      # Called out as its own step because a failure here does not mean the code is
+      # wrong — it means the committed query layer no longer matches the SQL it was
+      # generated from, so the reviewer is reading one thing and the server runs
+      # another. `make sqlc` and commit the result (M0-7).
+      - name: Query layer is up to date
+        run: make sqlc-check
+
       # -race catches data races, which a linter cannot. -shuffle=on catches tests
       # that only pass in declaration order — the kind that hides a shared-state bug
       # until the day someone adds a test above it.

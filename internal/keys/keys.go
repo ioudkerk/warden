@@ -23,6 +23,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/warden-project/warden/internal/store/db"
+
 	"github.com/warden-project/warden/internal/secrets"
 )
 
@@ -136,18 +138,17 @@ func aad(id, kid, algorithm string) []byte {
 // signed are still in circulation and must keep verifying until they expire, which is
 // what the JWKS overlap window in SPEC §17 is for.
 func Insert(ctx context.Context, tx pgx.Tx, k *Key, rotationInterval time.Duration) error {
-	if _, err := tx.Exec(ctx,
-		`UPDATE signing_key SET status = 'previous', retired_at = now() WHERE status = 'active'`); err != nil {
+	q := db.New(tx)
+	if err := q.RetireActiveSigningKey(ctx); err != nil {
 		return fmt.Errorf("retiring the previous signing key: %w", err)
 	}
 
 	expiresAt := k.CreatedAt.Add(rotationInterval)
-	_, err := tx.Exec(ctx, `
-		INSERT INTO signing_key (id, kid, algorithm, public_key, private_key, kek_id,
-		                         status, created_at, activated_at, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$7,$8)`,
-		k.ID, k.KID, k.Algorithm, k.PublicPEM, k.SealedPrivate, k.KEKID, k.CreatedAt, expiresAt)
-	if err != nil {
+	if err := q.InsertSigningKey(ctx, db.InsertSigningKeyParams{
+		ID: k.ID, Kid: k.KID, Algorithm: k.Algorithm,
+		PublicKey: k.PublicPEM, PrivateKey: k.SealedPrivate, KekID: k.KEKID,
+		CreatedAt: k.CreatedAt, ExpiresAt: &expiresAt,
+	}); err != nil {
 		return fmt.Errorf("storing the signing key: %w", err)
 	}
 	return nil
@@ -155,11 +156,7 @@ func Insert(ctx context.Context, tx pgx.Tx, k *Key, rotationInterval time.Durati
 
 // Active returns the key new tokens are signed with, with its private half opened.
 func Active(ctx context.Context, tx pgx.Tx, keyring *secrets.Keyring) (kid string, privateDER []byte, algorithm string, err error) {
-	var id string
-	var sealed []byte
-	err = tx.QueryRow(ctx, `
-		SELECT id, kid, algorithm, private_key FROM signing_key WHERE status = 'active'`).
-		Scan(&id, &kid, &algorithm, &sealed)
+	row, err := db.New(tx).ActiveSigningKey(ctx)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", nil, "", errors.New(
@@ -167,6 +164,7 @@ func Active(ctx context.Context, tx pgx.Tx, keyring *secrets.Keyring) (kid strin
 		}
 		return "", nil, "", err
 	}
+	id, kid, algorithm, sealed := row.ID, row.Kid, row.Algorithm, row.PrivateKey
 
 	privateDER, err = keyring.Decrypt(sealed, aad(id, kid, algorithm))
 	if err != nil {
@@ -190,24 +188,17 @@ type PublicKey struct {
 
 // PublicSet reads the keys JWKS publishes.
 func PublicSet(ctx context.Context, tx pgx.Tx) ([]PublicKey, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT kid, algorithm, public_key, status
-		  FROM signing_key WHERE status IN ('active', 'previous')
-		 ORDER BY status, created_at DESC`)
+	rows, err := db.New(tx).PublicSigningKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []PublicKey
-	for rows.Next() {
-		var k PublicKey
-		if err := rows.Scan(&k.KID, &k.Algorithm, &k.PEM, &k.Status); err != nil {
-			return nil, err
-		}
-		out = append(out, k)
+	out := make([]PublicKey, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, PublicKey{
+			KID: r.Kid, Algorithm: r.Algorithm, PEM: r.PublicKey, Status: r.Status,
+		})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func newID() (string, error) {

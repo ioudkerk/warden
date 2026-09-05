@@ -82,10 +82,42 @@ conformance: ## Run the conformance corpus against every registered evaluator
 bench: ## Run Go benchmarks
 	$(GO) test -run='^$$' -bench=. -benchmem ./...
 
+## -- Code generation -------------------------------------------------------------
+
+# sqlc reads internal/store/queries/*.sql against the migrations and writes the typed
+# accessors in internal/store/db. The generated code is committed so that a clean
+# clone builds without the tool; sqlc-check is what stops it drifting from the SQL.
+SQLC_VERSION := v1.31.1
+
+# The output directory is cleared first. sqlc writes one .go per .sql and never
+# removes anything, so a query file that is deleted or renamed leaves its generated
+# twin behind — still compiling, still exported, backed by no SQL anyone can review.
+# Clearing first also gives sqlc-check its teeth: an orphan shows up as a deletion.
+.PHONY: sqlc
+sqlc: $(BIN)/sqlc ## Regenerate internal/store/db from the SQL in internal/store/queries
+	@rm -f internal/store/db/*.go
+	$(BIN)/sqlc generate
+
+.PHONY: sqlc-check
+sqlc-check: sqlc ## Fail if the committed query layer does not match the SQL
+	@git diff --exit-code internal/store/db || { \
+		echo ""; \
+		echo "The committed query layer does not match internal/store/queries."; \
+		echo "Run 'make sqlc' and commit internal/store/db."; \
+		exit 1; \
+	}
+
+.PHONY: sqlc-vet
+sqlc-vet: $(BIN)/sqlc ## Lint the queries themselves
+	$(BIN)/sqlc vet
+
+$(BIN)/sqlc:
+	GOBIN=$(BIN) $(GO) install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
+
 ## -- Lint and format -------------------------------------------------------------
 
 .PHONY: lint
-lint: lint-go ## Run every linter
+lint: lint-go sqlc-check ## Run every linter
 
 .PHONY: lint-go
 lint-go: $(BIN)/golangci-lint ## Lint the Go code

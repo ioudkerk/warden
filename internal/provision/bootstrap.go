@@ -18,6 +18,7 @@ import (
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/secrets"
+	"github.com/warden-project/warden/internal/store/db"
 )
 
 // SystemTenantID is the reserved tenant holding deployment operators (SPEC §6.3).
@@ -95,23 +96,21 @@ func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorit
 	err = p.db.InSystem(ctx, "bootstrapping the deployment", func(ctx context.Context, tx pgx.Tx) error {
 		// The check and the writes are in one transaction, so two concurrent inits
 		// cannot both decide the deployment is empty.
-		var initialised bool
-		if scanErr := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM tenant WHERE id = $1)`, SystemTenantID).Scan(&initialised); scanErr != nil {
+		q := db.New(tx)
+		initialised, scanErr := q.TenantExists(ctx, SystemTenantID)
+		if scanErr != nil {
 			return scanErr
 		}
 		if initialised {
 			return ErrAlreadyInitialised
 		}
 
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO tenant (id, slug, name) VALUES ($1, $2, 'Deployment')`,
-			SystemTenantID, SystemTenantSlug); execErr != nil {
+		if execErr := q.InsertTenant(ctx, db.InsertTenantParams{
+			ID: SystemTenantID, Slug: SystemTenantSlug, Name: "Deployment",
+		}); execErr != nil {
 			return fmt.Errorf("creating the system tenant: %w", execErr)
 		}
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO app_enrollment (tenant_id, application_id)
-			SELECT $1, id FROM application ON CONFLICT DO NOTHING`, SystemTenantID); execErr != nil {
+		if execErr := q.EnrolTenantInEveryApplication(ctx, SystemTenantID); execErr != nil {
 			return execErr
 		}
 
@@ -120,19 +119,17 @@ func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorit
 		// status stays 'invited' until the setup URL is redeemed. An owner who never
 		// redeems it can therefore do nothing, rather than existing as an active
 		// account with no credential.
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO app_user (id, tenant_id, email, status) VALUES ($1, $2, $3, 'invited')`,
-			ownerID, SystemTenantID, ownerEmail); execErr != nil {
+		if execErr := q.InsertUserWithoutAttributes(ctx, db.InsertUserWithoutAttributesParams{
+			ID: ownerID, TenantID: SystemTenantID, Email: ownerEmail, Status: "invited",
+		}); execErr != nil {
 			return fmt.Errorf("creating the first owner: %w", execErr)
 		}
 
 		grantID := "grn_" + randomSuffix()
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO grant_ (id, tenant_id, subject_user_id, role_id, scope_kind, scope_ref,
-			                    valid_from, reason)
-			VALUES ($1, $2, $3, 'rol_system_owner', $4, $2, '0001-01-01T00:00:00Z',
-			        'the deployment''s first owner, created by warden init')`,
-			grantID, SystemTenantID, ownerID, authz.ScopeTenant); execErr != nil {
+		if execErr := q.InsertBootstrapGrant(ctx, db.InsertBootstrapGrantParams{
+			ID: grantID, TenantID: SystemTenantID,
+			SubjectUserID: &ownerID, ScopeKind: authz.ScopeTenant,
+		}); execErr != nil {
 			return fmt.Errorf("granting system.owner: %w", execErr)
 		}
 
@@ -141,10 +138,10 @@ func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorit
 		}
 
 		setupID := "stk_" + randomSuffix()
-		if _, execErr := tx.Exec(ctx, `
-			INSERT INTO setup_token (id, tenant_id, user_id, token_hash, expires_at)
-			VALUES ($1, $2, $3, $4, $5)`,
-			setupID, SystemTenantID, ownerID, tokenHash, result.ExpiresAt); execErr != nil {
+		if execErr := q.InsertSetupToken(ctx, db.InsertSetupTokenParams{
+			ID: setupID, TenantID: SystemTenantID, UserID: ownerID,
+			TokenHash: tokenHash, ExpiresAt: result.ExpiresAt,
+		}); execErr != nil {
 			return fmt.Errorf("storing the setup token: %w", execErr)
 		}
 
@@ -179,8 +176,9 @@ func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorit
 func (p *Provisioner) IsInitialised(ctx context.Context) (bool, error) {
 	var yes bool
 	err := p.db.InSystem(ctx, "checking whether the deployment is initialised", func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM tenant WHERE id = $1)`, SystemTenantID).Scan(&yes)
+		var err error
+		yes, err = db.New(tx).TenantExists(ctx, SystemTenantID)
+		return err
 	})
 	return yes, err
 }
