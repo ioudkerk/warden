@@ -58,6 +58,13 @@ type Store struct {
 	isOwnerOfN int
 
 	isolationWarning string
+
+	// retry and onRetry govern what happens when PostgreSQL aborts a transaction as
+	// transient. Both are set at startup and read on every transaction thereafter;
+	// see SetRetryPolicy and SetRetryObserver for why they are not safe to change
+	// once traffic is flowing.
+	retry   RetryPolicy
+	onRetry func(RetryInfo)
 }
 
 // Open connects, verifies the connection's privileges against the access level it
@@ -104,7 +111,7 @@ func Open(ctx context.Context, cfg *config.Config, access Access) (*Store, error
 		return nil, fmt.Errorf("connecting to the database: %w", err)
 	}
 
-	s := &Store{pool: pool, access: access}
+	s := &Store{pool: pool, access: access, retry: DefaultRetryPolicy()}
 	if err := s.describeRole(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -222,7 +229,7 @@ func (s *Store) IsolationWarning() string { return s.isolationWarning }
 // Every query fn issues against a tenant-scoped table is filtered by the row-level
 // security policies of migration 000005. A query that forgets its WHERE clause
 // returns that tenant's rows, not everyone's.
-func (s *Store) InTenant(ctx context.Context, tenantID string, fn func(context.Context, pgx.Tx) error) error {
+func (s *Store) InTenant(ctx context.Context, tenantID string, fn func(context.Context, pgx.Tx) error, opts ...TxOption) error {
 	if tenantID == "" {
 		// An empty tenant id would set the variable to '', which matches no row, so
 		// the query would return nothing rather than everything. That is safe but
@@ -235,7 +242,7 @@ func (s *Store) InTenant(ctx context.Context, tenantID string, fn func(context.C
 				"use the tenant-scoped pool so the database enforces the boundary")
 	}
 
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return s.inTx(ctx, opts, func(ctx context.Context, tx pgx.Tx) error {
 		if err := db.New(tx).SetTenantScope(ctx, tenantID); err != nil {
 			return fmt.Errorf("setting the tenant scope: %w", err)
 		}
@@ -248,14 +255,12 @@ func (s *Store) InTenant(ctx context.Context, tenantID string, fn func(context.C
 //
 // The reason parameter is required and is not decoration: SPEC §6.2 says cross-tenant
 // work "is itself audited". Once the audit log exists (M2-12) this is what it records.
-func (s *Store) InSystem(ctx context.Context, reason string, fn func(context.Context, pgx.Tx) error) error {
+func (s *Store) InSystem(ctx context.Context, reason string, fn func(context.Context, pgx.Tx) error, opts ...TxOption) error {
 	if s.access != SystemAccess {
 		return errors.New("InSystem was called on a tenant-scoped pool")
 	}
 	if reason == "" {
 		return errors.New("InSystem requires a reason; cross-tenant work is audited (SPEC §6.2)")
 	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		return fn(ctx, tx)
-	})
+	return s.inTx(ctx, opts, fn)
 }

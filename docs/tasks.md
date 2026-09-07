@@ -103,7 +103,7 @@ tenant-scoped table returns zero of tenant B's rows — table list generated fro
 new tables cannot be forgotten.
 
 ### M0-7 Store layer and query generation
-**Status: query generation done; retry classification outstanding.**
+**Status: done.**
 `sqlc` wiring, connection pooling, transaction helper, retry classification for
 serialization failures.
 
@@ -121,9 +121,29 @@ stays assignable from a plain `map[string]any`; and `audit_event.before/after` a
 `json`, not `jsonb`, so they generate as `[]byte` and the hash chain still verifies over
 the exact bytes written.
 
-**Exit:** met for generation — `make sqlc-check` regenerates and fails on a diff, wired
-into `make lint` and called out as its own CI step. **Still open:** retry classification
-for serialization failures (40001/40P01), which nothing in the store distinguishes yet.
+[`retry.go`](../internal/store/retry.go) classifies the two SQLSTATEs PostgreSQL defines
+as transient — `40001` serialization failure and `40P01` deadlock — and reissues those
+transactions with jittered backoff, three attempts by default. Nothing else is retried:
+a unique violation reissued three times is three identical failures and a bug that took
+three times as long to find.
+
+Two things worth knowing before using it. `InTenant`/`InSystem` take variadic
+`TxOption`s, so `store.Isolation(pgx.Serializable)` is available for the code that will
+need it — **M1-5**'s refresh-token reuse detection is the case the option exists for, and
+it is safe to ask for precisely because the retry loop is now underneath it. And a retry
+re-runs the whole callback, so anything a callback does *outside* the database must not
+be there; the convention is that such values are produced before the transaction opens,
+which is why a retried `CreateServiceAccount` does not mint a second token.
+
+Retries are counted in `warden_store_transaction_retries_total{code}` and, when the
+budget runs out, `warden_store_transaction_retries_exhausted_total{code}`. Without those
+a retry is invisible — the transaction succeeds and the caller never knows — so rising
+lock contention would show up only as latency nobody can explain.
+
+**Exit:** met. `make sqlc-check` regenerates and fails on a diff, wired into `make lint`
+and called out as its own CI step. `TestDeadlockIsRetried` provokes a real lock cycle
+between two transactions and asserts both commit; it fails loudly if the ordering stops
+deadlocking, so it cannot quietly decay into a test that proves nothing.
 
 ### M0-8 [B] Conformance corpus format and runner ★
 **Status: done.** 10 cases, 87 checks, validated by a reference evaluator (`conformance/reference`).

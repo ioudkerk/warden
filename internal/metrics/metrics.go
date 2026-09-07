@@ -57,6 +57,18 @@ type Metrics struct {
 	// Any non-zero value is worth a human looking at the audit log.
 	AssignmentsRefused *prometheus.CounterVec
 
+	// StoreRetries counts transactions PostgreSQL aborted as transient and the store
+	// reissued, by SQLSTATE. A low rate is normal and is the mechanism working. A
+	// rising one is a contention signal — two code paths taking the same rows in
+	// opposite orders — which is a thing to fix rather than to absorb, and it is
+	// invisible without this series because the retry hides it from the caller.
+	StoreRetries *prometheus.CounterVec
+
+	// StoreRetriesExhausted counts transactions that used the whole retry budget and
+	// failed anyway. Unlike StoreRetries these are user-visible errors, so this is
+	// the series to alert on.
+	StoreRetriesExhausted *prometheus.CounterVec
+
 	// BuildInfo carries the version as a label on a constant 1, the conventional way
 	// to make "which build is this?" answerable from a dashboard.
 	BuildInfo *prometheus.GaugeVec
@@ -116,6 +128,16 @@ func New(version string) *Metrics {
 			Help: "Role assignments refused by the privilege-escalation guard, by reason.",
 		}, []string{"reason"}),
 
+		StoreRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "warden_store_transaction_retries_total",
+			Help: "Transactions reissued after PostgreSQL aborted them as transient, by SQLSTATE.",
+		}, []string{"code"}),
+
+		StoreRetriesExhausted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "warden_store_transaction_retries_exhausted_total",
+			Help: "Transactions that used the whole retry budget and still failed, by SQLSTATE.",
+		}, []string{"code"}),
+
 		BuildInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "warden_build_info",
 			Help: "Build information; always 1, with the version as a label.",
@@ -124,13 +146,24 @@ func New(version string) *Metrics {
 
 	r.MustRegister(
 		m.CheckDuration, m.ChecksTotal, m.ModelLoads, m.DecisionLogRecords,
-		m.HTTPRequests, m.HTTPDuration, m.AuthFailures, m.AssignmentsRefused, m.BuildInfo,
+		m.HTTPRequests, m.HTTPDuration, m.AuthFailures, m.AssignmentsRefused,
+		m.StoreRetries, m.StoreRetriesExhausted, m.BuildInfo,
 		// Process and runtime metrics: memory, goroutines, file descriptors. Enough
 		// to answer "is it the database or is it us?" without a second exporter.
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		collectors.NewGoCollector(),
 	)
 	m.BuildInfo.WithLabelValues(version).Set(1)
+
+	// A CounterVec with no observed labels exposes no series at all, so an alert on
+	// "retries are being exhausted" would evaluate against nothing until the first
+	// one happened — which is the moment it is least useful to discover the alert
+	// never worked. Both retryable SQLSTATEs are known in advance, so both series
+	// start at zero.
+	for _, code := range []string{"40001", "40P01"} {
+		m.StoreRetries.WithLabelValues(code)
+		m.StoreRetriesExhausted.WithLabelValues(code)
+	}
 
 	return m
 }

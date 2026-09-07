@@ -165,6 +165,12 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Built before the pools, because a store's retry observer must be installed
+	// before anything can run a transaction through it — the decision log below
+	// starts a writer goroutine, and assigning the observer afterwards would be a
+	// data race against it.
+	metricSet := metrics.New(buildVersion())
+
 	// Opening the pool verifies that the request-serving role cannot bypass
 	// row-level security, and refuses to continue in production if it can. That
 	// check has to happen before anything serves traffic: a deployment with the
@@ -174,6 +180,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer db.Close()
+	observeRetries(db, metricSet, log, "tenant-scoped")
 
 	log.Info("database connected", "role", db.Role(), "access", db.Access().String())
 	if warning := db.IsolationWarning(); warning != "" {
@@ -189,6 +196,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		defer system.Close()
+		observeRetries(system, metricSet, log, "system")
 		log.Info("system database connected", "role", system.Role())
 	}
 
@@ -221,8 +229,6 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	} else {
 		log.Warn("no decision log: database.system_url is not configured, so decisions are not recorded")
 	}
-
-	metricSet := metrics.New(buildVersion())
 
 	tracing, err := metrics.StartTracing(ctx, cfg.Telemetry.TracingOTLP, buildVersion(),
 		cfg.Telemetry.TraceSampler, log)
@@ -266,6 +272,30 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	return <-errs
+}
+
+// observeRetries points a store's transaction retries at Prometheus and the log.
+//
+// A retry is invisible to the caller by design — the transaction succeeds and nothing
+// upstream knows it ran twice — so without this the only symptom of rising lock
+// contention is latency nobody can explain. Retries are logged at debug because a
+// handful are normal; an exhausted budget is a warning, because that one reached the
+// user as an error.
+//
+// Must be called before the store serves anything: it assigns a field that every
+// subsequent transaction reads.
+func observeRetries(s *store.Store, m *metrics.Metrics, log *slog.Logger, pool string) {
+	s.SetRetryObserver(func(info store.RetryInfo) {
+		if info.Exhausted {
+			m.StoreRetriesExhausted.WithLabelValues(info.Code).Inc()
+			log.Warn("a transaction exhausted its retry budget",
+				"pool", pool, "sqlstate", info.Code, "attempts", info.Attempt, "error", info.Err)
+			return
+		}
+		m.StoreRetries.WithLabelValues(info.Code).Inc()
+		log.Debug("retrying a transaction PostgreSQL aborted as transient",
+			"pool", pool, "sqlstate", info.Code, "attempt", info.Attempt, "delay", info.Delay)
+	})
 }
 
 func newLogger(cfg *config.Config, out io.Writer) *slog.Logger {

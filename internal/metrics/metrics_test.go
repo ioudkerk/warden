@@ -33,6 +33,8 @@ func TestTheSpecifiedMetricsArePublished(t *testing.T) {
 	m.AuthFailures.Inc()
 	m.AssignmentsRefused.WithLabelValues("missing_permissions").Inc()
 	m.DecisionLogRecords.WithLabelValues("dropped").Add(3)
+	m.StoreRetries.WithLabelValues("40P01").Add(2)
+	m.StoreRetriesExhausted.WithLabelValues("40001").Inc()
 
 	body := gather(t, m)
 	for _, want := range []string{
@@ -42,6 +44,8 @@ func TestTheSpecifiedMetricsArePublished(t *testing.T) {
 		`warden_auth_failures_total 1`,
 		`warden_assignments_refused_total{reason="missing_permissions"} 1`,
 		`warden_decision_log_records_total{disposition="dropped"} 3`,
+		`warden_store_transaction_retries_total{code="40P01"} 2`,
+		`warden_store_transaction_retries_exhausted_total{code="40001"} 1`,
 		`warden_build_info{version="v-test"} 1`,
 	} {
 		if !strings.Contains(body, want) {
