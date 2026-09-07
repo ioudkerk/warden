@@ -170,9 +170,38 @@ request id, OpenTelemetry tracer setup.
 **Exit:** `/readyz` returns 503 with a named failing dependency when Postgres is stopped.
 
 ### M0-11 [P] Local development environment
+**Status: done.**
 `docker-compose.yml` with Postgres, Redis, Mailpit and Warden; a seed command producing a
 demo tenant and the `billing` app from `examples/warden.yaml`.
-**Exit:** clean clone → `docker compose up` → a seeded, reachable server in under two minutes.
+
+`make dev` (or plain `docker compose up`) brings up the dependencies, migrates with the
+same pinned golang-migrate the Makefile and CI use, runs `warden seed`, and serves. The
+image is multi-stage, built at the ADR-0001 Go floor — so the floor is a claim something
+exercises rather than only a line in `go.mod` — and ships distroless and non-root.
+
+`warden seed` publishes the manifest and creates SPEC §9.9's worked example: tenant
+`acme`, Maria with an approval limit and Bob without one, the three invoices, and grants
+that differ by scope and by condition. It is the same fixture as
+`conformance/cases/001-worked-example.yaml` and `examples/demo-app`, on purpose — the
+specification, the corpus and the running server should tell one story. UI bindings are
+derived from each element's `suggests` rather than listed in the seed, so an element
+added to the manifest is seeded without anyone remembering to.
+
+Two properties it holds rather than merely documents:
+
+- **No credential is created anywhere.** The KEK is generated once into a named volume
+  (never regenerated — a new one cannot open the signing key the last one sealed), and
+  the first owner's password does not exist until someone opens the one-time setup URL
+  that seeding prints into the log. Same guarantee as M0-9, not a development-only path
+  around it.
+- **Seeding is refused in production**, and both ways of getting the environment wrong
+  fail closed. `cmd/warden/seed_test.go` covers this; it also asserts the refusal happens
+  before the store is opened, so the check cannot drift below the connection.
+
+**Exit:** met. From no image, no build cache and no volumes, `make dev` reaches a seeded
+server answering `/readyz` in about 20 seconds on a warm machine — the two-minute budget
+assumed a slower path. Re-running is safe: the manifest is reapplied, the tenant left
+alone, the KEK untouched.
 
 ### M0-12 [P] Missing design artifacts named by the spec but not yet written
 **Status: done.**

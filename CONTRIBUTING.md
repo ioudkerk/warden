@@ -45,21 +45,34 @@ pins Go and Node. macOS ships Python 3.9, which is too old; the Makefile looks f
 ```bash
 git clone <repo> && cd warden
 make build test lint      # should be green on a clean clone
-make dev-up               # Postgres, Redis and Mailpit in Docker
+make dev                  # the whole stack, seeded and serving on :8080
+make dev-logs-seed        # the owner's one-time setup URL and the demo app's token
 ```
 
-`make help` lists every target. Development tools (golangci-lint, migrate,
+`make dev` brings up Postgres, Redis and Mailpit, migrates, publishes
+`examples/warden.yaml` and seeds SPEC §9.9's worked example — the same invoices as
+`conformance/cases/001-worked-example.yaml` and the demo application, so the
+specification, the corpus and the running server tell one story. Then:
+
+```bash
+curl -s localhost:8080/readyz
+```
+
+`make help` lists every target. Development tools (golangci-lint, migrate, sqlc,
 govulncheck) install themselves into `./bin` at versions pinned in the Makefile, so a
 tool upgrade is a reviewable commit rather than a surprise on your machine.
 
-### Running the server locally
+### Running the server from source
+
+Rebuilding an image on every edit is a poor loop, so run the dependencies in containers
+and Warden from source. [`deploy/README.md`](deploy/README.md) has the environment it
+needs; `warden config` validates it and reports every problem in one pass.
 
 ```bash
+make dev-setup                           # dependencies, migrations, database roles
 export WARDEN_KEK="$(make -s kek)"       # 32 random bytes, base64
-warden config -config deploy/warden-server.example.yaml   # validate before running
+warden config -config deploy/warden-server.example.yaml
 ```
-
-See [`deploy/README.md`](deploy/README.md).
 
 ## Where things live
 

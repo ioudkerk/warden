@@ -61,6 +61,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	case "init":
 		return runInit(rest, stdout, stderr)
+	case "seed":
+		return runSeed(rest, stdout, stderr)
 	case "apply":
 		return runApply(rest, stdout, stderr)
 	case "tenant":
@@ -340,6 +342,9 @@ Usage:
 Administration (until the console arrives in M6). Each needs database.system_url:
   warden init -owner <email>                   bootstrap a fresh deployment; prints a one-time URL
   warden apply -f <manifest.yaml>              publish an application's permission surface
+  warden seed [-f examples/warden.yaml]        development fixture: the billing app, a demo
+                                               tenant and SPEC §9.9's users and invoices.
+                                               Idempotent; refused in production
   warden tenant -slug <slug>                   create a tenant
   warden user -tenant <slug> -email <email>    create a user, printing its subject id
   warden grant -tenant <slug> -user <id> -role <key> [-scope <scope>] [-as <assigner>] [-until <ts>]

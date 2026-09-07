@@ -1,9 +1,32 @@
-# Local development dependencies. Started with `make dev-up`.
+# A whole Warden, on a laptop. `docker compose up` from the repository root, or
+# `make dev`, brings up the dependencies, migrates, seeds SPEC §9.9's worked example
+# and serves it.
 #
-# This is not a production topology — see SPEC §20.1 for those. Postgres and Redis
-# here are unauthenticated on a private network and hold no data worth protecting.
+# This is not a production topology — see SPEC §20.1 for those. Postgres and Redis here
+# are unauthenticated on a private network and hold no data worth protecting.
+#
+# Two things it deliberately does not do, because they are the habits that leak into
+# real deployments:
+#
+#   * No credential is baked in. The key-encryption key is generated once, on your
+#     machine, into a named volume — Warden never invents one at startup, because a key
+#     that differs on the next boot silently orphans everything encrypted under the
+#     last one. And the first owner's password does not exist: `warden seed` prints a
+#     single-use setup URL, which you will find in `docker compose logs seed`.
+#
+#   * Nothing here runs as production. Every Warden service sets WARDEN_ENVIRONMENT=dev
+#     explicitly, and `warden seed` refuses to run in production at all.
 
 name: warden-dev
+
+x-warden-env: &warden-env
+  WARDEN_ENVIRONMENT: dev
+  WARDEN_ISSUER: http://localhost:8080
+  WARDEN_LOG_FORMAT: text
+  WARDEN_DATABASE_URL: postgres://warden_app:app-pw@postgres:5432/warden?sslmode=disable
+  WARDEN_DATABASE_SYSTEM_URL: postgres://warden_system:system-pw@postgres:5432/warden?sslmode=disable
+  WARDEN_CACHE_URL: redis://redis:6379/0
+  WARDEN_SECURITY_KEK: file:/var/lib/warden/kek
 
 services:
   postgres:
@@ -16,6 +39,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates warden_app and warden_system on first boot, so the compose stack has
+      # the same two-role separation a real deployment does — and so the startup check
+      # that refuses a request-serving role with BYPASSRLS is actually exercised here
+      # rather than only in CI.
+      - ./dev-roles.sql:/docker-entrypoint-initdb.d/10-warden-roles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U warden -d warden"]
       interval: 2s
@@ -44,5 +72,97 @@ services:
     environment:
       MP_MAX_MESSAGES: 500
 
+  # The same golang-migrate the Makefile and CI use, at the same pinned version. A
+  # container that migrated differently from `make migrate-up` would make "it works on
+  # my machine" a question about which migrator ran.
+  migrate:
+    image: migrate/migrate:v4.19.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../internal/store/migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://warden:warden@postgres:5432/warden?sslmode=disable"
+      - "up"
+
+  # Generates the key-encryption key, once, if it is not already there.
+  #
+  # It is a separate service because it is the one step that must never repeat: the
+  # signing key created by `warden seed` is sealed under this KEK, so regenerating it
+  # on a restart would leave a deployment that cannot open its own key. `set -C` makes
+  # the create-if-absent atomic rather than a check followed by a race.
+  kek:
+    image: alpine:3.20
+    volumes:
+      - warden-state:/var/lib/warden
+    command:
+      - "sh"
+      - "-euc"
+      - |
+        if [ -s /var/lib/warden/kek ]; then
+          echo "key-encryption key already present; leaving it alone"
+          exit 0
+        fi
+        ( set -C; head -c 32 /dev/urandom | base64 -w0 > /var/lib/warden/kek )
+        chmod 0400 /var/lib/warden/kek
+        chown 65532:65532 /var/lib/warden/kek
+        echo "generated a development key-encryption key in the warden-state volume"
+
+  # Publishes the billing manifest and creates the demo tenant, then exits. Idempotent:
+  # bringing the stack up again reapplies the manifest and leaves the tenant alone.
+  #
+  # The setup URL for the first owner is printed here and nowhere else:
+  #   docker compose logs seed
+  seed:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: warden:dev
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kek:
+        condition: service_completed_successfully
+    environment: *warden-env
+    volumes:
+      - warden-state:/var/lib/warden:ro
+      # Development data, mounted rather than baked into the image, so the published
+      # image carries no demo tenant waiting to be created.
+      - ../examples/warden.yaml:/etc/warden/warden.yaml:ro
+    command: ["seed", "-f", "/etc/warden/warden.yaml"]
+
+  warden:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: warden:dev
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *warden-env
+      WARDEN_HTTP_ADDR: 0.0.0.0:8080
+      WARDEN_METRICS_ADDR: 0.0.0.0:9090
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - warden-state:/var/lib/warden:ro
+    # No healthcheck. The readiness endpoint is /readyz — it names the failing
+    # dependency rather than just saying no — but the image is distroless and carries
+    # no shell or HTTP client to call it with, and running `warden version` here would
+    # report a process that is alive rather than a server that is ready. Check it from
+    # the host instead: curl -s localhost:8080/readyz. A real in-container check wants
+    # a `warden healthcheck` subcommand, which is worth adding when something actually
+    # depends on this service being healthy.
+
 volumes:
   postgres-data:
+  # Holds the key-encryption key. Deleting this volume without also deleting
+  # postgres-data leaves a database full of values nothing can decrypt — `make
+  # dev-reset` removes both together for that reason.
+  warden-state:

@@ -18,6 +18,8 @@ LDFLAGS         := -X main.version=$(VERSION)
 GOLANGCI_VERSION    := v2.13.2
 MIGRATE_VERSION     := v4.19.0
 
+COMPOSE := docker compose -f deploy/docker-compose.yml
+
 # Python 3.10+ is required by the SDK (SPEC §12.2). macOS ships 3.9, so look for a
 # usable interpreter rather than assuming `python3` is new enough.
 PYTHON ?= $(shell for p in python3.13 python3.12 python3.11 python3.10 python3; do \
@@ -60,8 +62,8 @@ test-go: ## Run the Go tests with the race detector
 # provides one, so the isolation guarantees are never merely optional.
 .PHONY: test-integration
 test-integration: ## Run the tests that need PostgreSQL (starts it if needed)
-	@docker compose -f deploy/docker-compose.yml up -d postgres >/dev/null
-	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U warden -d warden >/dev/null 2>&1; do :; done
+	@$(COMPOSE) up -d postgres >/dev/null
+	@until $(COMPOSE) exec -T postgres pg_isready -U warden -d warden >/dev/null 2>&1; do :; done
 	WARDEN_TEST_DATABASE_URL="$(DATABASE_URL)" WARDEN_TEST_REDIS_URL="$(REDIS_URL)" \
 		$(GO) test -race -count=1 -p 1 ./internal/...
 
@@ -194,13 +196,42 @@ schema-check: schema-dump ## Fail if the committed schema does not match the mig
 
 ## -- Local environment -----------------------------------------------------------
 
+# Two ways to work, and the difference is which Warden you are running.
+#
+#   make dev       everything in containers, seeded and serving. What a newcomer wants,
+#                  and what the M0-11 exit condition measures.
+#   make dev-setup dependencies only, so `go run ./cmd/warden serve` on the host talks
+#                  to them. What you want while changing the server, because the edit
+#                  loop is a compile rather than an image build.
+.PHONY: dev
+dev: ## Bring up the whole stack in containers: dependencies, migrations, seed and server
+	$(COMPOSE) up -d --wait
+	@echo ""
+	@echo "  API      http://localhost:8080     (try: curl -s localhost:8080/readyz)"
+	@echo "  metrics  http://localhost:9090/metrics"
+	@echo "  mail     http://localhost:8025"
+	@echo ""
+	@echo "  The first owner's one-time setup URL and the demo application's token are"
+	@echo "  printed once, by the seed step:  make dev-logs-seed"
+
+.PHONY: dev-logs
+dev-logs: ## Follow the server's logs
+	$(COMPOSE) logs -f warden
+
+.PHONY: dev-logs-seed
+dev-logs-seed: ## Show what the seed printed: the setup URL and the demo token
+	@$(COMPOSE) logs seed --no-log-prefix
+
+# --wait blocks until the healthchecks pass. Without it `dev-setup` runs migrate-up
+# against a PostgreSQL that is listening but not yet accepting connections, and the
+# failure reads as "relation tenant does not exist" from whatever runs next.
 .PHONY: dev-up
-dev-up: ## Start Postgres, Redis and Mailpit for local development
-	docker compose -f deploy/docker-compose.yml up -d
+dev-up: ## Start only the dependencies (Postgres, Redis, Mailpit), for a server run from source
+	$(COMPOSE) up -d --wait postgres redis mailpit
 
 .PHONY: dev-roles
 dev-roles: ## Create the local warden_app and warden_system roles (idempotent)
-	@docker compose -f deploy/docker-compose.yml exec -T postgres \
+	@$(COMPOSE) exec -T postgres \
 		psql -U warden -d warden -q -v ON_ERROR_STOP=1 < deploy/dev-roles.sql
 	@echo "warden_app and warden_system are ready"
 
@@ -213,17 +244,20 @@ dev-setup: dev-up migrate-up dev-roles ## Start the dependencies, migrate, and c
 # on objects that already exist. This puts the database back to a known state.
 .PHONY: dev-reset-db
 dev-reset-db: dev-up ## Drop and rebuild the development schema, then re-grant the roles
-	@docker compose -f deploy/docker-compose.yml exec -T postgres \
+	@$(COMPOSE) exec -T postgres \
 		psql -U warden -d warden -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 	@$(MAKE) --no-print-directory migrate-up dev-roles
 
 .PHONY: dev-down
-dev-down: ## Stop the local development dependencies
-	docker compose -f deploy/docker-compose.yml down
+dev-down: ## Stop the whole local stack, keeping its data
+	$(COMPOSE) down
 
+# -v takes the key-encryption key with the database, and that pairing is the point.
+# Dropping one without the other leaves either a key that opens nothing or a database
+# of values nothing can open.
 .PHONY: dev-reset
-dev-reset: ## Stop the local dependencies and delete their data
-	docker compose -f deploy/docker-compose.yml down -v
+dev-reset: ## Stop the local stack and delete its data, including the development KEK
+	$(COMPOSE) down -v
 
 ## -- Security --------------------------------------------------------------------
 

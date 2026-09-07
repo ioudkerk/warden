@@ -183,6 +183,20 @@ func (p *Provisioner) IsInitialised(ctx context.Context) (bool, error) {
 	return yes, err
 }
 
+// TenantExists reports whether a tenant with this slug is already present. It is what
+// lets a seeding run tell "nothing here yet" from "somebody's work is already in this
+// database", rather than discovering the difference from a primary-key violation
+// halfway through.
+func (p *Provisioner) TenantExists(ctx context.Context, slug string) (bool, error) {
+	var yes bool
+	err := p.db.InSystem(ctx, "checking whether a tenant exists", func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		yes, err = db.New(tx).TenantExists(ctx, id("ten", slug))
+		return err
+	})
+	return yes, err
+}
+
 // newSetupToken returns the token to print and the hash to store. 256 bits from
 // crypto/rand: this is the only thing standing between a fresh deployment and its
 // first administrator.

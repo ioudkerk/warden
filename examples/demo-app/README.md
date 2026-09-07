@@ -30,42 +30,33 @@ result, so a caller who forgets to check fails rather than continues.
 
 ## Running it
 
-Warden must be initialised and serving. From the repository root:
+From the repository root, bring up a seeded Warden and take the demo application's
+token out of the seed log:
 
 ```bash
-make dev-setup                                   # Postgres, Redis, migrations, roles
-export WARDEN_KEK="$(make -s kek)" WARDEN_CONFIG=deploy/warden-server.example.yaml
-warden init  -owner you@example.com
-warden apply -f examples/warden.yaml             # publishes permissions AND ui elements
-warden tenant -slug acme
-
-MARIA=$(warden user -tenant acme -email maria@acme.test -attributes '{"approval_limit":50000}')
-BOB=$(warden user   -tenant acme -email bob@acme.test)
-
-warden resource -tenant acme -ref billing.project:acme-2026
-warden resource -tenant acme -ref billing.invoice:4711 -parent billing.project:acme-2026 \
-  -attributes '{"amount":30000,"status":"pending"}'
-
-warden grant -tenant acme -user "$BOB"   -role billing.viewer
-warden grant -tenant acme -user "$MARIA" -role billing.viewer
-warden grant -tenant acme -user "$MARIA" -role billing.approver \
-  -scope 'billing.project:acme-2026/**' \
-  -condition 'resource.attributes.amount <= subject.attributes.approval_limit'
-
-TOKEN=$(warden token -tenant acme -name demo-app -may-explain)
-warden serve
+make dev
+make dev-logs-seed          # prints the setup URL and the service-account token
 ```
 
-Then:
+The seed creates exactly the fixture this application expects — the `billing`
+manifest, tenant `acme`, Maria with an approval limit of 50 000, Bob without one, and
+SPEC §9.9's invoices. Then:
 
 ```bash
 cd examples/demo-app
 python3 -m venv .venv && .venv/bin/pip install fastapi 'uvicorn[standard]' jinja2 python-multipart
-WARDEN_TOKEN="$TOKEN" MARIA_ID="$MARIA" BOB_ID="$BOB" \
-  .venv/bin/uvicorn main:app --port 8000
+
+export WARDEN_URL=http://localhost:8080
+export WARDEN_TOKEN=wsk_...          # from `make dev-logs-seed`
+export MARIA_ID=usr_maria_acme BOB_ID=usr_bob_acme
+.venv/bin/uvicorn main:app --port 8000
 ```
 
 Open <http://localhost:8000>, sign in as either user.
+
+The subject ids are stable because `warden seed` derives them from the email and the
+tenant slug, which is convenient here and is also why seeding is refused in production:
+predictable identifiers with standing grants are what `warden init` exists to prevent.
 
 ## What each user sees, and why
 

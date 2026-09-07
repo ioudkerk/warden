@@ -37,6 +37,33 @@ Work is broken down in [`docs/tasks.md`](./docs/tasks.md).
 | [docs/design-email.md](./docs/design-email.md) | Email delivery: providers, templates, bounces, enumeration |
 | [docs/adr/](./docs/adr/) | Architecture decision records |
 
+## Try it
+
+```bash
+git clone <repo> && cd warden
+make dev                  # the whole stack, seeded and serving on :8080
+make dev-logs-seed        # the one-time owner setup URL and a demo API token
+```
+
+About twenty seconds to a running server carrying [SPEC §9.9](./SPEC.md)'s worked
+example: two users, three invoices, and grants that differ by scope and by a condition
+on the invoice amount. Ask it something:
+
+```bash
+curl -s localhost:8080/v1/authz/check -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+    "subject":  {"id": "usr_maria_acme"},
+    "permission": "billing.invoice:approve",
+    "resource": {"type": "billing.invoice", "id": "4712"},
+    "context":  {"amr": ["pwd", "otp"]},
+    "environment": "dev"}'
+# {"allowed":false,"reason":"condition_failed", ...}   — 90 000 is over her limit
+```
+
+No credential is created anywhere in that: the first owner's password does not exist
+until someone opens the one-time setup URL, and `warden seed` refuses to run in
+production. See [deploy/README.md](./deploy/README.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md). `make build test lint` should be green on a
