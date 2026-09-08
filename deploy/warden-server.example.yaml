@@ -84,6 +84,11 @@ security:
   # Bounded to 5m–15m by SPEC §8.2: a short lifetime is the backstop for revocation.
   access_token_ttl: 10m
   key_rotation_interval: 2160h # 90 days
+  # How long a rotated-out key stays in JWKS. It must outlast every token that key
+  # signed — so at least access_token_ttl — and, in practice, the caching relying
+  # parties do of their own accord, which is why a day rather than a quarter hour.
+  # Must be shorter than key_rotation_interval, or keys are never actually retired.
+  key_overlap_window: 24h
 
 log:
   level: info   # debug | info | warn | error

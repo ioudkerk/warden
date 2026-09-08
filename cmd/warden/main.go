@@ -18,6 +18,7 @@ import (
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
+	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
@@ -79,6 +80,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runUI(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
+	case "keys":
+		return runKeys(rest, stdout, stderr)
 
 	default:
 		usage(stderr)
@@ -202,6 +205,23 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		log.Info("system database connected", "role", system.Role())
 	}
 
+	// Signing keys are deployment-level, so key management needs the system pool.
+	// Without one, this process can neither publish JWKS nor sign a token; it says so
+	// once at startup rather than failing per request.
+	var keyManager *keys.Manager
+	if system != nil {
+		keyManager, err = keys.NewManager(system, keyring, cfg, log)
+		if err != nil {
+			return err
+		}
+		if cfg.HasRole(config.RoleWorker) {
+			go keyManager.RunRotation(ctx)
+		}
+	} else if cfg.HasRole(config.RoleAuth) {
+		log.Warn("no token signing: database.system_url is not configured, " +
+			"so JWKS is not published and no token can be issued")
+	}
+
 	if !cfg.HasRole(config.RolePDP) {
 		log.Warn("no listener: this process serves no role that has endpoints yet",
 			"roles", cfg.EffectiveRoles())
@@ -258,7 +278,12 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	}()
 	log.Info("cache connected", "backend", cacheClient.Backend())
 
-	server, err := httpapi.New(cfg, log, db, system, decisions, metricSet, cacheClient, tracing)
+	server, err := httpapi.New(httpapi.Deps{
+		Config: cfg, Log: log,
+		Tenant: db, System: system,
+		Decisions: decisions, Metrics: metricSet, Cache: cacheClient, Tracing: tracing,
+		Keys: keyManager,
+	})
 	if err != nil {
 		return err
 	}
@@ -354,6 +379,10 @@ Administration (until the console arrives in M6). Each needs database.system_url
   warden ui -tenant <slug> -application <key> -element <key> -requires <json> [-mode <mode>]
   warden audit [-tenant <slug>] [-limit N]     show recent administrative changes
   warden audit -verify                         recompute the hash chain; non-zero exit if broken
+  warden keys list                             show every signing key and what is published
+  warden keys show                             the active key and when it rotates
+  warden keys rotate [-force]                  rotate now; the previous key keeps verifying
+                                               for security.key_overlap_window
 
 Configuration is read from a file, then the environment, then flags, each layer
 overriding the one before it. The file is selected with -config or WARDEN_CONFIG.

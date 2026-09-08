@@ -339,6 +339,23 @@ func TestValidationRejectsUnsafeCombinations(t *testing.T) {
 			wantDetail: "must be between",
 		},
 		{
+			// The window has to outlast the tokens the key it retires has signed,
+			// or rotation produces tokens nothing can verify.
+			name: "overlap window shorter than the token lifetime",
+			env: map[string]string{
+				"WARDEN_SECURITY_ACCESS_TOKEN_TTL":   "15m",
+				"WARDEN_SECURITY_KEY_OVERLAP_WINDOW": "5m",
+			},
+			wantField:  "security.key_overlap_window",
+			wantDetail: "shorter than security.access_token_ttl",
+		},
+		{
+			name:       "overlap window as long as the rotation interval",
+			env:        map[string]string{"WARDEN_SECURITY_KEY_OVERLAP_WINDOW": "2160h"},
+			wantField:  "security.key_overlap_window",
+			wantDetail: "never actually retired",
+		},
+		{
 			name:       "symmetric token signing",
 			env:        map[string]string{"WARDEN_SECURITY_TOKEN_SIGNING_ALGORITHM": "HS256"},
 			wantField:  "security.token_signing_algorithm",

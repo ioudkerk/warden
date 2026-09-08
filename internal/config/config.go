@@ -179,6 +179,17 @@ type SecurityConfig struct {
 
 	// KeyRotationInterval is the signing-key rotation schedule (SPEC §17).
 	KeyRotationInterval time.Duration `yaml:"key_rotation_interval"`
+
+	// KeyOverlapWindow is how long a rotated-out key stays in JWKS after it stops
+	// signing (SPEC §17's "overlap window"). It has to outlast every token the key
+	// signed, so validation refuses a window shorter than the access token
+	// lifetime: a shorter one produces tokens that expire *after* the key that
+	// verifies them disappears, and the symptom is a burst of invalid-signature
+	// errors at whichever relying party had not yet refetched JWKS.
+	//
+	// It also has to outlast the caching that relying parties do of their own
+	// accord, which is why the default is a day rather than a quarter of an hour.
+	KeyOverlapWindow time.Duration `yaml:"key_overlap_window"`
 }
 
 // LogConfig configures diagnostic output.
@@ -240,6 +251,7 @@ func Defaults() *Config {
 			TokenSigningAlgorithm: "RS256",
 			AccessTokenTTL:        10 * time.Minute, // SPEC §8.2 default
 			KeyRotationInterval:   90 * 24 * time.Hour,
+			KeyOverlapWindow:      24 * time.Hour,
 		},
 
 		Log: LogConfig{

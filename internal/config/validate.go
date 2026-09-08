@@ -341,6 +341,26 @@ func (c *Config) validateSecurity(errs *Errors, lookupEnv secrets.LookupEnvFunc,
 		errs.add("security.key_rotation_interval", fmt.Sprintf(
 			"is %s; signing keys must rotate at least yearly (SPEC §17)", c.Security.KeyRotationInterval))
 	}
+
+	// The overlap window is what makes rotation invisible to relying parties. Too
+	// short and it stops being an overlap: a token signed a moment before the
+	// rotation outlives the key that verifies it. Too long and a key that has been
+	// taken out of service keeps verifying tokens for longer than anybody intended,
+	// which is the same thing as not having rotated.
+	switch {
+	case c.Security.KeyOverlapWindow <= 0:
+		errs.add("security.key_overlap_window", "must be positive")
+	case c.Security.KeyOverlapWindow < c.Security.AccessTokenTTL:
+		errs.add("security.key_overlap_window", fmt.Sprintf(
+			"is %s, shorter than security.access_token_ttl (%s); a rotated-out key must stay in JWKS "+
+				"for at least as long as the tokens it signed remain valid (SPEC §17)",
+			c.Security.KeyOverlapWindow, c.Security.AccessTokenTTL))
+	case c.Security.KeyOverlapWindow >= c.Security.KeyRotationInterval:
+		errs.add("security.key_overlap_window", fmt.Sprintf(
+			"is %s, and security.key_rotation_interval is %s; an overlap at least as long as the "+
+				"rotation interval means keys are never actually retired",
+			c.Security.KeyOverlapWindow, c.Security.KeyRotationInterval))
+	}
 }
 
 func (c *Config) validateLog(errs *Errors) {

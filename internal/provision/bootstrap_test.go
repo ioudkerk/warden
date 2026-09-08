@@ -45,7 +45,7 @@ func TestBootstrapCreatesTheDeployment(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := f.p.Bootstrap(ctx, "owner@example.com", "https://warden.example.com",
-		keys.RS256, testKeyring(t))
+		keys.RS256, 90*24*time.Hour, testKeyring(t))
 	if err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestBootstrapPrintsOneUsableSetupURL(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := f.p.Bootstrap(ctx, "owner@example.com", "https://warden.example.com",
-		keys.RS256, testKeyring(t))
+		keys.RS256, 90*24*time.Hour, testKeyring(t))
 	if err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestSetupTokensAreUnpredictable(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		f := bootstrapFixture(t)
 		result, err := f.p.Bootstrap(context.Background(), "owner@example.com",
-			"https://warden.example.com", keys.RS256, testKeyring(t))
+			"https://warden.example.com", keys.RS256, 90*24*time.Hour, testKeyring(t))
 		if err != nil {
 			t.Fatalf("Bootstrap: %v", err)
 		}
@@ -171,12 +171,12 @@ func TestBootstrapRefusesToRunTwice(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := f.p.Bootstrap(ctx, "owner@example.com", "https://warden.example.com",
-		keys.RS256, testKeyring(t)); err != nil {
+		keys.RS256, 90*24*time.Hour, testKeyring(t)); err != nil {
 		t.Fatalf("the first Bootstrap failed: %v", err)
 	}
 
 	_, err := f.p.Bootstrap(ctx, "attacker@example.com", "https://warden.example.com",
-		keys.RS256, testKeyring(t))
+		keys.RS256, 90*24*time.Hour, testKeyring(t))
 	if !errors.Is(err, provision.ErrAlreadyInitialised) {
 		t.Fatalf("expected ErrAlreadyInitialised, got %v", err)
 	}
@@ -204,7 +204,7 @@ func TestTheSigningKeyIsSealedUnderTheKEK(t *testing.T) {
 	kr := testKeyring(t)
 
 	if _, err := f.p.Bootstrap(ctx, "owner@example.com", "https://warden.example.com",
-		keys.RS256, kr); err != nil {
+		keys.RS256, 90*24*time.Hour, kr); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 
@@ -265,7 +265,7 @@ func TestBootstrapRejectsABadOwnerAddress(t *testing.T) {
 	f := bootstrapFixture(t)
 	for _, email := range []string{"", "not-an-address", "@example.com"} {
 		if _, err := f.p.Bootstrap(context.Background(), email,
-			"https://warden.example.com", keys.RS256, testKeyring(t)); err == nil {
+			"https://warden.example.com", keys.RS256, 90*24*time.Hour, testKeyring(t)); err == nil {
 			t.Errorf("Bootstrap accepted owner address %q", email)
 		}
 	}
@@ -274,7 +274,7 @@ func TestBootstrapRejectsABadOwnerAddress(t *testing.T) {
 func TestBootstrapRequiresAKeyring(t *testing.T) {
 	f := bootstrapFixture(t)
 	if _, err := f.p.Bootstrap(context.Background(), "owner@example.com",
-		"https://warden.example.com", keys.RS256, nil); err == nil {
+		"https://warden.example.com", keys.RS256, 90*24*time.Hour, nil); err == nil {
 		t.Fatal("bootstrapped with nowhere to seal the signing key")
 	}
 }
@@ -286,7 +286,7 @@ func TestBootstrapIsAudited(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := f.p.Bootstrap(ctx, "owner@example.com", "https://warden.example.com",
-		keys.RS256, testKeyring(t))
+		keys.RS256, 90*24*time.Hour, testKeyring(t))
 	if err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}

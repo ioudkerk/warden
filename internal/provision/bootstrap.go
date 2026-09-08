@@ -61,7 +61,12 @@ type BootstrapResult struct {
 // It refuses to run twice. Running it again on a live deployment would otherwise mint
 // a fresh setup URL for an existing owner — which is a password reset with no
 // authentication in front of it.
-func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorithm string, keyring *secrets.Keyring) (*BootstrapResult, error) {
+//
+// rotationInterval sets when the first signing key falls due. It comes from
+// security.key_rotation_interval; the value used to be ninety days written into this
+// function, which meant a deployment that had configured a shorter rotation did not
+// get one until the first rotation had already been missed.
+func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorithm string, rotationInterval time.Duration, keyring *secrets.Keyring) (*BootstrapResult, error) {
 	if _, err := mail.ParseAddress(ownerEmail); err != nil {
 		return nil, fmt.Errorf("owner email %q is not a valid address: %w", ownerEmail, err)
 	}
@@ -133,7 +138,7 @@ func (p *Provisioner) Bootstrap(ctx context.Context, ownerEmail, issuer, algorit
 			return fmt.Errorf("granting system.owner: %w", execErr)
 		}
 
-		if insertErr := keys.Insert(ctx, tx, key, 90*24*time.Hour); insertErr != nil {
+		if insertErr := keys.Insert(ctx, tx, key, rotationInterval); insertErr != nil {
 			return insertErr
 		}
 

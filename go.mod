@@ -5,7 +5,7 @@ module github.com/warden-project/warden
 // CONTRIBUTING.md — not something to accept because a `go get` suggested it.
 // cmd/warden/gomod_test.go fails if this drifts.
 //
-// Holding the floor costs three pins. Go computes the main module's directive as the
+// Holding the floor costs four pins. Go computes the main module's directive as the
 // maximum over every dependency's, so a single dependency built for a newer toolchain
 // raises it for everyone. `go get github.com/jackc/pgx/v5@latest` did exactly that,
 // silently moving the floor to 1.25 and putting go.mod at odds with the two documents
@@ -14,6 +14,14 @@ module github.com/warden-project/warden
 go 1.23.0
 
 require (
+	// JOSE: JWKS serialisation and JWT signing (M1-1). Major version 3, not 4, and
+	// that is the fourth pin holding the line described above. go-jose v4.1+ declares
+	// go 1.24; pinning v4.0.5 to avoid that instead drags grpc and the OpenTelemetry
+	// exporters backwards, because grpc v1.75 requires v4.1.1. v3 is
+	// security-maintained, declares go 1.12, and is the version fosite uses — so
+	// M1-6 will not add a second JOSE implementation to the binary. Revisit when
+	// ADR-0001 moves the floor.
+	github.com/go-jose/go-jose/v3 v3.0.5
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0

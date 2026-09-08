@@ -119,7 +119,8 @@ func runSeed(args []string, stdout, stderr io.Writer) error {
 		if keyErr != nil {
 			return keyErr
 		}
-		result, bootErr := p.Bootstrap(ctx, *owner, cfg.Issuer, cfg.Security.TokenSigningAlgorithm, keyring)
+		result, bootErr := p.Bootstrap(ctx, *owner, cfg.Issuer, cfg.Security.TokenSigningAlgorithm,
+			cfg.Security.KeyRotationInterval, keyring)
 		if bootErr != nil {
 			return bootErr
 		}

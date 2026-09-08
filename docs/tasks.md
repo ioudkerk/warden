@@ -242,7 +242,7 @@ library, with no Warden-specific client code.
 
 | # | Task | Exit condition |
 | --- | --- | --- |
-| M1-1 [B] | Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Rotation leaves tokens signed by the previous key verifiable for the full overlap window |
+| M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
 | M1-2 [B] | Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Timing test shows unknown-user and wrong-password responses are indistinguishable (§7.2) |
 | M1-3 | Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle |
 | M1-4 | Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | `POST /v1/users/{id}/revoke-all` invalidates within 1 s |
@@ -252,6 +252,41 @@ library, with no Warden-specific client code.
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
+
+### Notes from M1-1
+
+Three things are worth knowing before touching key rotation.
+
+**The overlap window is its own setting.** `security.key_overlap_window` (default 24 h) is
+how long a rotated-out key stays in JWKS, and it is separate from
+`security.key_rotation_interval` because they answer different questions: one is how often
+a key is replaced, the other is how long the replaced one keeps verifying. Validation
+refuses a window shorter than `security.access_token_ttl` — that combination mints tokens
+that outlive the key that verifies them, and the symptom is a burst of invalid-signature
+errors at whichever relying party had not refetched JWKS. It also refuses a window at least
+as long as the rotation interval, which would mean keys are never actually retired.
+
+**Scheduling runs on one clock.** `signing_key.expires_at` is when a key stops signing;
+`retired_at + overlap` is when it leaves JWKS. Both, and the sweep's cutoff, come from
+[`keys.Manager`](../internal/keys/manager.go)'s injectable clock rather than from `now()` in
+the database. Mixing the two is not a rounding difference: `RetireActiveSigningKey` used to
+stamp `retired_at` from `now()`, and against a manager whose clock said anything else the
+key it had just demoted was already outside its own overlap window and swept on the next
+JWKS read. `retired_at` is now supplied, and it is the same instant as the incoming key's
+`activated_at` — a key stops signing exactly when its successor starts.
+
+**Rotation is safe on every replica.** It takes a transaction-scoped advisory lock, so the
+losers of a race return `ErrRotationHeld` rather than colliding on `signing_key_one_active`;
+`TestConcurrentRotationsProduceOneKey` runs four at once and asserts exactly one key is
+produced. The worker (`--role=worker`) checks hourly, which is far more often than a 90-day
+interval needs — what the frequency buys is the overlap sweep, so a key leaves JWKS within
+an hour of its window closing rather than whenever the next rotation happens to come round.
+`GET /.well-known/jwks.json` sweeps too, so the published document is correct even in a
+deployment running no worker at all.
+
+`warden keys list|show|rotate [-force]` is the operator surface; `-force` is the
+suspected-compromise path, and it says in as many words that the previous key keeps
+verifying until the window closes.
 
 ---
 

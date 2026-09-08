@@ -6,10 +6,15 @@ package db
 
 import (
 	"context"
+	"time"
 )
 
 type Querier interface {
 	ActiveSigningKey(ctx context.Context) (ActiveSigningKeyRow, error)
+	// The active key's metadata, without its private half. The rotation scheduler asks
+	// "is the current key due?" far more often than anything asks to sign, and opening a
+	// sealed private key to answer that would put a KEK decryption on a timer.
+	ActiveSigningKeyMeta(ctx context.Context) (ActiveSigningKeyMetaRow, error)
 	AppendAuditEvent(ctx context.Context, arg AppendAuditEventParams) error
 	// Administrative provisioning (internal/provision).
 	//
@@ -62,6 +67,7 @@ type Querier interface {
 	InsertTenant(ctx context.Context, arg InsertTenantParams) error
 	InsertUser(ctx context.Context, arg InsertUserParams) error
 	InsertUserWithoutAttributes(ctx context.Context, arg InsertUserWithoutAttributesParams) error
+	ListSigningKeys(ctx context.Context) ([]ListSigningKeysRow, error)
 	// The administrative audit log (internal/audit).
 	//
 	// `before` and `after` are json, not jsonb, and the generated []byte must stay []byte:
@@ -98,7 +104,18 @@ type Querier interface {
 	// The previously active key becomes 'previous' rather than 'retired': tokens it
 	// signed are still in circulation and must keep verifying until they expire, which is
 	// what the JWKS overlap window in SPEC §17 is for.
-	RetireActiveSigningKey(ctx context.Context) error
+	//
+	// retired_at is supplied rather than taken from now() so that it is the same instant
+	// as the incoming key's activated_at — a key stops signing exactly when its successor
+	// starts — and so that it is on the same clock as the overlap cutoff. Two clocks here
+	// is not a rounding difference: it decides whether the key that has just stopped
+	// signing is inside its overlap window or already outside it.
+	RetireActiveSigningKey(ctx context.Context, retiredAt time.Time) error
+	// Drops keys out of JWKS once the overlap window has passed. The cutoff is computed
+	// by the caller from security.key_overlap_window rather than embedded here, so that
+	// shortening the window takes effect on the next sweep instead of on the next
+	// migration.
+	RetireOverlappedSigningKeys(ctx context.Context, cutoff time.Time) (int64, error)
 	// The HTTP surface (internal/httpapi).
 	// Resolves a bearer token to a service account. This runs on the system pool, and
 	// necessarily so: it has to find which tenant the token belongs to before a tenant
@@ -134,6 +151,13 @@ type Querier interface {
 	// not apply and these predicates are the only thing keeping one tenant's roles out
 	// of another's decision.
 	TenantRevision(ctx context.Context, id string) (int64, error)
+	// Serialises rotation across replicas. A transaction-scoped advisory lock is released
+	// by commit or rollback, including the rollback a crashed connection causes, so a
+	// process that dies mid-rotation does not leave the lock held. Without it, every
+	// replica noticing the same due date at the same moment would each generate a key and
+	// all but one would fail on signing_key_one_active — correct, but noisy, and it burns
+	// an RSA keygen per replica to achieve nothing.
+	TryLockKeyRotation(ctx context.Context, lockKey int64) (bool, error)
 	UIElementExists(ctx context.Context, id string) (bool, error)
 	// An application's declared elements together with whatever binding applies in this
 	// tenant and environment. An environment-specific binding wins over the one that

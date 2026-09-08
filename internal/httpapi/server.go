@@ -18,6 +18,7 @@ import (
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
+	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
@@ -41,30 +42,55 @@ type Server struct {
 	metrics   *metrics.Metrics
 	cache     cache.Cache
 	tracer    trace.Tracer
+	keys      *keys.Manager
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
 }
 
+// Deps are the collaborators the server is built from.
+//
+// A struct rather than a parameter list because the list had reached eight and M1
+// adds more: at that width every call site is a row of positional arguments whose
+// meaning depends on counting commas, and swapping two *store.Store values by mistake
+// is a tenant-isolation bug that compiles.
+type Deps struct {
+	Config *config.Config
+	Log    *slog.Logger
+
+	// Tenant serves decisions under row-level security. System is for the lookups
+	// that cannot be tenant-scoped: resolving a token to its tenant, the decision
+	// log, and the deployment-level signing keys.
+	Tenant *store.Store
+	System *store.Store
+
+	Decisions *decisionlog.Sink
+	Metrics   *metrics.Metrics
+	Cache     cache.Cache
+	Tracing   *metrics.Tracing
+
+	// Keys publishes JWKS and signs tokens. Optional: a process serving only the PDP
+	// role has nothing to sign, and the JWKS route is simply absent when it is nil,
+	// rather than present and answering with an error.
+	Keys *keys.Manager
+}
+
 // New builds the server.
-func New(
-	cfg *config.Config, log *slog.Logger,
-	tenant, system *store.Store,
-	decisions *decisionlog.Sink, m *metrics.Metrics, c cache.Cache, tracing *metrics.Tracing,
-) (*Server, error) {
-	engine, err := authz.NewEngine(tenant)
+func New(d Deps) (*Server, error) {
+	engine, err := authz.NewEngine(d.Tenant)
 	if err != nil {
 		return nil, err
 	}
-	if system == nil {
+	if d.System == nil {
 		return nil, errors.New(
 			"the decision API needs database.system_url: authenticating a service account " +
 				"means resolving a token to a tenant, which happens before any tenant scope exists")
 	}
 	return &Server{
-		cfg: cfg, log: log, engine: engine,
-		tenant: tenant, system: system, decisions: decisions,
-		metrics: m, cache: c, tracer: tracerOf(tracing),
+		cfg: d.Config, log: d.Log, engine: engine,
+		tenant: d.Tenant, system: d.System, decisions: d.Decisions,
+		metrics: d.Metrics, cache: d.Cache, tracer: tracerOf(d.Tracing),
+		keys: d.Keys,
 	}, nil
 }
 
@@ -142,6 +168,12 @@ func (s *Server) Handler() http.Handler {
 	// hold a credential, and neither reveals anything about policy or tenants.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// JWKS is unauthenticated by definition: it is how a relying party that holds no
+	// Warden credential verifies a token. It carries only public key material.
+	if s.keys != nil {
+		mux.HandleFunc("GET /.well-known/jwks.json", s.handleJWKS)
+	}
 
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))

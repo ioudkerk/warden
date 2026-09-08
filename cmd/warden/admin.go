@@ -382,7 +382,8 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	result, err := p.Bootstrap(ctx, *email, cfg.Issuer, cfg.Security.TokenSigningAlgorithm, keyring)
+	result, err := p.Bootstrap(ctx, *email, cfg.Issuer, cfg.Security.TokenSigningAlgorithm,
+		cfg.Security.KeyRotationInterval, keyring)
 	if err != nil {
 		if errors.Is(err, provision.ErrAlreadyInitialised) {
 			// Refused rather than repeated: a second init on a live deployment would

@@ -139,7 +139,7 @@ func aad(id, kid, algorithm string) []byte {
 // what the JWKS overlap window in SPEC §17 is for.
 func Insert(ctx context.Context, tx pgx.Tx, k *Key, rotationInterval time.Duration) error {
 	q := db.New(tx)
-	if err := q.RetireActiveSigningKey(ctx); err != nil {
+	if err := q.RetireActiveSigningKey(ctx, k.CreatedAt); err != nil {
 		return fmt.Errorf("retiring the previous signing key: %w", err)
 	}
 
@@ -159,8 +159,7 @@ func Active(ctx context.Context, tx pgx.Tx, keyring *secrets.Keyring) (kid strin
 	row, err := db.New(tx).ActiveSigningKey(ctx)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", nil, "", errors.New(
-				"no active signing key: the deployment has not been initialised (run `warden init`)")
+			return "", nil, "", ErrNotInitialised
 		}
 		return "", nil, "", err
 	}

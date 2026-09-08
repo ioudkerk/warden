@@ -23,6 +23,7 @@ import (
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/httpapi"
+	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/provision"
 	"github.com/warden-project/warden/internal/secrets"
@@ -39,6 +40,7 @@ type fixture struct {
 	rival    string
 	sink     *decisionlog.Sink
 	metrics  *metrics.Metrics
+	keys     *keys.Manager
 }
 
 // newFixture builds two tenants, each with a user and its own service-account token.
@@ -178,8 +180,27 @@ func build(t *testing.T, mayExplain bool, c cache.Cache) fixture {
 	f.sink = sink
 
 	f.metrics = metrics.New("test")
-	server, err := httpapi.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		tenantPool, system, sink, f.metrics, c, nil)
+
+	// A key manager with one key in it, so the JWKS route is the real one rather
+	// than a stub. ES256 because the test does not care which algorithm and an RSA
+	// keygen per fixture is a visible cost across a package's worth of tests.
+	cfg.Security.TokenSigningAlgorithm = keys.ES256
+	km, keysErr := keys.NewManager(system, testKeyring(t), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if keysErr != nil {
+		t.Fatalf("key manager: %v", keysErr)
+	}
+	km.SetCacheTTL(0)
+	if _, rotateErr := km.Rotate(context.Background(), true); rotateErr != nil {
+		t.Fatalf("creating a signing key: %v", rotateErr)
+	}
+	f.keys = km
+
+	server, err := httpapi.New(httpapi.Deps{
+		Config: cfg, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tenant: tenantPool, System: system,
+		Decisions: sink, Metrics: f.metrics, Cache: c,
+		Keys: km,
+	})
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -789,4 +810,23 @@ func TestUIEndpointsRequireAuthentication(t *testing.T) {
 		`{"subject":{"id":"x"},"application":"billing","items":[{"ref":"a","element":"b"}]}`); status != http.StatusUnauthorized {
 		t.Errorf("resolve without a credential returned %d", status)
 	}
+}
+
+// testKeyring is a fixed KEK. Fixed rather than random because a test that fails
+// should fail the same way twice, and nothing here is protecting anything.
+func testKeyring(t *testing.T) *secrets.Keyring {
+	t.Helper()
+	material := make([]byte, secrets.KEKSize)
+	for i := range material {
+		material[i] = byte(i * 7)
+	}
+	kek, err := secrets.NewKEKFromBytes(material)
+	if err != nil {
+		t.Fatalf("NewKEKFromBytes: %v", err)
+	}
+	kr, err := secrets.NewKeyring(kek)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	return kr
 }

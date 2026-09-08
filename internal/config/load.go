@@ -153,6 +153,8 @@ func fields() []field {
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.AccessTokenTTL })},
 		{"security-key-rotation-interval", "WARDEN_SECURITY_KEY_ROTATION_INTERVAL", "signing key rotation interval",
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.KeyRotationInterval })},
+		{"security-key-overlap-window", "WARDEN_SECURITY_KEY_OVERLAP_WINDOW", "how long a rotated-out key stays in JWKS",
+			durationSetter(func(c *Config) *time.Duration { return &c.Security.KeyOverlapWindow })},
 
 		{"log-level", "WARDEN_LOG_LEVEL", "log level: debug, info, warn or error",
 			func(c *Config, v string) error { c.Log.Level = v; return nil }},
