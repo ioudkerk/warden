@@ -151,6 +151,29 @@ func TestConfigFileRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// database.auto_migrate was a real setting from M0-4 to M0-11, with a default, a flag,
+// an environment variable and a rule refusing it in production — and no implementation
+// anywhere. It was removed rather than implemented, because a knob that silently does
+// nothing is worse than an absent one.
+//
+// This test is what makes the removal safe for anyone still carrying it in a file: the
+// unknown-key rule above turns it into a startup error naming the line, which is a
+// better outcome than the validation rule it replaced. It also fails if someone
+// re-adds the field without an implementation.
+func TestLeftoverAutoMigrateIsRejected(t *testing.T) {
+	s := src(minimalEnv(), "-config", "/c.yaml")
+	s.ReadFile = func(string) ([]byte, error) {
+		return []byte("issuer: https://x.example.com\ndatabase:\n  auto_migrate: true\n"), nil
+	}
+	_, err := config.Load(s)
+	if err == nil {
+		t.Fatal("auto_migrate no longer exists; a config file still setting it must fail")
+	}
+	if !strings.Contains(err.Error(), "auto_migrate") {
+		t.Fatalf("the error should name the setting so an operator can find it, got: %v", err)
+	}
+}
+
 func TestConfigFileMissingIsAnError(t *testing.T) {
 	_, err := config.Load(src(minimalEnv(), "-config", "/absent.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "/absent.yaml") {
@@ -268,9 +291,6 @@ func TestDefaultsChooseTheStrictOption(t *testing.T) {
 	if len(d.HTTP.TrustedProxyCIDRs) != 0 {
 		t.Error("no proxy should be trusted by default; context.ip feeds authorization conditions")
 	}
-	if d.Database.AutoMigrate {
-		t.Error("auto-migrate should be off by default; rolling deploys must not race to migrate")
-	}
 	if d.Cache.Backend != config.CacheRedis {
 		t.Error("the cache should default to redis; in-process cannot propagate permission changes")
 	}
@@ -305,12 +325,6 @@ func TestValidationRejectsUnsafeCombinations(t *testing.T) {
 			env:        map[string]string{"WARDEN_CACHE_BACKEND": "in-process", "WARDEN_CACHE_URL": ""},
 			wantField:  "cache.backend",
 			wantDetail: "single-node only",
-		},
-		{
-			name:       "auto-migrate in production",
-			env:        map[string]string{"WARDEN_DATABASE_AUTO_MIGRATE": "true"},
-			wantField:  "database.auto_migrate",
-			wantDetail: "separate job",
 		},
 		{
 			name:       "access token lifetime above the spec bound",
@@ -414,15 +428,11 @@ func TestDevelopmentRelaxesProductionOnlyRules(t *testing.T) {
 	env["WARDEN_ENVIRONMENT"] = "dev"
 	env["WARDEN_ISSUER"] = "http://localhost:8080"
 	env["WARDEN_CACHE_BACKEND"] = "in-process"
-	env["WARDEN_DATABASE_AUTO_MIGRATE"] = "true"
 	delete(env, "WARDEN_CACHE_URL")
 
 	cfg := load(t, src(env))
 	if cfg.Cache.Backend != config.CacheInProcess {
 		t.Fatal("in-process cache should be allowed in dev")
-	}
-	if !cfg.Database.AutoMigrate {
-		t.Fatal("auto-migrate should be allowed in dev")
 	}
 }
 

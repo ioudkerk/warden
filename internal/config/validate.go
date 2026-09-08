@@ -82,7 +82,6 @@ var fieldToBinding = map[string]string{
 	"database.max_open_conns":          "database-max-open-conns",
 	"database.max_idle_conns":          "database-max-idle-conns",
 	"database.statement_timeout":       "database-statement-timeout",
-	"database.auto_migrate":            "database-auto-migrate",
 	"cache.backend":                    "cache-backend",
 	"cache.url":                        "cache-url",
 	"cache.pool_size":                  "cache-pool-size",
@@ -273,9 +272,6 @@ func (c *Config) validateDatabase(errs *Errors) {
 	}
 	if c.Database.StatementTimeout <= 0 {
 		errs.add("database.statement_timeout", "must be positive; an unbounded query stalls the decision path")
-	}
-	if c.Database.AutoMigrate && c.Environment == EnvProduction {
-		errs.add("database.auto_migrate", "must not be enabled in production; run migrations as a separate job so replicas cannot race")
 	}
 }
 

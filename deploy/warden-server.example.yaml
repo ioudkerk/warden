@@ -56,9 +56,11 @@ database:
   conn_max_lifetime: 30m
   connect_timeout: 10s
   statement_timeout: 5s
-  # Run migrations as a separate pre-upgrade job (SPEC §20.1) so a rolling deploy
-  # cannot have several replicas racing to migrate. Refused in production.
-  auto_migrate: false
+  # There is no auto-migrate setting, on purpose. Migrations run as a separate
+  # pre-upgrade job (SPEC §20.1), so a rolling deploy cannot have several replicas
+  # racing to apply them: `migrate -path internal/store/migrations -database "$URL" up`,
+  # which is what `make migrate-up`, the compose file and CI all run, at one pinned
+  # version. See deploy/README.md.
 
 cache:
   # redis is required for any deployment with more than one process: the change

@@ -119,10 +119,18 @@ type DatabaseConfig struct {
 	// budget (SPEC §18); an unbounded query is an availability incident.
 	StatementTimeout time.Duration `yaml:"statement_timeout"`
 
-	// AutoMigrate runs pending migrations at startup. Off by default: SPEC §20.1
-	// runs migrations as a separate pre-upgrade job so that a rolling deploy cannot
-	// have several replicas racing to migrate.
-	AutoMigrate bool `yaml:"auto_migrate"`
+	// There is deliberately no auto_migrate here. Migrations run as a separate
+	// pre-upgrade job (SPEC §20.1), so that a rolling deploy cannot have several
+	// replicas racing to apply them; `make migrate-up`, the compose file's migrate
+	// service and CI all use the same pinned golang-migrate.
+	//
+	// The field existed from M0-4 to M0-11 and never had an implementation behind
+	// it: it was written before migrations arrived in M0-5, as an entry in the
+	// safe-defaults inventory, and nothing ever came back to connect it. A knob that
+	// silently does nothing is worse than an absent one, and absent is enforced —
+	// unknown keys in a config file are a startup error, so a leftover
+	// `auto_migrate: true` now names its own line number instead of being ignored.
+	// If a deployment story ever wants it, it should arrive with its behaviour.
 }
 
 // CacheBackend selects where sessions, the decision cache, SAML replay protection and
@@ -216,7 +224,6 @@ func Defaults() *Config {
 			ConnMaxLifetime:  30 * time.Minute,
 			ConnectTimeout:   10 * time.Second,
 			StatementTimeout: 5 * time.Second,
-			AutoMigrate:      false,
 		},
 
 		Cache: CacheConfig{

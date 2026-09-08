@@ -36,9 +36,6 @@ func TestShippedExampleConfigurationIsValid(t *testing.T) {
 	if cfg.Cache.Backend != config.CacheRedis {
 		t.Errorf("the example should use the redis cache backend, got %q", cfg.Cache.Backend)
 	}
-	if cfg.Database.AutoMigrate {
-		t.Error("the example should not enable auto-migration")
-	}
 	if len(cfg.HTTP.TrustedProxyCIDRs) != 0 {
 		t.Error("the example should not trust any proxy by default")
 	}

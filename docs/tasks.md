@@ -52,7 +52,24 @@ deploy/                  # docker-compose, Helm chart
 
 **Milestone exit:** `docker compose up` yields a running `warden --role=all` that passes
 `/readyz`, a bootstrapped system tenant with no default credentials, and a conformance runner
-that executes an (initially tiny) corpus in CI across three toolchains.
+that executes the corpus in CI.
+
+> **Corrected during M0.** This line originally asked for the corpus to run "across three
+> toolchains", and it was wrong twice over. No task in M0 was ever written to deliver it —
+> M0-8's own exit stops at Go and hands the Python runner to **M3-4** by name — so the
+> milestone line, not the task, was the one out of date. And three is not the right number:
+> only Go and Python ever evaluate policy. `@warden/browser` fetches a bundle and asks the
+> server (SPEC §13, [`sdk-frontend-react.md`](sdk-frontend-react.md)), so there is no JS
+> evaluator for a corpus to run against, and no such task exists anywhere in M0–M8. Node is
+> in CI for the console and the browser SDK.
+>
+> What M0 does deliver is the harder half of the claim: two *independent* implementations
+> checked against each other on every case — the PDP and the plain transcription of §10.2 in
+> `conformance/reference/`. What is still unproven is that the format is portable across
+> languages, and M3-4 is where that gets tested. It sits on the critical path for this
+> reason, and should be taken early in M3 rather than mid-milestone: the moment to discover
+> that the YAML has a Go-shaped assumption in it is while the format is still cheap to
+> change.
 
 ### M0-1 [B] Repository scaffolding and toolchains
 **Status: done.**
@@ -269,7 +286,7 @@ the corpus covers all of §9.
 | M3-1 [B] | Package skeleton, typing, sync + async parity | `mypy --strict` clean; every public sync method has an async twin |
 | M3-2 [B] | Token verification: JWKS fetch, cache, rotation, `iss`/`aud`/`exp`/`nbf`, clock skew — fully offline | No network call on the happy path after warm-up |
 | M3-3 [B] | `check` / `batch_check` / `filter` against the M2 API | Same results as the server for every corpus case |
-| M3-4 [B] | **Python conformance runner** against the M0-8 corpus | Python and Go agree on all cases — this is what makes the SDK trustworthy |
+| M3-4 [B] | **Python conformance runner** against the M0-8 corpus. **Take this early in M3**, not mid-milestone: it is the first test that the corpus format is portable at all, and a format problem is cheap now and expensive once M3-3 and M3-5 are written against it | Python and Go agree on all cases — this is what makes the SDK trustworthy, and what M0's exit note defers to |
 | M3-5 | Caching: `remote` / `cached` / `embedded`; cache key **includes the resource-attribute hash and tenant revision** (ADR-0002 consequence) | A changed attribute value cannot hit a stale entry |
 | M3-6 | Change-stream subscription (SSE) with reconnect and backoff | Propagation p95 < 1 s end to end |
 | M3-7 | `fail_mode` `closed` / `open_read` / `stale` + circuit breaker with exposed state | Default `closed`; a misconfigured SDK fails at startup, never allows at runtime (§12.5) |

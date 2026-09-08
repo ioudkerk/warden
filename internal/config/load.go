@@ -134,9 +134,6 @@ func fields() []field {
 			durationSetter(func(c *Config) *time.Duration { return &c.Database.ConnectTimeout })},
 		{"database-statement-timeout", "WARDEN_DATABASE_STATEMENT_TIMEOUT", "server-side statement timeout",
 			durationSetter(func(c *Config) *time.Duration { return &c.Database.StatementTimeout })},
-		{"database-auto-migrate", "WARDEN_DATABASE_AUTO_MIGRATE", "run pending migrations at startup (prefer a separate migrate job)",
-			boolSetter(func(c *Config) *bool { return &c.Database.AutoMigrate })},
-
 		{"cache-backend", "WARDEN_CACHE_BACKEND", "cache and pub/sub backend: redis or in-process",
 			func(c *Config, v string) error { c.Cache.Backend = CacheBackend(v); return nil }},
 		{"cache-url", "WARDEN_CACHE_URL", "Redis connection string (required when the backend is redis)",
@@ -328,16 +325,10 @@ func int64Setter(get func(*Config) *int64) func(*Config, string) error {
 	}
 }
 
-func boolSetter(get func(*Config) *bool) func(*Config, string) error {
-	return func(c *Config, v string) error {
-		b, err := strconv.ParseBool(strings.TrimSpace(v))
-		if err != nil {
-			return fmt.Errorf("%q is not a boolean (want true or false)", v)
-		}
-		*get(c) = b
-		return nil
-	}
-}
+// There is no boolSetter. database.auto_migrate was the only boolean in the binding
+// table, and it was removed in M0-11 as a setting nothing implemented; the linter
+// noticing its setter is how that was confirmed rather than assumed. Add one back with
+// the first boolean that has behaviour behind it.
 
 func floatSetter(get func(*Config) *float64) func(*Config, string) error {
 	return func(c *Config, v string) error {
