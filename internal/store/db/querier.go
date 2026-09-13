@@ -7,9 +7,15 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/warden-project/warden/internal/store/dbtypes"
 )
 
 type Querier interface {
+	// Moves a user from 'invited' to 'active'. Redeeming a setup token or an invitation is
+	// the moment that happens: before it the account has no credential and can do nothing,
+	// which is the property SPEC §20.2 is after.
+	ActivateUser(ctx context.Context, arg ActivateUserParams) error
 	ActiveSigningKey(ctx context.Context) (ActiveSigningKeyRow, error)
 	// The active key's metadata, without its private half. The rotation scheduler asks
 	// "is the current key due?" far more often than anything asks to sign, and opening a
@@ -39,6 +45,12 @@ type Querier interface {
 	// every tenant's revision moves and every cached model is rebuilt (SPEC §10.5).
 	BumpEveryTenantRevision(ctx context.Context) error
 	BumpTenantRevision(ctx context.Context, id string) error
+	// Marks a token used. The WHERE clause repeats the unconsumed check that the caller
+	// already made, so that two simultaneous redemptions of the same link cannot both
+	// succeed: the second updates zero rows and the caller treats that as a replay. The
+	// check and the write being one statement is what makes it a race the database
+	// settles rather than one the application hopes not to lose.
+	ConsumeSetupToken(ctx context.Context, id string) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
 	DeleteGrant(ctx context.Context, arg DeleteGrantParams) error
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
@@ -67,6 +79,9 @@ type Querier interface {
 	InsertTenant(ctx context.Context, arg InsertTenantParams) error
 	InsertUser(ctx context.Context, arg InsertUserParams) error
 	InsertUserWithoutAttributes(ctx context.Context, arg InsertUserWithoutAttributesParams) error
+	// Redemption invalidates every other outstanding token for the same user
+	// (docs/design-email.md §8). Two live setup links is one more than anyone needs.
+	InvalidateOtherSetupTokens(ctx context.Context, arg InvalidateOtherSetupTokensParams) (int64, error)
 	ListSigningKeys(ctx context.Context) ([]ListSigningKeysRow, error)
 	// The administrative audit log (internal/audit).
 	//
@@ -94,6 +109,25 @@ type Querier interface {
 	ModelRolePermissions(ctx context.Context, tenantID string) ([]ModelRolePermissionsRow, error)
 	ModelRoles(ctx context.Context, tenantID string) ([]ModelRolesRow, error)
 	ModelSubjects(ctx context.Context, tenantID string) ([]ModelSubjectsRow, error)
+	// Local credentials (internal/authn).
+	//
+	// Two of these run on the system pool and the rest are tenant-scoped, and the split is
+	// not arbitrary. Resolving a setup token to its user necessarily happens before any
+	// tenant scope exists — the token is all the caller has — which is why setup_token is
+	// registered as a deliberate exception to row-level security alongside
+	// service_account. Everything reached by (tenant, email) goes through the tenant pool,
+	// where RLS is the thing keeping one tenant's credentials out of another's login.
+	// ---------------------------------------------------------------------------------
+	// Authentication
+	// ---------------------------------------------------------------------------------
+	// The row a password login needs, in one query.
+	//
+	// A LEFT JOIN rather than an inner one, so that a user who exists but has no password
+	// credential — invited and never redeemed, or federated only — is distinguishable here
+	// from a user who does not exist at all. The caller must NOT let that distinction reach
+	// the response: it is needed to decide whether to record a failed attempt against a
+	// real account, and SPEC §7.2 requires both cases to answer identically.
+	PasswordCredentialByEmail(ctx context.Context, arg PasswordCredentialByEmailParams) (PasswordCredentialByEmailRow, error)
 	// The permission surface is global: an application declares it once (SPEC §6.1).
 	PermissionSurface(ctx context.Context) ([]string, error)
 	// The keys a relying party should accept: the active one and any still within the
@@ -125,6 +159,9 @@ type Querier interface {
 	SetGrantGrantedBy(ctx context.Context, arg SetGrantGrantedByParams) error
 	// Set in a second pass, so a type may name a parent declared after it.
 	SetResourceTypeParent(ctx context.Context, arg SetResourceTypeParentParams) error
+	// jsonb_strip_nulls keeps a cleared field from being stored as an explicit null, which
+	// would read back as "configured, to nothing" rather than "not configured".
+	SetTenantPasswordPolicy(ctx context.Context, arg SetTenantPasswordPolicyParams) error
 	// The tenant scope itself (internal/store).
 	// Establishes the row-level security scope for a transaction.
 	//
@@ -134,6 +171,10 @@ type Querier interface {
 	// security boundary. is_local also ties the setting to the transaction, so it cannot
 	// leak to the next user of a pooled connection.
 	SetTenantScope(ctx context.Context, setConfig string) error
+	// ---------------------------------------------------------------------------------
+	// Setup tokens (system pool: see the header)
+	// ---------------------------------------------------------------------------------
+	SetupTokenByHash(ctx context.Context, tokenHash []byte) (SetupTokenByHashRow, error)
 	// SPEC §16.2 makes the decision log level per application; with one decision endpoint
 	// and no application in the request, the caller takes the strictest level across the
 	// tenant's enrolled applications.
@@ -142,6 +183,13 @@ type Querier interface {
 	// Tenancy
 	// ---------------------------------------------------------------------------------
 	TenantExists(ctx context.Context, id string) (bool, error)
+	// ---------------------------------------------------------------------------------
+	// Per-tenant password policy (SPEC §7.2)
+	// ---------------------------------------------------------------------------------
+	// Stored inside tenant.settings rather than in columns of its own. The policy is read
+	// once per password change, never on the decision path, and it will grow fields —
+	// history depth, expiry, dictionary choice — that would otherwise each be a migration.
+	TenantPasswordPolicy(ctx context.Context, tenantID string) (dbtypes.JSONMap, error)
 	// The decision engine's model loader (internal/authz/loader.go).
 	//
 	// Every tenant-scoped query below names the tenant explicitly. Row-level security
@@ -151,6 +199,10 @@ type Querier interface {
 	// not apply and these predicates are the only thing keeping one tenant's roles out
 	// of another's decision.
 	TenantRevision(ctx context.Context, id string) (int64, error)
+	// Records that a credential was used. Deliberately not in the same transaction as the
+	// verification: a successful login must not fail because this write contended, and an
+	// unsuccessful one must not be distinguishable by having skipped it.
+	TouchCredential(ctx context.Context, id string) error
 	// Serialises rotation across replicas. A transaction-scoped advisory lock is released
 	// by commit or rollback, including the rollback a crashed connection causes, so a
 	// process that dies mid-rotation does not leave the lock held. Without it, every
@@ -168,6 +220,16 @@ type Querier interface {
 	UpsertApplication(ctx context.Context, arg UpsertApplicationParams) error
 	UpsertEnvironment(ctx context.Context, arg UpsertEnvironmentParams) error
 	// ---------------------------------------------------------------------------------
+	// Setting a password
+	// ---------------------------------------------------------------------------------
+	// Writes the one password credential a user may have.
+	//
+	// ON CONFLICT targets credential_one_password_per_user, the partial unique index that
+	// enforces "at most one password per user". Doing it as an upsert rather than
+	// delete-then-insert means a password change cannot leave a user with no credential if
+	// it fails between the two statements.
+	UpsertPasswordCredential(ctx context.Context, arg UpsertPasswordCredentialParams) error
+	// ---------------------------------------------------------------------------------
 	// Resources and UI bindings
 	// ---------------------------------------------------------------------------------
 	UpsertResourceNode(ctx context.Context, arg UpsertResourceNodeParams) error
@@ -180,6 +242,8 @@ type Querier interface {
 	// binding with it — silently changing what their staff can see as a side effect of
 	// someone else's refactor.
 	UpsertUIElement(ctx context.Context, arg UpsertUIElementParams) error
+	UserForPasswordChange(ctx context.Context, arg UserForPasswordChangeParams) (UserForPasswordChangeRow, error)
+	UserIDByEmail(ctx context.Context, arg UserIDByEmailParams) (string, error)
 }
 
 var _ Querier = (*Queries)(nil)

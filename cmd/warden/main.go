@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
@@ -82,6 +83,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runAudit(rest, stdout, stderr)
 	case "keys":
 		return runKeys(rest, stdout, stderr)
+	case "password":
+		return runPassword(rest, stdout, stderr)
 
 	default:
 		usage(stderr)
@@ -203,6 +206,29 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		defer system.Close()
 		observeRetries(system, metricSet, log, "system")
 		log.Info("system database connected", "role", system.Role())
+	}
+
+	// Validate the breached-password corpus now rather than at the first password
+	// change. The failure this catches is the quiet one: a file in the wrong format
+	// loads happily and answers "not breached" to everything, which turns the one
+	// mandatory check in SPEC §7.2 into a no-op that looks like it is working.
+	//
+	// Opened and closed, not held: nothing serves a login yet. The authenticator opens
+	// its own when the OIDC endpoints arrive in M1-6.
+	if cfg.Security.BreachedPasswordFile != "" {
+		corpus, corpusErr := authn.OpenHIBPFile(cfg.Security.BreachedPasswordFile)
+		if corpusErr != nil {
+			return corpusErr
+		}
+		if closeErr := corpus.Close(); closeErr != nil {
+			log.Warn("closing the breached-password corpus", "error", closeErr)
+		}
+		log.Info("breached-password corpus validated", "path", cfg.Security.BreachedPasswordFile)
+	} else {
+		log.Warn("no breached-password corpus configured; the mandatory check in SPEC §7.2 "+
+			"runs against the built-in list only",
+			"entries", authn.NewEmbeddedSet().Size(),
+			"setting", "security.breached_password_file")
 	}
 
 	// Signing keys are deployment-level, so key management needs the system pool.
@@ -383,6 +409,16 @@ Administration (until the console arrives in M6). Each needs database.system_url
   warden keys show                             the active key and when it rotates
   warden keys rotate [-force]                  rotate now; the previous key keeps verifying
                                                for security.key_overlap_window
+  warden password redeem -token <token>        finish "warden init": set the first owner's
+                                               password from the one-time setup link
+  warden password set -tenant <slug> -email <email>
+                                               set a user's password
+  warden password policy -tenant <slug> [-min-length N] [-check-breached false] ...
+                                               show or change a tenant's password policy
+
+The password subcommands read the password from standard input, never from a flag:
+arguments are visible in "ps" and land in shell history.
+  printf '%%s' "$PASSWORD" | warden password redeem -token ...
 
 Configuration is read from a file, then the environment, then flags, each layer
 overriding the one before it. The file is selected with -config or WARDEN_CONFIG.

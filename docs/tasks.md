@@ -243,7 +243,7 @@ library, with no Warden-specific client code.
 | # | Task | Exit condition |
 | --- | --- | --- |
 | M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
-| M1-2 [B] | Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Timing test shows unknown-user and wrong-password responses are indistinguishable (§7.2) |
+| M1-2 [B] | **Status: done.** Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Met. `TestUnknownUserAndWrongPasswordTakeTheSameTime` measures both paths against the cost of one Argon2id hash; they differ by under 1% of it, and the test fails loudly if either path skips the hash |
 | M1-3 | Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle |
 | M1-4 | Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | `POST /v1/users/{id}/revoke-all` invalidates within 1 s |
 | M1-5 | Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Replaying a rotated token kills the family and emits `security.refresh_token_reuse` |
@@ -252,6 +252,55 @@ library, with no Warden-specific client code.
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
+
+### Notes from M1-2
+
+**The timing property is a function, not a layer.** `authn.Authenticate` is one function
+rather than "look the user up" plus "verify the password" because the moment those are
+separable, a caller can skip the second when the first finds nothing — and that difference
+is tens of milliseconds of 64 MiB hashing, measurable across a network by anyone who wants
+a list of which addresses have accounts. Every failure path verifies against a **decoy
+hash**: a real Argon2id hash of a random string, generated once under the current
+parameters. The test asserts two things, and the second is the one with teeth: that the two
+medians are close, *and* that both exceed half the cost of one hash. Injecting the obvious
+bug — return early when there is no credential — moves the unknown-user median from 7.4 ms
+to 0.7 ms and the test names the consequence in its failure message.
+
+One imperfection is documented rather than hidden: a tenant whose stored hashes still carry
+*older* parameters verifies faster than the decoy, so a timing difference exists between
+the raising of parameters and the population having logged in once. It is bounded by the
+rehash-on-login rollout.
+
+**The length floor decides what the breach corpus is for.** With `min_length` at 12,
+"123456" and "qwerty" are refused on length and never reach the corpus at all; the entries
+that earn their place are the ones that clear twelve characters and are still in every
+wordlist. The built-in list is weighted accordingly. It is also **generated** rather than
+hand-written, and that was not the original plan: the hand-written version held
+`Password1234` but not `password1234`, which a real `warden init` → redeem run accepted.
+The unit tests had not caught it because they only asserted entries somebody had already
+thought of. `TestEmbeddedSetCatchesTheObviousTwelveCharacterCases` is the regression test.
+
+For real coverage, `security.breached_password_file` takes a Have I Been Pwned download.
+It is binary-searched in place — the full corpus is tens of gigabytes — and validated at
+startup, because a file in the wrong format loads happily and answers "not breached" to
+everything, which is a mandatory check silently doing nothing.
+
+**`warden init` now has a second half.** `setup_token` was written by M0-9 and read by
+nothing, so the one-time URL it printed could not be redeemed and a bootstrapped deployment
+had no way in. `warden password redeem -token …` closes that: it sets the password,
+activates the user from `invited`, and burns every other outstanding link for them. A
+rejected password leaves the link usable — burning a one-time bootstrap link because the
+first guess was too short would be unrecoverable — and concurrent redemptions elect exactly
+one winner, settled by the row count of a single `UPDATE … WHERE consumed_at IS NULL`.
+
+Passwords are read from standard input only, never a flag or an environment variable:
+arguments show up in `ps` and shell history, and environment variables are readable from
+`/proc`.
+
+**Known gap.** NIST 800-63B also recommends rejecting context-specific words — the user's
+own address, the service name. The SPEC enumerates length, composition and the breach
+corpus, so that is what was built; the contextual check is not implemented and is not
+covered by any task yet.
 
 ### Notes from M1-1
 

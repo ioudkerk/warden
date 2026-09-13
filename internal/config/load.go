@@ -155,6 +155,8 @@ func fields() []field {
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.KeyRotationInterval })},
 		{"security-key-overlap-window", "WARDEN_SECURITY_KEY_OVERLAP_WINDOW", "how long a rotated-out key stays in JWKS",
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.KeyOverlapWindow })},
+		{"security-breached-password-file", "WARDEN_SECURITY_BREACHED_PASSWORD_FILE", "Have I Been Pwned corpus for the breached-password check",
+			func(c *Config, v string) error { c.Security.BreachedPasswordFile = v; return nil }},
 
 		{"log-level", "WARDEN_LOG_LEVEL", "log level: debug, info, warn or error",
 			func(c *Config, v string) error { c.Log.Level = v; return nil }},

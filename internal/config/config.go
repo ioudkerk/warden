@@ -180,6 +180,18 @@ type SecurityConfig struct {
 	// KeyRotationInterval is the signing-key rotation schedule (SPEC §17).
 	KeyRotationInterval time.Duration `yaml:"key_rotation_interval"`
 
+	// BreachedPasswordFile points at a Have I Been Pwned corpus — the "hash:count"
+	// download, sorted by hash. SPEC §7.2 makes the breached-password check
+	// mandatory, and Warden ships a small built-in list so that the check is never a
+	// no-op; this is how a deployment gets real coverage.
+	//
+	// Optional, and checked at startup rather than at the first password change: a
+	// path that does not open, or a file that is not in that format, is a
+	// configuration error. The failure it prevents is the quiet one — a corpus that
+	// loads and answers "not breached" to everything looks exactly like a corpus that
+	// works.
+	BreachedPasswordFile string `yaml:"breached_password_file"`
+
 	// KeyOverlapWindow is how long a rotated-out key stays in JWKS after it stops
 	// signing (SPEC §17's "overlap window"). It has to outlast every token the key
 	// signed, so validation refuses a window shorter than the access token
