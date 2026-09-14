@@ -291,15 +291,39 @@ unknown client is verified against a decoy exactly as an unknown user is. Genera
 fresh decoy per call would hash twice — once to build it, once to verify — making the miss
 reliably *slower* than the hit and just as good an oracle. It is cached per parameter set.
 
-**Dependency cost, recorded rather than absorbed.** fosite v0.49.0 takes the module count
-from 44 to 87 and adds about 35 *linked* modules, among them `gobuffalo/pop` (a full ORM),
-`zipkin-go`, `logrus` and `ristretto`. The whole cascade comes from one import —
-`fosite` → `ory/x/otelx` → all of the above. Every fosite release from v0.45 onward has it;
-only v0.44.0 (2023) is clean, which is not a sensible pin for a security component. The
-binary grows 41 MB → 44 MB. This is accepted because SPEC §19 and this task both name
-fosite, and because `govulncheck` does reachability analysis so unreachable code in those
-modules should not become a triage queue — but the **SBOM required by SPEC §17 will list
-them**, and that should not be a surprise at release time.
+**Dependency cost, measured.** fosite v0.49.0 takes the module count from 44 to 87 and the
+binary from 41 MB to 44 MB. The extra modules arrive through one import chain:
+
+```
+internal/oidcop → ory/fosite → ory/x/otelx → ory/x/logrusx → gobuffalo/pop/v6/logging
+```
+
+Module *presence* is a poor measure of what that costs, and an early draft of this note
+used it and was wrong as a result — it claimed a full ORM was being linked. What is
+actually compiled in from each module:
+
+| module | linked packages | source lines |
+| --- | --- | --- |
+| `gobuffalo/pop` | 1 | 27 — an integer enum and its `String()`, nothing more |
+| `zipkin-go` | 1 | 670 |
+| `sirupsen/logrus` | 1 | 4,890 |
+| `dgraph-io/ristretto` | 3 | 8,520 |
+| `ory/x` | 4 | 2,301 |
+| `pkg/errors` | 1 | 1,785 |
+
+So the real additions worth knowing about are `logrus` and `ristretto`, about 13k lines
+between them, reached through Ory's logging and tracing helpers. `gobuffalo/pop` is a
+27-line constants file that `ory/x/logrusx` imports to satisfy pop's logger-level type; no
+ORM, no drivers, no SQL, and no further dependencies.
+
+Accepted, because SPEC §19 and this task both name fosite, because the measured cost is
+modest, and because `govulncheck` does reachability analysis so unreachable code in those
+modules should not become a triage queue. What remains true regardless: the **SBOM required
+by SPEC §17 lists modules, not reachable packages**, so all 43 will appear there. That
+should not be a surprise at release time, and the table above is what to answer with.
+
+Every fosite release from v0.45 onward carries this chain; only v0.44.0 (2023) is clean,
+which is not a sensible pin for a security component.
 
 ### Notes from M1-5
 
