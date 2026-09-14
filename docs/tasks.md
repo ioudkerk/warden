@@ -271,24 +271,44 @@ the chain silently forks into two live tokens that know nothing of each other �
 the exact state reuse detection exists to notice, arrived at without noticing it.
 `TestConcurrentRotationsOfOneTokenElectOneWinner` runs four at once and asserts one winner.
 
-**Revocation is checked before reuse, and the order is a deliberate trade.** Once a family
-is revoked the alarm has been raised; both parties then retry, and checking reuse first
-turned one theft into a stream of identical security events (three, in the first run of the
-exit-condition test). A dead family now answers "invalid" and says nothing more. The cost is
-that a replay arriving after the family was revoked for an unrelated reason — a logout, say
-— goes unreported. That is evidence lost, and it is the lesser loss: the token is already
-useless, while an alert that fires repeatedly per incident is an alert that gets filtered.
+**Every replay is recorded; only the first is an alarm.** The first attempt at this ordered
+revocation ahead of reuse, so that a dead family answered "invalid" and said nothing more.
+That suppressed the event flood and destroyed the signal with it: somebody retrying a stolen
+token for an hour became indistinguishable from an ordinary expired-token refusal. The fix
+is to classify the record rather than discard it. A consumed token presented again always
+revokes the family — idempotent, so it is a no-op UPDATE against one already dead — and
+always writes an audit entry:
+
+| Presentation | Action | Level |
+| --- | --- | --- |
+| Consumed token, family still live | `security.refresh_token_reuse` | error — alert on this |
+| Consumed token, family already revoked | `security.refresh_token_reuse_repeat` | warn — evidence, not news |
+| Revoked but never consumed | none | the legitimate client's collateral token |
+
+An alert keyed on the first action fires once per incident; a query over both shows how hard
+somebody tried. `warden_refresh_token_reuse_total{outcome}` carries the same split, with both
+series pre-seeded so an alert never evaluates against nothing. The session revocation runs on
+repeats too — kill first, classify second, because an earlier attempt may have failed.
+`TestAReplayAgainstADeadFamilyIsStillRecorded` retries five times against a dead family and
+asserts one alarm and five repeats; restoring the old ordering makes it fail with "0 of 5
+retries were recorded".
+
+The third row matters as much as the first two: the token the legitimate client was still
+holding when the family died was never consumed, so it is not evidence of anything, and
+recording it would bury the presentations that are.
 
 **Reuse ends the session too.** Somebody holding a stolen refresh token very probably holds
 the session cookie as well; revoking the family alone would log the thief out of refresh
 while leaving their browser working.
 
-**No grace window, deliberately.** A common mitigation for the double-refresh false positive
-— two tabs refreshing at once — is to let the immediately-previous token be re-presented for
-a few seconds and return the same successor. SPEC §8.3 does not describe one, so there is
-none: a replay kills the family, full stop. The consequence is that a client which retries a
-refresh after a network timeout logs its user out. **This is worth revisiting if it bites**,
-and it is a specification question rather than an implementation one.
+**No grace window — settled, not merely deferred.** A common mitigation for the
+double-refresh false positive is to let the immediately-previous token be re-presented for a
+few seconds and return the same successor. There is none here, and that was raised as an open
+question and then decided: once a token has been rotated it cannot be used, full stop. A
+client that retries a refresh after a network timeout logs its user out, and that is the
+correct trade — the alternative is a window in which a stolen token is honoured, which is
+exactly what reuse detection exists to close. Do not reintroduce one without revisiting
+SPEC §8.3.
 
 **Where the tenant comes from.** A client presents a token and no tenant, the same
 chicken-and-egg that `service_account` and `setup_token` solved by being registered as

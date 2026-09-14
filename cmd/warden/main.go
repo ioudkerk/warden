@@ -333,6 +333,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		IdleLifetime:     cfg.Security.RefreshTokenIdleLifetime,
 		Log:              log,
 		Audit:            audit.NewWriter(),
+		Metrics:          metricSet,
 	})
 	if err != nil {
 		return err

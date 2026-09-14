@@ -164,12 +164,19 @@ func TestReplayingARotatedTokenKillsTheFamily(t *testing.T) {
 		})
 	}
 
-	// The security event M1-5 names, with enough on it to investigate.
-	events := f.securityEvents(t, "security.refresh_token_reuse")
+	// Exactly one alarm, however many times the dead family is presented afterwards.
+	// The subtests above replayed two more consumed tokens; those are recorded under
+	// the repeat action, not this one.
+	events := f.securityEvents(t, authn.ActionRefreshTokenReuse)
 	if len(events) != 1 {
-		t.Fatalf("the audit log holds %d security.refresh_token_reuse events; want exactly 1", len(events))
+		t.Fatalf("the audit log holds %d %s events; want exactly 1 — an alert keyed on this "+
+			"action must fire once per incident, not once per retry",
+			len(events), authn.ActionRefreshTokenReuse)
 	}
 	event := events[0]
+	if already, ok := event["already_revoked"].(bool); !ok || already {
+		t.Fatalf("the first detection is marked already_revoked=%v; it is the alarm", event["already_revoked"])
+	}
 	if event["target_id"] != f.maria {
 		t.Fatalf("the event names %v; want the affected user %s", event["target_id"], f.maria)
 	}
@@ -181,6 +188,92 @@ func TestReplayingARotatedTokenKillsTheFamily(t *testing.T) {
 	}
 	if revoked, ok := event["tokens_revoked"].(float64); !ok || int(revoked) != 3 {
 		t.Fatalf("the event reports %v tokens revoked; the family held 3", event["tokens_revoked"])
+	}
+
+	// And the later presentations are recorded rather than dropped. Somebody hammering
+	// a stolen token must not look like silence.
+	repeats := f.securityEvents(t, authn.ActionRefreshTokenReuseRepeat)
+	if len(repeats) != 2 {
+		t.Fatalf("the audit log holds %d %s events; the two consumed tokens replayed after "+
+			"the family died should each have been recorded",
+			len(repeats), authn.ActionRefreshTokenReuseRepeat)
+	}
+	for _, repeat := range repeats {
+		if already, ok := repeat["already_revoked"].(bool); !ok || !already {
+			t.Fatalf("a repeat is marked already_revoked=%v", repeat["already_revoked"])
+		}
+		if repeat["family_id"] != first.FamilyID {
+			t.Fatalf("a repeat names family %v; want %s", repeat["family_id"], first.FamilyID)
+		}
+	}
+}
+
+// TestAReplayAgainstADeadFamilyIsStillRecorded is the property that ordering revocation
+// ahead of reuse used to destroy: once the family was revoked, further presentations of
+// its consumed tokens were indistinguishable from an ordinary expired-token refusal, so
+// somebody retrying a stolen token for an hour left no trace at all.
+func TestAReplayAgainstADeadFamilyIsStillRecorded(t *testing.T) {
+	ctx := context.Background()
+	f := newRefreshFixture(t)
+
+	first := f.issue(t)
+	if _, err := f.tokens.Rotate(ctx, first.Token, "billing-web"); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	// The first replay: the alarm.
+	if _, err := f.tokens.Rotate(ctx, first.Token, "billing-web"); !errors.Is(err, authn.ErrTokenReuse) {
+		t.Fatalf("first replay returned %v; want ErrTokenReuse", err)
+	}
+
+	// Somebody keeps trying. Every attempt is refused, and every attempt is recorded.
+	const retries = 5
+	for i := 0; i < retries; i++ {
+		if _, err := f.tokens.Rotate(ctx, first.Token, "billing-web"); !errors.Is(err, authn.ErrInvalidRefreshToken) {
+			t.Fatalf("retry %d returned %v; want a refusal", i, err)
+		}
+	}
+
+	if alarms := f.securityEvents(t, authn.ActionRefreshTokenReuse); len(alarms) != 1 {
+		t.Fatalf("%d alarms for one incident; an alert on this action would page per retry", len(alarms))
+	}
+	repeats := f.securityEvents(t, authn.ActionRefreshTokenReuseRepeat)
+	if len(repeats) != retries {
+		t.Fatalf("%d of %d retries were recorded; a stolen token being hammered must not "+
+			"look like silence", len(repeats), retries)
+	}
+}
+
+// TestACollateralTokenIsRefusedQuietly is the other half of the distinction. The token
+// the legitimate client still held when the family died is not evidence of anything,
+// and recording it would bury the presentations that are.
+func TestACollateralTokenIsRefusedQuietly(t *testing.T) {
+	ctx := context.Background()
+	f := newRefreshFixture(t)
+
+	first := f.issue(t)
+	live, err := f.tokens.Rotate(ctx, first.Token, "billing-web")
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if _, replayErr := f.tokens.Rotate(ctx, first.Token, "billing-web"); !errors.Is(replayErr, authn.ErrTokenReuse) {
+		t.Fatalf("replay returned %v; want ErrTokenReuse", replayErr)
+	}
+
+	before := len(f.securityEvents(t, authn.ActionRefreshTokenReuseRepeat))
+
+	// The legitimate client presents the token it was last given. It was never
+	// consumed — it was revoked as collateral.
+	_, collateralErr := f.tokens.Rotate(ctx, live.Token, "billing-web")
+	if !errors.Is(collateralErr, authn.ErrInvalidRefreshToken) {
+		t.Fatalf("the collateral token returned %v; want a refusal", collateralErr)
+	}
+	if errors.Is(collateralErr, authn.ErrTokenReuse) {
+		t.Fatal("the legitimate client's own token was reported as a replay")
+	}
+
+	if after := len(f.securityEvents(t, authn.ActionRefreshTokenReuseRepeat)); after != before {
+		t.Fatalf("presenting a revoked-but-never-consumed token wrote %d security events; "+
+			"it is collateral damage, not evidence", after-before)
 	}
 }
 

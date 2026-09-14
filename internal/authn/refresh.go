@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/audit"
+	"github.com/warden-project/warden/internal/metrics"
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
 )
@@ -71,6 +72,7 @@ type RefreshTokens struct {
 	sessions *Sessions
 	log      *slog.Logger
 	audit    *audit.Writer
+	metrics  *metrics.Metrics
 
 	absoluteLifetime time.Duration
 	idleLifetime     time.Duration
@@ -87,6 +89,9 @@ type RefreshTokenOptions struct {
 	IdleLifetime time.Duration
 	Log          *slog.Logger
 	Audit        *audit.Writer
+	// Metrics is optional. Without it a replay is still logged and audited; what is
+	// lost is the counter an alert would be keyed on.
+	Metrics *metrics.Metrics
 }
 
 // NewRefreshTokens builds the refresh-token store.
@@ -111,7 +116,8 @@ func NewRefreshTokens(tenant, system *store.Store, sessions *Sessions, opts Refr
 		log = slog.Default()
 	}
 	return &RefreshTokens{
-		tenant: tenant, system: system, sessions: sessions, log: log, audit: opts.Audit,
+		tenant: tenant, system: system, sessions: sessions, log: log,
+		audit: opts.Audit, metrics: opts.Metrics,
 		absoluteLifetime: opts.AbsoluteLifetime,
 		idleLifetime:     opts.IdleLifetime,
 		now:              time.Now,
@@ -258,29 +264,27 @@ func (r *RefreshTokens) Rotate(ctx context.Context, presented, clientID string) 
 
 		now := r.now().UTC()
 
-		// Revocation is checked before reuse, and the order matters. Once a family has
-		// been revoked the alarm has already been raised, and every subsequent
-		// presentation of one of its consumed tokens would raise it again — both
-		// parties retry, so a single theft becomes a stream of identical security
-		// events. A dead family answers "invalid" and says nothing more.
+		// A consumed token presented again is evidence, and it is treated as evidence
+		// whether or not the family is already dead. Kill first, classify second: the
+		// revocation below is idempotent, so running it against an already-revoked
+		// family costs one no-op UPDATE and closes the case where some token in the
+		// family somehow escaped an earlier sweep.
 		//
-		// The cost is that a replay arriving after the family was revoked for some
-		// unrelated reason, a logout say, is not reported. That is evidence lost, and
-		// it is the lesser loss: the token is already useless, while an alert that
-		// fires repeatedly per incident is an alert that gets filtered.
-		if row.RevokedAt != nil {
-			return ErrInvalidRefreshToken
-		}
-
-		// Reuse. A consumed token presented again means two parties hold it; which of
-		// them is legitimate is unknowable from here, so the family dies and both start
-		// again.
+		// Checking revocation first — which this did briefly — makes a replay against
+		// a dead family indistinguishable from an ordinary expired-token refusal, and
+		// that is exactly the traffic worth seeing: somebody hammering a stolen token
+		// looks like nothing at all. What must not happen is *alerting* once per
+		// retry, and that is solved by classifying the record rather than by
+		// discarding it. See handleReuse.
 		if row.ConsumedAt != nil {
 			reuse = &reuseEvent{
 				tenantID: row.TenantID, familyID: row.FamilyID,
 				sessionID: row.SessionID, userID: row.UserID,
 				clientID: row.ClientID, tokenID: row.ID,
 				firstConsumedAt: *row.ConsumedAt,
+				// Whether the alarm has already been raised for this family. It
+				// decides how loudly this presentation is reported, not whether it is.
+				alreadyRevoked: row.RevokedAt != nil,
 			}
 			revoked, revokeErr := q.RevokeRefreshTokenFamily(ctx, db.RevokeRefreshTokenFamilyParams{
 				TenantID: row.TenantID, FamilyID: row.FamilyID,
@@ -301,6 +305,12 @@ func (r *RefreshTokens) Rotate(ctx context.Context, presented, clientID string) 
 		}
 
 		switch {
+		case row.RevokedAt != nil:
+			// Revoked but never consumed: this is the token the legitimate client was
+			// still holding when the family died. Collateral damage from someone
+			// else's replay, or from a logout — not evidence of anything, and logging
+			// it as such would bury the presentations that are.
+			return ErrInvalidRefreshToken
 		case !now.Before(row.ExpiresAt):
 			return ErrInvalidRefreshToken
 		case row.SessionRevokedAt != nil:
@@ -382,23 +392,62 @@ type reuseEvent struct {
 	tenantID, familyID, sessionID, userID, clientID, tokenID string
 	firstConsumedAt                                          time.Time
 	revokedCount                                             int64
+	// alreadyRevoked means the family had been revoked before this presentation, so
+	// the alarm has already been raised once and this is a subsequent attempt.
+	alreadyRevoked bool
 }
 
-// handleReuse ends the session and raises the security event.
+// Audit actions for a replayed refresh token.
 //
-// Neither step can fail the caller's request: the family is already revoked, which is
-// the part that had to be atomic. What is left is containment and alerting, and an
+// Two actions rather than one, because alerting and investigation want different
+// things from the same fact. ActionRefreshTokenReuse is the first replay against a live
+// family: a token is in two places at once, and somebody should look now. The repeat
+// action is every presentation after that — the shape of a stolen token being retried,
+// which is worth having in the record and is not worth paging about a second time.
+//
+// An alert keyed on the first action fires once per incident. A query over both shows
+// how hard somebody tried.
+const (
+	ActionRefreshTokenReuse       = "security.refresh_token_reuse"
+	ActionRefreshTokenReuseRepeat = "security.refresh_token_reuse_repeat"
+)
+
+// handleReuse ends the session and records the replay.
+//
+// Nothing here can fail the caller's request: the family is already revoked, which is
+// the part that had to be atomic. What is left is containment and reporting, and an
 // error in either must be loud rather than fatal.
+//
+// Every replay is recorded. Only the first is raised as an alarm.
 func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
-	// Logged at error level whatever else happens. This is the one event in the whole
-	// package that means somebody probably has a credential they should not.
-	r.log.Error("refresh token reuse detected: the family has been revoked",
+	action, outcome := ActionRefreshTokenReuse, "detected"
+	if e.alreadyRevoked {
+		action, outcome = ActionRefreshTokenReuseRepeat, "repeat"
+	}
+	if r.metrics != nil {
+		r.metrics.RefreshTokenReuse.WithLabelValues(outcome).Inc()
+	}
+
+	fields := []any{
 		"tenant_id", e.tenantID, "user_id", e.userID, "session_id", e.sessionID,
 		"family_id", e.familyID, "client_id", e.clientID,
-		"tokens_revoked", e.revokedCount, "first_consumed_at", e.firstConsumedAt)
+		"tokens_revoked", e.revokedCount, "first_consumed_at", e.firstConsumedAt,
+	}
+	if e.alreadyRevoked {
+		// Warn, not error: the incident is already open. Still logged in full, because
+		// "they kept trying for an hour" is the sort of thing that only exists in the
+		// record if somebody wrote it down at the time.
+		r.log.Warn("a consumed refresh token was presented again; the family was already revoked", fields...)
+	} else {
+		// The one event in this package that means somebody probably holds a
+		// credential they should not.
+		r.log.Error("refresh token reuse detected: the family has been revoked", fields...)
+	}
 
-	// Ending the session is containment: a thief who has the refresh token very
-	// probably has the session cookie too.
+	// Ending the session is containment, and it runs on repeats too. It is idempotent,
+	// and "kill first, ask questions second" is the right order for a credential that
+	// is demonstrably in the wrong hands: if an earlier attempt failed to end the
+	// session, this is another chance to.
 	if err := r.sessions.Revoke(ctx, e.tenantID, e.sessionID, "refresh token reuse"); err != nil {
 		r.log.Error("could not end the session of a reused refresh token",
 			"session_id", e.sessionID, "error", err)
@@ -411,9 +460,8 @@ func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
 	}
 	err := r.system.InSystem(ctx, "recording refresh token reuse", func(ctx context.Context, tx pgx.Tx) error {
 		_, appendErr := r.audit.Append(ctx, tx, audit.Entry{
-			TenantID: e.tenantID,
-			// The event name M1-5 names, and the string an operator will grep for.
-			Action:     "security.refresh_token_reuse",
+			TenantID:   e.tenantID,
+			Action:     action,
 			TargetType: targetUser, TargetID: e.userID,
 			Reason: "a refresh token was presented after it had already been used",
 			After: map[string]any{
@@ -423,6 +471,7 @@ func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
 				"token_id":          e.tokenID,
 				"tokens_revoked":    e.revokedCount,
 				"first_consumed_at": e.firstConsumedAt.Format(time.RFC3339Nano),
+				"already_revoked":   e.alreadyRevoked,
 			},
 		})
 		return appendErr

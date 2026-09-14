@@ -57,6 +57,16 @@ type Metrics struct {
 	// Any non-zero value is worth a human looking at the audit log.
 	AssignmentsRefused *prometheus.CounterVec
 
+	// RefreshTokenReuse counts replayed refresh tokens (SPEC §17.1 threat 7).
+	//
+	// Labelled by outcome so that alerting and investigation can want different
+	// things. "detected" is the first replay against a live family and means a token
+	// is in two places at once — alert on it. "repeat" is a later replay against a
+	// family already revoked, which is how somebody hammering a stolen token looks;
+	// it is evidence rather than news, and alerting on it would page once per retry
+	// for an incident already raised.
+	RefreshTokenReuse *prometheus.CounterVec
+
 	// StoreRetries counts transactions PostgreSQL aborted as transient and the store
 	// reissued, by SQLSTATE. A low rate is normal and is the mechanism working. A
 	// rising one is a contention signal — two code paths taking the same rows in
@@ -128,6 +138,13 @@ func New(version string) *Metrics {
 			Help: "Role assignments refused by the privilege-escalation guard, by reason.",
 		}, []string{"reason"}),
 
+		RefreshTokenReuse: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "warden_refresh_token_reuse_total",
+			Help: "Refresh tokens presented after being consumed. outcome=detected is the " +
+				"first replay against a live family; outcome=repeat is a later one against a " +
+				"family already revoked.",
+		}, []string{"outcome"}),
+
 		StoreRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "warden_store_transaction_retries_total",
 			Help: "Transactions reissued after PostgreSQL aborted them as transient, by SQLSTATE.",
@@ -147,6 +164,7 @@ func New(version string) *Metrics {
 	r.MustRegister(
 		m.CheckDuration, m.ChecksTotal, m.ModelLoads, m.DecisionLogRecords,
 		m.HTTPRequests, m.HTTPDuration, m.AuthFailures, m.AssignmentsRefused,
+		m.RefreshTokenReuse,
 		m.StoreRetries, m.StoreRetriesExhausted, m.BuildInfo,
 		// Process and runtime metrics: memory, goroutines, file descriptors. Enough
 		// to answer "is it the database or is it us?" without a second exporter.
@@ -163,6 +181,12 @@ func New(version string) *Metrics {
 	for _, code := range []string{"40001", "40P01"} {
 		m.StoreRetries.WithLabelValues(code)
 		m.StoreRetriesExhausted.WithLabelValues(code)
+	}
+	// Same reasoning for refresh token reuse, and it matters more here: an alert that
+	// silently evaluates against no series is worst on the metric that signals a
+	// stolen credential.
+	for _, outcome := range []string{"detected", "repeat"} {
+		m.RefreshTokenReuse.WithLabelValues(outcome)
 	}
 
 	return m
