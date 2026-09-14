@@ -8,7 +8,39 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/warden-project/warden/internal/store/dbtypes"
 )
+
+const deactivateOAuthSession = `-- name: DeactivateOAuthSession :execrows
+UPDATE oauth_session SET active = false
+ WHERE kind = $1 AND signature_hash = $2 AND active
+`
+
+type DeactivateOAuthSessionParams struct {
+	Kind          string
+	SignatureHash []byte
+}
+
+func (q *Queries) DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deactivateOAuthSession, arg.Kind, arg.SignatureHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteExpiredOAuthSessions = `-- name: DeleteExpiredOAuthSessions :execrows
+DELETE FROM oauth_session WHERE expires_at < $1
+`
+
+func (q *Queries) DeleteExpiredOAuthSessions(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredOAuthSessions, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
 
 const deleteOAuthClient = `-- name: DeleteOAuthClient :execrows
 DELETE FROM oauth_client WHERE tenant_id = $1 AND id = $2
@@ -21,6 +53,59 @@ type DeleteOAuthClientParams struct {
 
 func (q *Queries) DeleteOAuthClient(ctx context.Context, arg DeleteOAuthClientParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteOAuthClient, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteOAuthSession = `-- name: DeleteOAuthSession :execrows
+DELETE FROM oauth_session WHERE kind = $1 AND signature_hash = $2
+`
+
+type DeleteOAuthSessionParams struct {
+	Kind          string
+	SignatureHash []byte
+}
+
+func (q *Queries) DeleteOAuthSession(ctx context.Context, arg DeleteOAuthSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOAuthSession, arg.Kind, arg.SignatureHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteOAuthSessionsByRequest = `-- name: DeleteOAuthSessionsByRequest :execrows
+DELETE FROM oauth_session WHERE tenant_id = $1 AND request_id = $2
+`
+
+type DeleteOAuthSessionsByRequestParams struct {
+	TenantID  string
+	RequestID string
+}
+
+// Everything issued in one exchange. This is what a detected authorization-code replay
+// revokes: fosite hands back the request id and expects every descendant to die.
+func (q *Queries) DeleteOAuthSessionsByRequest(ctx context.Context, arg DeleteOAuthSessionsByRequestParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOAuthSessionsByRequest, arg.TenantID, arg.RequestID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteOAuthSessionsForSession = `-- name: DeleteOAuthSessionsForSession :execrows
+DELETE FROM oauth_session WHERE tenant_id = $1 AND session_id = $2
+`
+
+type DeleteOAuthSessionsForSessionParams struct {
+	TenantID  string
+	SessionID *string
+}
+
+func (q *Queries) DeleteOAuthSessionsForSession(ctx context.Context, arg DeleteOAuthSessionsForSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOAuthSessionsForSession, arg.TenantID, arg.SessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -70,6 +155,113 @@ func (q *Queries) InsertOAuthClient(ctx context.Context, arg InsertOAuthClientPa
 		arg.TokenEndpointAuthMethod,
 		arg.PostLogoutRedirectUris,
 		arg.RequirePkce,
+	)
+	return err
+}
+
+const insertOAuthSession = `-- name: InsertOAuthSession :exec
+
+INSERT INTO oauth_session (signature_hash, kind, tenant_id, request_id, client_id,
+                           subject, session_id, requested_scope, granted_scope,
+                           requested_audience, granted_audience, form, session_data,
+                           requested_at, expires_at)
+VALUES ($1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        $10, $11, $12, $13,
+        $14, $15)
+`
+
+type InsertOAuthSessionParams struct {
+	SignatureHash     []byte
+	Kind              string
+	TenantID          string
+	RequestID         string
+	ClientID          string
+	Subject           string
+	SessionID         *string
+	RequestedScope    []string
+	GrantedScope      []string
+	RequestedAudience []string
+	GrantedAudience   []string
+	Form              dbtypes.JSONMap
+	SessionData       dbtypes.JSONMap
+	RequestedAt       time.Time
+	ExpiresAt         time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// Provider storage (the fosite adapter)
+// ---------------------------------------------------------------------------------
+func (q *Queries) InsertOAuthSession(ctx context.Context, arg InsertOAuthSessionParams) error {
+	_, err := q.db.Exec(ctx, insertOAuthSession,
+		arg.SignatureHash,
+		arg.Kind,
+		arg.TenantID,
+		arg.RequestID,
+		arg.ClientID,
+		arg.Subject,
+		arg.SessionID,
+		arg.RequestedScope,
+		arg.GrantedScope,
+		arg.RequestedAudience,
+		arg.GrantedAudience,
+		arg.Form,
+		arg.SessionData,
+		arg.RequestedAt,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
+const insertProviderRefreshToken = `-- name: InsertProviderRefreshToken :exec
+
+INSERT INTO refresh_token (id, session_id, tenant_id, family_id, token_hash, client_id,
+                           request_id, subject, granted_scope, granted_audience,
+                           form, session_data, issued_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6,
+        $7, $8, $9, $10,
+        $11, $12, $13, $14)
+`
+
+type InsertProviderRefreshTokenParams struct {
+	ID              string
+	SessionID       string
+	TenantID        string
+	FamilyID        string
+	TokenHash       []byte
+	ClientID        string
+	RequestID       *string
+	Subject         string
+	GrantedScope    []string
+	GrantedAudience []string
+	Form            dbtypes.JSONMap
+	SessionData     dbtypes.JSONMap
+	IssuedAt        time.Time
+	ExpiresAt       time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// Refresh tokens, as the provider sees them
+// ---------------------------------------------------------------------------------
+//
+// These read and write refresh_token rather than oauth_session, so that a token has one
+// row carrying both its protocol payload and the family state SPEC §8.3 turns on.
+func (q *Queries) InsertProviderRefreshToken(ctx context.Context, arg InsertProviderRefreshTokenParams) error {
+	_, err := q.db.Exec(ctx, insertProviderRefreshToken,
+		arg.ID,
+		arg.SessionID,
+		arg.TenantID,
+		arg.FamilyID,
+		arg.TokenHash,
+		arg.ClientID,
+		arg.RequestID,
+		arg.Subject,
+		arg.GrantedScope,
+		arg.GrantedAudience,
+		arg.Form,
+		arg.SessionData,
+		arg.IssuedAt,
+		arg.ExpiresAt,
 	)
 	return err
 }
@@ -258,6 +450,152 @@ func (q *Queries) OAuthClientTenant(ctx context.Context, id string) (string, err
 	var tenant_id string
 	err := row.Scan(&tenant_id)
 	return tenant_id, err
+}
+
+const oAuthSessionBySignature = `-- name: OAuthSessionBySignature :one
+SELECT signature_hash, kind, tenant_id, request_id, client_id, subject, session_id,
+       requested_scope, granted_scope, requested_audience, granted_audience,
+       form, session_data, active, requested_at, expires_at
+  FROM oauth_session
+ WHERE kind = $1 AND signature_hash = $2
+`
+
+type OAuthSessionBySignatureParams struct {
+	Kind          string
+	SignatureHash []byte
+}
+
+// Returns the row whether or not it is still active. fosite has to distinguish "never
+// existed" from "already used" — the second is a replayed authorization code and must
+// revoke everything descended from it — so `active` is returned rather than filtered on.
+func (q *Queries) OAuthSessionBySignature(ctx context.Context, arg OAuthSessionBySignatureParams) (OauthSession, error) {
+	row := q.db.QueryRow(ctx, oAuthSessionBySignature, arg.Kind, arg.SignatureHash)
+	var i OauthSession
+	err := row.Scan(
+		&i.SignatureHash,
+		&i.Kind,
+		&i.TenantID,
+		&i.RequestID,
+		&i.ClientID,
+		&i.Subject,
+		&i.SessionID,
+		&i.RequestedScope,
+		&i.GrantedScope,
+		&i.RequestedAudience,
+		&i.GrantedAudience,
+		&i.Form,
+		&i.SessionData,
+		&i.Active,
+		&i.RequestedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const oAuthSessionTenant = `-- name: OAuthSessionTenant :one
+SELECT tenant_id FROM oauth_session WHERE kind = $1 AND signature_hash = $2
+`
+
+type OAuthSessionTenantParams struct {
+	Kind          string
+	SignatureHash []byte
+}
+
+// Resolves an artifact to its tenant. System pool: a signature arrives with no tenant,
+// the same way a client_id and a refresh token do.
+func (q *Queries) OAuthSessionTenant(ctx context.Context, arg OAuthSessionTenantParams) (string, error) {
+	row := q.db.QueryRow(ctx, oAuthSessionTenant, arg.Kind, arg.SignatureHash)
+	var tenant_id string
+	err := row.Scan(&tenant_id)
+	return tenant_id, err
+}
+
+const providerRefreshTokenByHash = `-- name: ProviderRefreshTokenByHash :one
+SELECT rt.id, rt.session_id, rt.tenant_id, rt.family_id, rt.client_id, rt.request_id,
+       rt.subject, rt.granted_scope, rt.granted_audience, rt.form, rt.session_data,
+       rt.issued_at, rt.expires_at, rt.consumed_at, rt.revoked_at
+  FROM refresh_token rt
+ WHERE rt.tenant_id = $1 AND rt.token_hash = $2
+`
+
+type ProviderRefreshTokenByHashParams struct {
+	TenantID  string
+	TokenHash []byte
+}
+
+type ProviderRefreshTokenByHashRow struct {
+	ID              string
+	SessionID       string
+	TenantID        string
+	FamilyID        string
+	ClientID        string
+	RequestID       *string
+	Subject         string
+	GrantedScope    []string
+	GrantedAudience []string
+	Form            dbtypes.JSONMap
+	SessionData     dbtypes.JSONMap
+	IssuedAt        time.Time
+	ExpiresAt       time.Time
+	ConsumedAt      *time.Time
+	RevokedAt       *time.Time
+}
+
+func (q *Queries) ProviderRefreshTokenByHash(ctx context.Context, arg ProviderRefreshTokenByHashParams) (ProviderRefreshTokenByHashRow, error) {
+	row := q.db.QueryRow(ctx, providerRefreshTokenByHash, arg.TenantID, arg.TokenHash)
+	var i ProviderRefreshTokenByHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.TenantID,
+		&i.FamilyID,
+		&i.ClientID,
+		&i.RequestID,
+		&i.Subject,
+		&i.GrantedScope,
+		&i.GrantedAudience,
+		&i.Form,
+		&i.SessionData,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const refreshTokenFamilyByRequest = `-- name: RefreshTokenFamilyByRequest :one
+SELECT tenant_id, family_id, session_id, client_id, subject
+  FROM refresh_token
+ WHERE tenant_id = $1 AND request_id = $2
+ ORDER BY issued_at DESC
+ LIMIT 1
+`
+
+type RefreshTokenFamilyByRequestParams struct {
+	TenantID  string
+	RequestID *string
+}
+
+type RefreshTokenFamilyByRequestRow struct {
+	TenantID  string
+	FamilyID  string
+	SessionID string
+	ClientID  string
+	Subject   string
+}
+
+func (q *Queries) RefreshTokenFamilyByRequest(ctx context.Context, arg RefreshTokenFamilyByRequestParams) (RefreshTokenFamilyByRequestRow, error) {
+	row := q.db.QueryRow(ctx, refreshTokenFamilyByRequest, arg.TenantID, arg.RequestID)
+	var i RefreshTokenFamilyByRequestRow
+	err := row.Scan(
+		&i.TenantID,
+		&i.FamilyID,
+		&i.SessionID,
+		&i.ClientID,
+		&i.Subject,
+	)
+	return i, err
 }
 
 const setOAuthClientDisabled = `-- name: SetOAuthClientDisabled :execrows

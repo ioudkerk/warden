@@ -287,6 +287,10 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			{`INSERT INTO oauth_client (id, tenant_id, key, name, redirect_uris)
 			  VALUES ($1, $2, $3, $4, '{https://app.example.test/callback}')`,
 				[]any{"oac_" + suffix, tn, "client-" + suffix, "Client " + suffix}},
+			{`INSERT INTO oauth_session (signature_hash, kind, tenant_id, request_id,
+			                             client_id, subject, expires_at)
+			  VALUES (sha256($1::bytea), 'access_token', $2, $3, $4, $5, now() + interval '1 hour')`,
+				[]any{[]byte("sig-" + suffix), tn, "req_" + suffix, "oac_" + suffix, "usr_" + suffix}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -777,8 +781,8 @@ func TestTenantListIsStable(t *testing.T) {
 	want := []string{
 		"app_enrollment", "app_user", "credential", "decision_event", "denial",
 		"grant_", "group_", "group_member", "identity", "idp_connection",
-		"oauth_client", "refresh_token", "resource_node", "role", "role_inheritance",
-		"role_permission", "session", "tenant", "ui_binding",
+		"oauth_client", "oauth_session", "refresh_token", "resource_node", "role",
+		"role_inheritance", "role_permission", "session", "tenant", "ui_binding",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {

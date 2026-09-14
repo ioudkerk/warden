@@ -247,7 +247,7 @@ library, with no Warden-specific client code.
 | M1-3 | **Deferred, not skipped — take with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle. **Blocked:** none of those endpoints exist yet — login is M1-6, reset and invite are M1-9 — so the test that defines "done" cannot be written. The core (counter, backoff, per-account cap) is HTTP-independent and could land earlier; what must not happen is M1-6 shipping a login endpoint with no brute-force protection, because M1-2 closed the account-existence oracle but nothing yet throttles online guessing |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | **In progress (1 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry, with "absent not disabled" enforced by schema constraint. **Remaining:** the fosite storage adapter and provider; authorize + login + token (with **M1-3** folded in); then userinfo, introspect, revoke, logout, PAR, device |
+| M1-6 [B] | **In progress (2 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry, with "absent not disabled" enforced by schema constraint; the fosite storage adapter, the composed provider and the discovery document. **Remaining:** authorize + login + token (with **M1-3** folded in); then userinfo, introspect, revoke, logout, PAR, device |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
@@ -324,6 +324,57 @@ should not be a surprise at release time, and the table above is what to answer 
 
 Every fosite release from v0.45 onward carries this chain; only v0.44.0 (2023) is clean,
 which is not a sensible pin for a security component.
+
+### Notes from M1-6, part 2
+
+**"Absent, not disabled" now holds at both ends.** The schema makes a client that *asks*
+for the implicit or resource-owner-password grant unrepresentable; the provider composes
+no handler that could serve one. fosite dispatches on the handlers it was given, so a
+grant with no handler is refused by the provider itself rather than by a flag.
+`TestTheProviderComposesNoForbiddenGrant` presents both at the token endpoint and asserts
+they are not merely rejected but unrecognised.
+
+**Refresh tokens are not stored twice.** fosite manages refresh tokens itself, and letting
+it would have produced rotation *without* family revocation — the half that actually
+defends against a stolen token. Instead fosite's `RefreshTokenStorage` is implemented
+against M1-5's `refresh_token` table: `GetRefreshTokenSession` returns
+`fosite.ErrInactiveToken` for a consumed token, which is the signal fosite's refresh
+handler tests for, and the revocation hooks delegate to `authn.RefreshTokens.RevokeFamily`
+so the family dies and `security.refresh_token_reuse` is raised exactly as before. One row
+per token carries both the protocol payload and the family state, so the two cannot
+disagree about whether a token has been used.
+
+Everything else — codes, access tokens, PKCE challenges, OIDC sessions, PAR, client
+assertion identifiers — shares one `oauth_session` table, because they are the same shape:
+a serialized request keyed by a signature, with a lifetime. Signatures are hashed before
+storage, on the same principle as every other credential: a copy of the database is not a
+working set of tokens.
+
+**An authorization code is deactivated, never deleted.** fosite has to distinguish "never
+existed" from "already used" — the second is a replay that must revoke the whole exchange —
+and a deleted row answers the first when the truth is the second. Same reasoning as
+refresh tokens, and the storage returns the request *alongside*
+`ErrInvalidatedAuthorizeCode` so fosite can revoke what descended from it.
+
+**The provider's HMAC secret is derived from the KEK.** It keys every code and token
+signature, so it has to be identical on every replica and stable across restarts; an
+operator asked to generate and distribute one more secret eventually will not.
+`secrets.Keyring.Derive` is HKDF with a purpose string, so the value fosite holds is not
+the key that opens the signing keys, and two purposes cannot collide.
+
+**A test that looked like a finding and was not.** The first PKCE tests asserted against
+`NewAuthorizeRequest` and failed, which read like missing enforcement. fosite runs the
+PKCE handler in `NewAuthorizeResponse`, where the code is minted — the enforcement was
+never absent, the test was probing the wrong stage. Worth recording because the failure
+mode is convincing: a test at the wrong layer reports a security hole that is not there,
+and the temptation is to "fix" the implementation.
+
+**A real bug the same tests found.** `request.GetRequestedAudience()` returns nil when
+unset, and a nil slice reaches Postgres as NULL rather than the column's empty-array
+default — so storing an authorization code failed with a not-null violation, which fosite
+reported as `server_error` and which *masked* the PKCE check entirely. This is the second
+appearance of the same class (the client registry had it too), and both are now normalised
+at the boundary.
 
 ### Notes from M1-5
 

@@ -53,3 +53,79 @@ UPDATE oauth_client SET disabled_at = @disabled_at
 
 -- name: DeleteOAuthClient :execrows
 DELETE FROM oauth_client WHERE tenant_id = @tenant_id AND id = @id;
+
+-- ---------------------------------------------------------------------------------
+-- Provider storage (the fosite adapter)
+-- ---------------------------------------------------------------------------------
+
+-- name: InsertOAuthSession :exec
+INSERT INTO oauth_session (signature_hash, kind, tenant_id, request_id, client_id,
+                           subject, session_id, requested_scope, granted_scope,
+                           requested_audience, granted_audience, form, session_data,
+                           requested_at, expires_at)
+VALUES (@signature_hash, @kind, @tenant_id, @request_id, @client_id,
+        @subject, @session_id, @requested_scope, @granted_scope,
+        @requested_audience, @granted_audience, @form, @session_data,
+        @requested_at, @expires_at);
+
+-- Returns the row whether or not it is still active. fosite has to distinguish "never
+-- existed" from "already used" — the second is a replayed authorization code and must
+-- revoke everything descended from it — so `active` is returned rather than filtered on.
+-- name: OAuthSessionBySignature :one
+SELECT signature_hash, kind, tenant_id, request_id, client_id, subject, session_id,
+       requested_scope, granted_scope, requested_audience, granted_audience,
+       form, session_data, active, requested_at, expires_at
+  FROM oauth_session
+ WHERE kind = @kind AND signature_hash = @signature_hash;
+
+-- Resolves an artifact to its tenant. System pool: a signature arrives with no tenant,
+-- the same way a client_id and a refresh token do.
+-- name: OAuthSessionTenant :one
+SELECT tenant_id FROM oauth_session WHERE kind = @kind AND signature_hash = @signature_hash;
+
+-- name: DeactivateOAuthSession :execrows
+UPDATE oauth_session SET active = false
+ WHERE kind = @kind AND signature_hash = @signature_hash AND active;
+
+-- name: DeleteOAuthSession :execrows
+DELETE FROM oauth_session WHERE kind = @kind AND signature_hash = @signature_hash;
+
+-- Everything issued in one exchange. This is what a detected authorization-code replay
+-- revokes: fosite hands back the request id and expects every descendant to die.
+-- name: DeleteOAuthSessionsByRequest :execrows
+DELETE FROM oauth_session WHERE tenant_id = @tenant_id AND request_id = @request_id;
+
+-- name: DeleteOAuthSessionsForSession :execrows
+DELETE FROM oauth_session WHERE tenant_id = @tenant_id AND session_id = @session_id;
+
+-- name: DeleteExpiredOAuthSessions :execrows
+DELETE FROM oauth_session WHERE expires_at < @before;
+
+-- ---------------------------------------------------------------------------------
+-- Refresh tokens, as the provider sees them
+-- ---------------------------------------------------------------------------------
+--
+-- These read and write refresh_token rather than oauth_session, so that a token has one
+-- row carrying both its protocol payload and the family state SPEC §8.3 turns on.
+
+-- name: InsertProviderRefreshToken :exec
+INSERT INTO refresh_token (id, session_id, tenant_id, family_id, token_hash, client_id,
+                           request_id, subject, granted_scope, granted_audience,
+                           form, session_data, issued_at, expires_at)
+VALUES (@id, @session_id, @tenant_id, @family_id, @token_hash, @client_id,
+        @request_id, @subject, @granted_scope, @granted_audience,
+        @form, @session_data, @issued_at, @expires_at);
+
+-- name: ProviderRefreshTokenByHash :one
+SELECT rt.id, rt.session_id, rt.tenant_id, rt.family_id, rt.client_id, rt.request_id,
+       rt.subject, rt.granted_scope, rt.granted_audience, rt.form, rt.session_data,
+       rt.issued_at, rt.expires_at, rt.consumed_at, rt.revoked_at
+  FROM refresh_token rt
+ WHERE rt.tenant_id = @tenant_id AND rt.token_hash = @token_hash;
+
+-- name: RefreshTokenFamilyByRequest :one
+SELECT tenant_id, family_id, session_id, client_id, subject
+  FROM refresh_token
+ WHERE tenant_id = @tenant_id AND request_id = @request_id
+ ORDER BY issued_at DESC
+ LIMIT 1;

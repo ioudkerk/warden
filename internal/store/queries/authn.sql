@@ -242,3 +242,12 @@ SELECT count(*) FROM refresh_token
 
 -- name: DeleteExpiredRefreshTokens :execrows
 DELETE FROM refresh_token WHERE expires_at < @before;
+
+-- One member of a family, for the security event a revocation raises: it needs the
+-- session and the subject, and every member carries the same ones.
+-- name: RefreshTokenFamilyMember :one
+SELECT id, session_id, client_id, subject
+  FROM refresh_token
+ WHERE tenant_id = @tenant_id AND family_id = @family_id
+ ORDER BY issued_at
+ LIMIT 1;

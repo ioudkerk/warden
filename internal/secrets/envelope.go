@@ -4,10 +4,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 // Envelope encryption, per SPEC §17 ("Envelope encryption (AES-256-GCM) with a KEK
@@ -92,6 +95,39 @@ func (k *Keyring) KeyIDs() []string {
 		}
 	}
 	return ids
+}
+
+// Derive produces a deterministic subkey from the active KEK.
+//
+// HKDF, with the purpose string as the info parameter, so that two callers asking for
+// different purposes cannot receive the same bytes — and so that neither receives the
+// KEK itself. A leaked subkey does not compromise what the KEK protects.
+//
+// It exists for secrets that must be identical on every replica and stable across
+// restarts but are not worth asking an operator to generate and distribute. The OpenID
+// Provider's HMAC secret is the first: it keys the signatures of every authorization
+// code and token, so a per-replica value would make a code issued by one process
+// unredeemable at another. Deriving from the KEK adds no new failure mode, because a
+// deployment that has lost the KEK has already lost the signing keys.
+//
+// The purpose must be a stable string. Changing it changes the key, and for the
+// provider's HMAC that invalidates every outstanding code and token.
+func (k *Keyring) Derive(purpose string, length int) ([]byte, error) {
+	switch {
+	case k == nil || k.active.IsZero():
+		return nil, errors.New("deriving a subkey requires an active key")
+	case purpose == "":
+		return nil, errors.New("deriving a subkey requires a purpose, so that two uses cannot collide")
+	case length <= 0 || length > 64:
+		return nil, fmt.Errorf("a derived subkey of %d bytes is not sensible; want 1 to 64", length)
+	}
+
+	out := make([]byte, length)
+	reader := hkdf.New(sha256.New, k.active.Bytes(), nil, []byte(purpose))
+	if _, err := io.ReadFull(reader, out); err != nil {
+		return nil, fmt.Errorf("deriving a subkey: %w", err)
+	}
+	return out, nil
 }
 
 // Encrypt seals plaintext under a fresh DEK wrapped by the active KEK. The aad is

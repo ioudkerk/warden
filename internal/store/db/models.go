@@ -232,6 +232,27 @@ type OauthClient struct {
 	UpdatedAt               time.Time
 }
 
+// Short-lived OpenID Provider artifacts (SPEC §7.7). Refresh tokens are NOT here; they live in refresh_token, which carries the family rotation of SPEC §8.3.
+type OauthSession struct {
+	SignatureHash     []byte
+	Kind              string
+	TenantID          string
+	RequestID         string
+	ClientID          string
+	Subject           string
+	SessionID         *string
+	RequestedScope    []string
+	GrantedScope      []string
+	RequestedAudience []string
+	GrantedAudience   []string
+	Form              dbtypes.JSONMap
+	SessionData       dbtypes.JSONMap
+	// False once an authorization code has been exchanged. Deactivated rather than deleted so that a replayed code is distinguishable from an unknown one.
+	Active      bool
+	RequestedAt time.Time
+	ExpiresAt   time.Time
+}
+
 // The atom of authorization: app.resource:action. Materialized from resource_type × action at sync time (SPEC §9.2).
 type Permission struct {
 	ID             string
@@ -253,6 +274,13 @@ type RefreshToken struct {
 	ExpiresAt  time.Time
 	ConsumedAt *time.Time
 	RevokedAt  *time.Time
+	// fosite's request id, tying this token to the exchange that produced it. Null for tokens issued through the internal API rather than the token endpoint.
+	RequestID       *string
+	Subject         string
+	GrantedScope    []string
+	GrantedAudience []string
+	Form            dbtypes.JSONMap
+	SessionData     dbtypes.JSONMap
 }
 
 type ResourceNode struct {

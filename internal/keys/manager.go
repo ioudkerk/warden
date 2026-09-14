@@ -73,7 +73,11 @@ type cachedSigner struct {
 	kid       string
 	algorithm string
 	signer    jose.Signer
-	loadedAt  time.Time
+	// private is the parsed key itself, for callers that sign with something other
+	// than this package's Sign — the OpenID Provider hands it to fosite, which has its
+	// own JWT machinery.
+	private  crypto.PrivateKey
+	loadedAt time.Time
 }
 
 type cachedJWKS struct {
@@ -191,7 +195,10 @@ func (m *Manager) activeSigner(ctx context.Context) (*cachedSigner, error) {
 	if err != nil {
 		return nil, err
 	}
-	loaded := &cachedSigner{kid: kid, algorithm: algorithm, signer: signer, loadedAt: m.now()}
+	loaded := &cachedSigner{
+		kid: kid, algorithm: algorithm, signer: signer,
+		private: priv, loadedAt: m.now(),
+	}
 
 	m.mu.Lock()
 	m.signer = loaded
@@ -213,6 +220,30 @@ func newJOSESigner(algorithm, kid string, priv crypto.PrivateKey) (jose.Signer, 
 		jose.SigningKey{Algorithm: alg, Key: jose.JSONWebKey{Key: priv, KeyID: kid, Algorithm: algorithm}},
 		(&jose.SignerOptions{}).WithType("JWT"),
 	)
+}
+
+// SigningKey returns the active private key as a JSON Web Key, for callers with their
+// own JWT machinery.
+//
+// A JWK rather than the bare key, because it carries the `kid`. The OpenID Provider
+// hands this to fosite, and fosite puts the key id straight into the id-token header —
+// so a relying party can select the right key from JWKS without Warden having to
+// remember to set the header itself. Getting that wrong is invisible until the first
+// rotation, at which point every id token stops verifying.
+//
+// It follows the same cache as Sign, so a rotation is picked up within the cache TTL
+// without restarting the process.
+func (m *Manager) SigningKey(ctx context.Context) (any, error) {
+	s, err := m.activeSigner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &jose.JSONWebKey{
+		Key:       s.private,
+		KeyID:     s.kid,
+		Algorithm: s.algorithm,
+		Use:       "sig",
+	}, nil
 }
 
 // ---------------------------------------------------------------------------------

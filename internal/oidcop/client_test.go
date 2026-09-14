@@ -3,6 +3,8 @@ package oidcop_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,7 +15,9 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/authn"
+	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/oidcop"
 	"github.com/warden-project/warden/internal/provision"
 	"github.com/warden-project/warden/internal/secrets"
@@ -23,9 +27,11 @@ import (
 const dsnEnv = "WARDEN_TEST_DATABASE_URL"
 
 type fixture struct {
-	clients *oidcop.Clients
-	acme    string
-	rival   string
+	clients    *oidcop.Clients
+	tenantPool *store.Store
+	system     *store.Store
+	acme       string
+	rival      string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -124,7 +130,10 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("NewClients: %v", err)
 	}
-	return &fixture{clients: clients, acme: acme, rival: rival}
+	return &fixture{
+		clients: clients, tenantPool: tenantPool, system: system,
+		acme: acme, rival: rival,
+	}
 }
 
 func TestRegisteringAPublicClient(t *testing.T) {
@@ -501,4 +510,144 @@ func TestAnEmptyAudienceMeansTheClientItself(t *testing.T) {
 	if len(audience) != 1 || audience[0] != client.ID {
 		t.Fatalf("audience is %v; an unconfigured audience must mean this client alone", audience)
 	}
+}
+
+// --- the provider fixture -----------------------------------------------------------
+
+// providerFixture is the client registry plus a fully composed provider, which needs
+// the session store, the refresh-token store and a signing key behind it.
+type providerFixture struct {
+	*fixture
+	provider *oidcop.Provider
+	storage  *oidcop.Storage
+	// session is a live Warden session. Every token the provider issues hangs off one:
+	// refresh_token's foreign key says so, and "log out everywhere" walks it.
+	session *authn.Session
+	user    string
+}
+
+func testKeyring(t *testing.T) *secrets.Keyring {
+	t.Helper()
+	material := make([]byte, secrets.KEKSize)
+	for i := range material {
+		material[i] = byte(i * 5)
+	}
+	kek, err := secrets.NewKEKFromBytes(material)
+	if err != nil {
+		t.Fatalf("NewKEKFromBytes: %v", err)
+	}
+	kr, err := secrets.NewKeyring(kek)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	return kr
+}
+
+// keyringMaterial returns the raw KEK, so a test can assert a derived secret is not it.
+func keyringMaterial(t *testing.T, _ *secrets.Keyring) []byte {
+	t.Helper()
+	material := make([]byte, secrets.KEKSize)
+	for i := range material {
+		material[i] = byte(i * 5)
+	}
+	return material
+}
+
+func newProviderFixture(t *testing.T) *providerFixture {
+	t.Helper()
+	f := newFixture(t)
+	ctx := context.Background()
+
+	keyring := testKeyring(t)
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvDevelopment
+	cfg.Issuer = "https://warden.example.com"
+	// ES256: the provider tests care about composition and policy, not key size, and an
+	// RSA keygen per fixture is a visible cost.
+	cfg.Security.TokenSigningAlgorithm = keys.ES256
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	km, err := keys.NewManager(f.system, keyring, cfg, log)
+	if err != nil {
+		t.Fatalf("key manager: %v", err)
+	}
+	km.SetCacheTTL(0)
+	if _, rotateErr := km.Rotate(ctx, true); rotateErr != nil {
+		t.Fatalf("creating a signing key: %v", rotateErr)
+	}
+
+	inProcess := config.Defaults()
+	inProcess.Environment = config.EnvDevelopment
+	inProcess.Cache.Backend = config.CacheInProcess
+	cacheClient, err := cache.Open(ctx, inProcess)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	t.Cleanup(func() { _ = cacheClient.Close() }) //nolint:errcheck // teardown
+
+	sessions, err := authn.NewSessions(f.tenantPool, f.system, cacheClient, authn.SessionOptions{
+		AbsoluteLifetime: 30 * 24 * time.Hour,
+		IdleTimeout:      7 * 24 * time.Hour,
+		Log:              log,
+	})
+	if err != nil {
+		t.Fatalf("sessions: %v", err)
+	}
+	refresh, err := authn.NewRefreshTokens(f.tenantPool, f.system, sessions, authn.RefreshTokenOptions{
+		AbsoluteLifetime: 30 * 24 * time.Hour,
+		IdleLifetime:     7 * 24 * time.Hour,
+		Log:              log,
+	})
+	if err != nil {
+		t.Fatalf("refresh tokens: %v", err)
+	}
+
+	storage, err := oidcop.NewStorage(f.tenantPool, f.system, f.clients, oidcop.StorageOptions{
+		Refresh: refresh, Sessions: sessions, Log: log,
+	})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+
+	opts, err := oidcop.ProviderOptionsFrom(cfg, km, keyring, log)
+	if err != nil {
+		t.Fatalf("provider options: %v", err)
+	}
+	provider, err := oidcop.NewProvider(storage, opts)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+
+	p, err := provision.New(f.system)
+	if err != nil {
+		t.Fatalf("provisioner: %v", err)
+	}
+	user, err := p.CreateUser(ctx, "acme", "maria@acme.test", nil)
+	if err != nil {
+		t.Fatalf("creating a user: %v", err)
+	}
+	session, err := sessions.Create(ctx, f.acme, user, []string{"pwd"}, "", "test")
+	if err != nil {
+		t.Fatalf("creating a session: %v", err)
+	}
+
+	return &providerFixture{
+		fixture: f, provider: provider, storage: storage,
+		session: session, user: user,
+	}
+}
+
+// confidentialClient registers a client that can hold a secret, which is the only kind
+// that could otherwise skip PKCE or use client authentication.
+func (f *providerFixture) confidentialClient(t *testing.T) (*oidcop.Client, string) {
+	t.Helper()
+	client, secret, err := f.clients.Register(context.Background(), oidcop.NewClientOptions{
+		TenantID: f.acme, Key: "provider-test", Name: "Provider test",
+		RedirectURIs: []string{"https://app.acme.test/callback"},
+	})
+	if err != nil {
+		t.Fatalf("registering a client: %v", err)
+	}
+	return client, secret
 }

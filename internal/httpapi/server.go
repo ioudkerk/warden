@@ -21,6 +21,7 @@ import (
 	"github.com/warden-project/warden/internal/decisionlog"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
+	"github.com/warden-project/warden/internal/oidcop"
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
 )
@@ -45,6 +46,7 @@ type Server struct {
 	tracer    trace.Tracer
 	keys      *keys.Manager
 	sessions  *authn.Sessions
+	provider  *oidcop.Provider
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
@@ -80,6 +82,9 @@ type Deps struct {
 	// though the routes are registered either way so that a misconfigured deployment
 	// answers 503 with a reason rather than 404, which would look like a version skew.
 	Sessions *authn.Sessions
+
+	// Provider is the OpenID Provider (SPEC §7.7). Optional on the same terms.
+	Provider *oidcop.Provider
 }
 
 // New builds the server.
@@ -97,7 +102,7 @@ func New(d Deps) (*Server, error) {
 		cfg: d.Config, log: d.Log, engine: engine,
 		tenant: d.Tenant, system: d.System, decisions: d.Decisions,
 		metrics: d.Metrics, cache: d.Cache, tracer: tracerOf(d.Tracing),
-		keys: d.Keys, sessions: d.Sessions,
+		keys: d.Keys, sessions: d.Sessions, provider: d.Provider,
 	}, nil
 }
 
@@ -181,6 +186,11 @@ func (s *Server) Handler() http.Handler {
 	if s.keys != nil {
 		mux.HandleFunc("GET /.well-known/jwks.json", s.handleJWKS)
 	}
+
+	// Discovery is unauthenticated for the same reason JWKS is: it is what a client
+	// holding nothing reads in order to find everything else.
+	mux.HandleFunc("GET /.well-known/openid-configuration",
+		s.requireProvider(s.handleOpenIDConfiguration))
 
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))

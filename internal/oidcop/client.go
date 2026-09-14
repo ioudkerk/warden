@@ -39,6 +39,14 @@ const (
 	ResponseTypeCode = "code"
 )
 
+// Signing algorithms, matching internal/keys. SPEC §8.2 makes RS256 the default and
+// ES256 selectable; symmetric algorithms are deliberately absent, because a relying
+// party must be able to verify without holding anything that could mint.
+const (
+	AlgRS256 = "RS256"
+	AlgES256 = "ES256"
+)
+
 // Token endpoint authentication methods.
 const (
 	AuthMethodNone              = "none"
@@ -131,11 +139,11 @@ func (c *Client) GetJSONWebKeys() *jose.JSONWebKeySet { return nil }
 func (c *Client) GetJSONWebKeysURI() string { return "" }
 
 // GetRequestObjectSigningAlgorithm pins the algorithm for signed request objects.
-func (c *Client) GetRequestObjectSigningAlgorithm() string { return "RS256" }
+func (c *Client) GetRequestObjectSigningAlgorithm() string { return AlgRS256 }
 
 func (c *Client) GetTokenEndpointAuthMethod() string { return c.TokenEndpointAuthMethod }
 
-func (c *Client) GetTokenEndpointAuthSigningAlgorithm() string { return "RS256" }
+func (c *Client) GetTokenEndpointAuthSigningAlgorithm() string { return AlgRS256 }
 
 // --- registry ----------------------------------------------------------------------
 

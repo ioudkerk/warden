@@ -391,6 +391,40 @@ func (q *Queries) RefreshTokenByHash(ctx context.Context, tokenHash []byte) (Ref
 	return i, err
 }
 
+const refreshTokenFamilyMember = `-- name: RefreshTokenFamilyMember :one
+SELECT id, session_id, client_id, subject
+  FROM refresh_token
+ WHERE tenant_id = $1 AND family_id = $2
+ ORDER BY issued_at
+ LIMIT 1
+`
+
+type RefreshTokenFamilyMemberParams struct {
+	TenantID string
+	FamilyID string
+}
+
+type RefreshTokenFamilyMemberRow struct {
+	ID        string
+	SessionID string
+	ClientID  string
+	Subject   string
+}
+
+// One member of a family, for the security event a revocation raises: it needs the
+// session and the subject, and every member carries the same ones.
+func (q *Queries) RefreshTokenFamilyMember(ctx context.Context, arg RefreshTokenFamilyMemberParams) (RefreshTokenFamilyMemberRow, error) {
+	row := q.db.QueryRow(ctx, refreshTokenFamilyMember, arg.TenantID, arg.FamilyID)
+	var i RefreshTokenFamilyMemberRow
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.ClientID,
+		&i.Subject,
+	)
+	return i, err
+}
+
 const refreshTokenTenantByHash = `-- name: RefreshTokenTenantByHash :one
 SELECT tenant_id FROM refresh_token WHERE token_hash = $1
 `

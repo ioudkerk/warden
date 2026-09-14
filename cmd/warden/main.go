@@ -22,6 +22,7 @@ import (
 	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
+	"github.com/warden-project/warden/internal/oidcop"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 )
@@ -345,11 +346,38 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		go authn.RunPurge(ctx, sessions, refreshTokens, log)
 	}
 
+	// The OpenID Provider. It needs the client registry, the storage adapter over both
+	// pools, the refresh-token store (so a replayed token still revokes its family) and
+	// the signing keys.
+	var provider *oidcop.Provider
+	if system != nil && keyManager != nil {
+		clients, clientErr := oidcop.NewClients(db, system, authn.DefaultParams())
+		if clientErr != nil {
+			return clientErr
+		}
+		providerStorage, storageErr := oidcop.NewStorage(db, system, clients, oidcop.StorageOptions{
+			Refresh: refreshTokens, Sessions: sessions, Log: log,
+		})
+		if storageErr != nil {
+			return storageErr
+		}
+		providerOpts, optErr := oidcop.ProviderOptionsFrom(cfg, keyManager, keyring, log)
+		if optErr != nil {
+			return optErr
+		}
+		if provider, err = oidcop.NewProvider(providerStorage, providerOpts); err != nil {
+			return err
+		}
+		log.Info("OpenID Provider ready", "issuer", cfg.Issuer)
+	} else if cfg.HasRole(config.RoleAuth) {
+		log.Warn("no OpenID Provider: it needs database.system_url and a signing key")
+	}
+
 	server, err := httpapi.New(httpapi.Deps{
 		Config: cfg, Log: log,
 		Tenant: db, System: system,
 		Decisions: decisions, Metrics: metricSet, Cache: cacheClient, Tracing: tracing,
-		Keys: keyManager, Sessions: sessions,
+		Keys: keyManager, Sessions: sessions, Provider: provider,
 	})
 	if err != nil {
 		return err

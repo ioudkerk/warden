@@ -481,6 +481,54 @@ func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
 	}
 }
 
+// RevokeFamily revokes a whole chain and reports it, for a caller that has already
+// detected the replay itself.
+//
+// The OpenID Provider is that caller: fosite does its own reuse detection — storage
+// returns ErrInactiveToken and fosite's refresh handler asks for the exchange to be
+// revoked — and this is where that lands, so there is one implementation of what a
+// detected reuse means rather than two that can drift apart.
+func (r *RefreshTokens) RevokeFamily(ctx context.Context, tenantID, familyID, reason string) error {
+	var (
+		revoked int64
+		sample  db.RefreshTokenFamilyMemberRow
+	)
+	err := r.tenant.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
+		q := db.New(tx)
+		// Read a member before revoking, for the session and subject the event names.
+		member, memberErr := q.RefreshTokenFamilyMember(ctx, db.RefreshTokenFamilyMemberParams{
+			TenantID: tenantID, FamilyID: familyID,
+		})
+		if memberErr != nil {
+			return memberErr
+		}
+		sample = member
+
+		var revokeErr error
+		revoked, revokeErr = q.RevokeRefreshTokenFamily(ctx, db.RevokeRefreshTokenFamilyParams{
+			TenantID: tenantID, FamilyID: familyID,
+		})
+		return revokeErr
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Nothing to revoke. Not an error: the family may already have been swept.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	r.handleReuse(ctx, &reuseEvent{
+		tenantID: tenantID, familyID: familyID,
+		sessionID: sample.SessionID, userID: sample.Subject,
+		clientID: sample.ClientID, tokenID: sample.ID,
+		revokedCount: revoked,
+		// The alarm, not a repeat: the caller detected this replay just now.
+	})
+	_ = reason
+	return nil
+}
+
 // RevokeForSession kills every refresh token belonging to a session.
 //
 // This is what a logout has to call, and what session revocation has to call: a

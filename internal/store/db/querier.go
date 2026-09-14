@@ -59,13 +59,20 @@ type Querier interface {
 	// settles rather than one the application hopes not to lose.
 	ConsumeSetupToken(ctx context.Context, id string) (int64, error)
 	CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error)
+	DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
+	DeleteExpiredOAuthSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteExpiredRefreshTokens(ctx context.Context, before time.Time) (int64, error)
 	// Sessions whose absolute lifetime has passed are of no further interest to anyone;
 	// the row is kept only long enough for the UI to be honest about recent activity.
 	DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteGrant(ctx context.Context, arg DeleteGrantParams) error
 	DeleteOAuthClient(ctx context.Context, arg DeleteOAuthClientParams) (int64, error)
+	DeleteOAuthSession(ctx context.Context, arg DeleteOAuthSessionParams) (int64, error)
+	// Everything issued in one exchange. This is what a detected authorization-code replay
+	// revokes: fosite hands back the request id and expects every descendant to die.
+	DeleteOAuthSessionsByRequest(ctx context.Context, arg DeleteOAuthSessionsByRequestParams) (int64, error)
+	DeleteOAuthSessionsForSession(ctx context.Context, arg DeleteOAuthSessionsForSessionParams) (int64, error)
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
 	DeleteRolePermissions(ctx context.Context, roleID string) error
 	DeprecateUIElement(ctx context.Context, arg DeprecateUIElementParams) error
@@ -82,7 +89,18 @@ type Querier interface {
 	// ---------------------------------------------------------------------------------
 	InsertGrant(ctx context.Context, arg InsertGrantParams) error
 	InsertOAuthClient(ctx context.Context, arg InsertOAuthClientParams) error
+	// ---------------------------------------------------------------------------------
+	// Provider storage (the fosite adapter)
+	// ---------------------------------------------------------------------------------
+	InsertOAuthSession(ctx context.Context, arg InsertOAuthSessionParams) error
 	InsertPermission(ctx context.Context, arg InsertPermissionParams) error
+	// ---------------------------------------------------------------------------------
+	// Refresh tokens, as the provider sees them
+	// ---------------------------------------------------------------------------------
+	//
+	// These read and write refresh_token rather than oauth_session, so that a token has one
+	// row carrying both its protocol payload and the family state SPEC §8.3 turns on.
+	InsertProviderRefreshToken(ctx context.Context, arg InsertProviderRefreshTokenParams) error
 	// ---------------------------------------------------------------------------------
 	// Refresh tokens (SPEC §8.3, threat 7 of §17.1)
 	// ---------------------------------------------------------------------------------
@@ -159,6 +177,13 @@ type Querier interface {
 	// security, and oauth_client stays registered as tenant-scoped.
 	// Resolves a client id to its tenant. System pool; see the header.
 	OAuthClientTenant(ctx context.Context, id string) (string, error)
+	// Returns the row whether or not it is still active. fosite has to distinguish "never
+	// existed" from "already used" — the second is a replayed authorization code and must
+	// revoke everything descended from it — so `active` is returned rather than filtered on.
+	OAuthSessionBySignature(ctx context.Context, arg OAuthSessionBySignatureParams) (OauthSession, error)
+	// Resolves an artifact to its tenant. System pool: a signature arrives with no tenant,
+	// the same way a client_id and a refresh token do.
+	OAuthSessionTenant(ctx context.Context, arg OAuthSessionTenantParams) (string, error)
 	// Local credentials (internal/authn).
 	//
 	// Two of these run on the system pool and the rest are tenant-scoped, and the split is
@@ -180,11 +205,16 @@ type Querier interface {
 	PasswordCredentialByEmail(ctx context.Context, arg PasswordCredentialByEmailParams) (PasswordCredentialByEmailRow, error)
 	// The permission surface is global: an application declares it once (SPEC §6.1).
 	PermissionSurface(ctx context.Context) ([]string, error)
+	ProviderRefreshTokenByHash(ctx context.Context, arg ProviderRefreshTokenByHashParams) (ProviderRefreshTokenByHashRow, error)
 	// The keys a relying party should accept: the active one and any still within the
 	// overlap window (SPEC §17).
 	PublicSigningKeys(ctx context.Context) ([]PublicSigningKeysRow, error)
 	RecentAuditEvents(ctx context.Context, arg RecentAuditEventsParams) ([]RecentAuditEventsRow, error)
 	RefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshTokenByHashRow, error)
+	RefreshTokenFamilyByRequest(ctx context.Context, arg RefreshTokenFamilyByRequestParams) (RefreshTokenFamilyByRequestRow, error)
+	// One member of a family, for the security event a revocation raises: it needs the
+	// session and the subject, and every member carries the same ones.
+	RefreshTokenFamilyMember(ctx context.Context, arg RefreshTokenFamilyMemberParams) (RefreshTokenFamilyMemberRow, error)
 	// Everything rotation needs to decide, in one row.
 	//
 	// consumed_at and revoked_at are returned rather than filtered on, because "this token
