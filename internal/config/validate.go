@@ -357,6 +357,18 @@ func (c *Config) validateSecurity(errs *Errors, lookupEnv secrets.LookupEnvFunc,
 			c.Security.SessionIdleTimeout, c.Security.SessionAbsoluteLifetime))
 	}
 
+	switch {
+	case c.Security.RefreshTokenAbsoluteLifetime <= 0:
+		errs.add("security.refresh_token_absolute_lifetime", "must be positive")
+	case c.Security.RefreshTokenIdleLifetime <= 0:
+		errs.add("security.refresh_token_idle_lifetime", "must be positive")
+	case c.Security.RefreshTokenIdleLifetime > c.Security.RefreshTokenAbsoluteLifetime:
+		errs.add("security.refresh_token_idle_lifetime", fmt.Sprintf(
+			"is %s, longer than security.refresh_token_absolute_lifetime (%s); the absolute "+
+				"lifetime would end every chain first, making this setting inert",
+			c.Security.RefreshTokenIdleLifetime, c.Security.RefreshTokenAbsoluteLifetime))
+	}
+
 	// The overlap window is what makes rotation invisible to relying parties. Too
 	// short and it stops being an overlap: a token signed a moment before the
 	// rotation outlives the key that verifies it. Too long and a key that has been

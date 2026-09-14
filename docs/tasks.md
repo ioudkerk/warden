@@ -244,14 +244,62 @@ library, with no Warden-specific client code.
 | --- | --- | --- |
 | M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
 | M1-2 [B] | **Status: done.** Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Met. `TestUnknownUserAndWrongPasswordTakeTheSameTime` measures both paths against the cost of one Argon2id hash; they differ by under 1% of it, and the test fails loudly if either path skips the hash |
-| M1-3 | Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle |
+| M1-3 | **Deferred, not skipped — take with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle. **Blocked:** none of those endpoints exist yet — login is M1-6, reset and invite are M1-9 — so the test that defines "done" cannot be written. The core (counter, backoff, per-account cap) is HTTP-independent and could land earlier; what must not happen is M1-6 shipping a login endpoint with no brute-force protection, because M1-2 closed the account-existence oracle but nothing yet throttles online guessing |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
-| M1-5 | Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Replaying a rotated token kills the family and emits `security.refresh_token_reuse` |
+| M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
+
+### Notes from M1-5
+
+**The bug this task existed to avoid, found in the implementation of it.** Reuse
+detection revoked the family and then returned `ErrTokenReuse` from inside the
+transaction — and `pgx.BeginTxFunc` rolls back on any error, so the revocation was
+discarded every time. The detection reported a theft and left the whole family live. The
+signal now travels out of the callback in a variable, the callback returns nil so the
+revocation commits, and the error is returned by the caller. Re-introducing the early
+return makes `TestReplayingARotatedTokenKillsTheFamily` fail with "the live token still
+rotates after the family was revoked", zero security events, and the session still valid.
+
+**SERIALIZABLE is the load-bearing part**, and this is the case M0-7 built
+`store.Isolation` for by name. "Has this token been consumed?" and "consume it" must be
+indivisible, or two simultaneous presentations both read *not consumed*, both succeed, and
+the chain silently forks into two live tokens that know nothing of each other — which is
+the exact state reuse detection exists to notice, arrived at without noticing it.
+`TestConcurrentRotationsOfOneTokenElectOneWinner` runs four at once and asserts one winner.
+
+**Revocation is checked before reuse, and the order is a deliberate trade.** Once a family
+is revoked the alarm has been raised; both parties then retry, and checking reuse first
+turned one theft into a stream of identical security events (three, in the first run of the
+exit-condition test). A dead family now answers "invalid" and says nothing more. The cost is
+that a replay arriving after the family was revoked for an unrelated reason — a logout, say
+— goes unreported. That is evidence lost, and it is the lesser loss: the token is already
+useless, while an alert that fires repeatedly per incident is an alert that gets filtered.
+
+**Reuse ends the session too.** Somebody holding a stolen refresh token very probably holds
+the session cookie as well; revoking the family alone would log the thief out of refresh
+while leaving their browser working.
+
+**No grace window, deliberately.** A common mitigation for the double-refresh false positive
+— two tabs refreshing at once — is to let the immediately-previous token be re-presented for
+a few seconds and return the same successor. SPEC §8.3 does not describe one, so there is
+none: a replay kills the family, full stop. The consequence is that a client which retries a
+refresh after a network timeout logs its user out. **This is worth revisiting if it bites**,
+and it is a specification question rather than an implementation one.
+
+**Where the tenant comes from.** A client presents a token and no tenant, the same
+chicken-and-egg that `service_account` and `setup_token` solved by being registered as
+row-level-security exceptions. `refresh_token` does not need one: a single-column read on
+the system pool resolves the tenant, and every other statement then runs under RLS like any
+tenant data. The registry stays honest.
+
+**Also here:** an hourly purge worker for both mirrors. Neither session rows nor spent
+tokens are removed by anything else, and a deployment issuing tokens for a year accumulates
+a row per refresh per user per device. Rows are kept 30 days past expiry, because "which
+devices was this account signed in from last week?" is an incident question.
 
 ### Notes from M1-4
 

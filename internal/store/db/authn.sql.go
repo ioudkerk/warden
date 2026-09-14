@@ -89,6 +89,26 @@ func (q *Queries) ActiveSessionsForUser(ctx context.Context, arg ActiveSessionsF
 	return items, nil
 }
 
+const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
+UPDATE refresh_token SET consumed_at = $1::timestamptz
+ WHERE id = $2 AND consumed_at IS NULL AND revoked_at IS NULL
+`
+
+type ConsumeRefreshTokenParams struct {
+	At time.Time
+	ID string
+}
+
+// Consumes a token, but only if it is still unconsumed. The row count is what settles
+// a race: the loser updates nothing and is treated as a replay.
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeRefreshToken, arg.At, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeSetupToken = `-- name: ConsumeSetupToken :execrows
 UPDATE setup_token SET consumed_at = now()
  WHERE id = $1 AND consumed_at IS NULL
@@ -107,6 +127,35 @@ func (q *Queries) ConsumeSetupToken(ctx context.Context, id string) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const countRefreshTokensInFamily = `-- name: CountRefreshTokensInFamily :one
+SELECT count(*) FROM refresh_token
+ WHERE tenant_id = $1 AND family_id = $2
+`
+
+type CountRefreshTokensInFamilyParams struct {
+	TenantID string
+	FamilyID string
+}
+
+func (q *Queries) CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countRefreshTokensInFamily, arg.TenantID, arg.FamilyID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const deleteExpiredRefreshTokens = `-- name: DeleteExpiredRefreshTokens :execrows
+DELETE FROM refresh_token WHERE expires_at < $1
+`
+
+func (q *Queries) DeleteExpiredRefreshTokens(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredRefreshTokens, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
 DELETE FROM session WHERE expires_at < $1
 `
@@ -119,6 +168,52 @@ func (q *Queries) DeleteExpiredSessions(ctx context.Context, before time.Time) (
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const insertRefreshToken = `-- name: InsertRefreshToken :exec
+
+INSERT INTO refresh_token (id, session_id, tenant_id, family_id, token_hash, client_id,
+                           issued_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6,
+        $7, $8)
+`
+
+type InsertRefreshTokenParams struct {
+	ID        string
+	SessionID string
+	TenantID  string
+	FamilyID  string
+	TokenHash []byte
+	ClientID  string
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// Refresh tokens (SPEC §8.3, threat 7 of §17.1)
+// ---------------------------------------------------------------------------------
+//
+// A family is the chain of tokens descended from one login. Rotation consumes the
+// presented token and issues its successor into the same family; presenting a token
+// that has already been consumed means two parties hold one, which is theft until
+// proven otherwise, and the answer is to revoke the whole family.
+//
+// These run at SERIALIZABLE. The check "has this token been consumed?" and the write
+// "consume it" must be one indivisible step, or two simultaneous presentations of the
+// same token both read "not consumed" and both succeed — which is precisely the
+// situation reuse detection exists to notice. M0-7 built store.Isolation for this.
+func (q *Queries) InsertRefreshToken(ctx context.Context, arg InsertRefreshTokenParams) error {
+	_, err := q.db.Exec(ctx, insertRefreshToken,
+		arg.ID,
+		arg.SessionID,
+		arg.TenantID,
+		arg.FamilyID,
+		arg.TokenHash,
+		arg.ClientID,
+		arg.IssuedAt,
+		arg.ExpiresAt,
+	)
+	return err
 }
 
 const insertSession = `-- name: InsertSession :exec
@@ -242,6 +337,88 @@ func (q *Queries) PasswordCredentialByEmail(ctx context.Context, arg PasswordCre
 	return i, err
 }
 
+const refreshTokenByHash = `-- name: RefreshTokenByHash :one
+SELECT rt.id, rt.session_id, rt.tenant_id, rt.family_id, rt.client_id,
+       rt.issued_at, rt.expires_at, rt.consumed_at, rt.revoked_at,
+       s.user_id, s.revoked_at AS session_revoked_at, s.expires_at AS session_expires_at,
+       -- When the family began, which is what the absolute lifetime is measured from.
+       -- Read rather than inferred from the presented token's own dates: inferring it
+       -- means reconstructing one timestamp from two others and a configured duration,
+       -- and it silently produces the wrong answer the moment either duration changes.
+       -- family_id is indexed, so this is a lookup rather than a scan.
+       (SELECT min(f.issued_at) FROM refresh_token f
+         WHERE f.tenant_id = rt.tenant_id AND f.family_id = rt.family_id)::timestamptz
+         AS family_started_at
+  FROM refresh_token rt
+  JOIN session s ON s.id = rt.session_id AND s.tenant_id = rt.tenant_id
+ WHERE rt.token_hash = $1
+`
+
+type RefreshTokenByHashRow struct {
+	ID               string
+	SessionID        string
+	TenantID         string
+	FamilyID         string
+	ClientID         string
+	IssuedAt         time.Time
+	ExpiresAt        time.Time
+	ConsumedAt       *time.Time
+	RevokedAt        *time.Time
+	UserID           string
+	SessionRevokedAt *time.Time
+	SessionExpiresAt time.Time
+	FamilyStartedAt  time.Time
+}
+
+func (q *Queries) RefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshTokenByHashRow, error) {
+	row := q.db.QueryRow(ctx, refreshTokenByHash, tokenHash)
+	var i RefreshTokenByHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.TenantID,
+		&i.FamilyID,
+		&i.ClientID,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.RevokedAt,
+		&i.UserID,
+		&i.SessionRevokedAt,
+		&i.SessionExpiresAt,
+		&i.FamilyStartedAt,
+	)
+	return i, err
+}
+
+const refreshTokenTenantByHash = `-- name: RefreshTokenTenantByHash :one
+SELECT tenant_id FROM refresh_token WHERE token_hash = $1
+`
+
+// Everything rotation needs to decide, in one row.
+//
+// consumed_at and revoked_at are returned rather than filtered on, because "this token
+// exists and has already been used" and "there is no such token" demand opposite
+// responses: the first is a security event, the second is an ordinary expired-session
+// refusal. A WHERE clause that excluded consumed rows would make them indistinguishable
+// and reuse detection impossible.
+// Resolves a presented token to its tenant, and nothing else.
+//
+// This one runs on the system pool, and it is the only refresh-token query that does.
+// A client presents a token and no tenant — there is no tenant scope to establish until
+// the token has been resolved — which is the same chicken-and-egg service_account and
+// setup_token have. They solved it by being registered as row-level-security
+// exceptions; refresh_token does not, because it does not have to: this single column
+// read is enough to open the scope, and every other statement below then runs under
+// RLS like any tenant data. The atomicity that matters is in the rotation transaction,
+// not between it and this lookup: a token cannot change tenant.
+func (q *Queries) RefreshTokenTenantByHash(ctx context.Context, tokenHash []byte) (string, error) {
+	row := q.db.QueryRow(ctx, refreshTokenTenantByHash, tokenHash)
+	var tenant_id string
+	err := row.Scan(&tenant_id)
+	return tenant_id, err
+}
+
 const revokeAllSessionsForUser = `-- name: RevokeAllSessionsForUser :many
 UPDATE session SET revoked_at = now()
  WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
@@ -274,6 +451,45 @@ func (q *Queries) RevokeAllSessionsForUser(ctx context.Context, arg RevokeAllSes
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeRefreshTokenFamily = `-- name: RevokeRefreshTokenFamily :execrows
+UPDATE refresh_token SET revoked_at = now()
+ WHERE tenant_id = $1 AND family_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokenFamilyParams struct {
+	TenantID string
+	FamilyID string
+}
+
+// Kills every token descended from one login. Consumed tokens are revoked too, so that
+// a later replay of an earlier link in the chain is refused rather than merely noticed
+// a second time.
+func (q *Queries) RevokeRefreshTokenFamily(ctx context.Context, arg RevokeRefreshTokenFamilyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokenFamily, arg.TenantID, arg.FamilyID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeRefreshTokensForSession = `-- name: RevokeRefreshTokensForSession :execrows
+UPDATE refresh_token SET revoked_at = now()
+ WHERE tenant_id = $1 AND session_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokensForSessionParams struct {
+	TenantID  string
+	SessionID string
+}
+
+func (q *Queries) RevokeRefreshTokensForSession(ctx context.Context, arg RevokeRefreshTokensForSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokensForSession, arg.TenantID, arg.SessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const revokeSession = `-- name: RevokeSession :execrows

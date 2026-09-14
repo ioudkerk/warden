@@ -191,6 +191,17 @@ type SecurityConfig struct {
 	// something polls it.
 	SessionIdleTimeout time.Duration `yaml:"session_idle_timeout"`
 
+	// RefreshTokenAbsoluteLifetime and RefreshTokenIdleLifetime bound the rotating
+	// refresh chain (SPEC §8.3). The absolute figure is measured from the *first*
+	// token in a family — the login — so rotation cannot extend a chain indefinitely
+	// by issuing successors; the idle figure bounds the gap between rotations.
+	//
+	// SPEC §8.3 makes these per-application. They are deployment-wide here because
+	// there is no per-application override to read yet; when applications grow one,
+	// these become the default rather than the only answer.
+	RefreshTokenAbsoluteLifetime time.Duration `yaml:"refresh_token_absolute_lifetime"`
+	RefreshTokenIdleLifetime     time.Duration `yaml:"refresh_token_idle_lifetime"`
+
 	// BreachedPasswordFile points at a Have I Been Pwned corpus — the "hash:count"
 	// download, sorted by hash. SPEC §7.2 makes the breached-password check
 	// mandatory, and Warden ships a small built-in list so that the check is never a
@@ -278,6 +289,9 @@ func Defaults() *Config {
 
 			SessionAbsoluteLifetime: 30 * 24 * time.Hour, // SPEC §8.3
 			SessionIdleTimeout:      7 * 24 * time.Hour,  // SPEC §8.3
+
+			RefreshTokenAbsoluteLifetime: 30 * 24 * time.Hour, // SPEC §8.3
+			RefreshTokenIdleLifetime:     7 * 24 * time.Hour,  // SPEC §8.3
 		},
 
 		Log: LogConfig{

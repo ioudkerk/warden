@@ -44,6 +44,14 @@ type Result struct {
 	Rehashed bool
 }
 
+// Audit target types. The audit log is queried by these, so they are constants rather
+// than literals repeated at each call site: a typo'd "users" is a row that no
+// investigation will find.
+const (
+	targetUser    = "user"
+	targetSession = "session"
+)
+
 // failureReason names why a login failed, for the audit log only.
 type failureReason string
 
@@ -294,7 +302,7 @@ func (a *Authenticator) recordFailure(ctx context.Context, tenantID, email, user
 	err := a.system.InSystem(ctx, "recording a failed login", func(ctx context.Context, tx pgx.Tx) error {
 		_, appendErr := a.audit.Append(ctx, tx, audit.Entry{
 			TenantID: tenantID, Action: "authn.password.failed",
-			TargetType: "user", TargetID: userID,
+			TargetType: targetUser, TargetID: userID,
 			Reason: string(reason),
 			After:  map[string]any{"email": email, "reason": string(reason)},
 		})

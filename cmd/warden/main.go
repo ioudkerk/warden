@@ -323,6 +323,25 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 			"purged: database.system_url is not configured")
 	}
 
+	// Refresh tokens hang off sessions, so they are built after them. There is no
+	// refresh endpoint yet — the token endpoint arrives with the OIDC provider in
+	// M1-6 — so the only thing that drives this today is the purge below. Building it
+	// here rather than at M1-6 keeps the wiring in one place and gives the mirrors a
+	// sweeper from the moment they start filling.
+	refreshTokens, err := authn.NewRefreshTokens(db, system, sessions, authn.RefreshTokenOptions{
+		AbsoluteLifetime: cfg.Security.RefreshTokenAbsoluteLifetime,
+		IdleLifetime:     cfg.Security.RefreshTokenIdleLifetime,
+		Log:              log,
+		Audit:            audit.NewWriter(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if cfg.HasRole(config.RoleWorker) && system != nil {
+		go authn.RunPurge(ctx, sessions, refreshTokens, log)
+	}
+
 	server, err := httpapi.New(httpapi.Deps{
 		Config: cfg, Log: log,
 		Tenant: db, System: system,

@@ -49,13 +49,18 @@ type Querier interface {
 	// every tenant's revision moves and every cached model is rebuilt (SPEC §10.5).
 	BumpEveryTenantRevision(ctx context.Context) error
 	BumpTenantRevision(ctx context.Context, id string) error
+	// Consumes a token, but only if it is still unconsumed. The row count is what settles
+	// a race: the loser updates nothing and is treated as a replay.
+	ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error)
 	// Marks a token used. The WHERE clause repeats the unconsumed check that the caller
 	// already made, so that two simultaneous redemptions of the same link cannot both
 	// succeed: the second updates zero rows and the caller treats that as a replay. The
 	// check and the write being one statement is what makes it a race the database
 	// settles rather than one the application hopes not to lose.
 	ConsumeSetupToken(ctx context.Context, id string) (int64, error)
+	CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
+	DeleteExpiredRefreshTokens(ctx context.Context, before time.Time) (int64, error)
 	// Sessions whose absolute lifetime has passed are of no further interest to anyone;
 	// the row is kept only long enough for the UI to be honest about recent activity.
 	DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error)
@@ -76,6 +81,20 @@ type Querier interface {
 	// ---------------------------------------------------------------------------------
 	InsertGrant(ctx context.Context, arg InsertGrantParams) error
 	InsertPermission(ctx context.Context, arg InsertPermissionParams) error
+	// ---------------------------------------------------------------------------------
+	// Refresh tokens (SPEC §8.3, threat 7 of §17.1)
+	// ---------------------------------------------------------------------------------
+	//
+	// A family is the chain of tokens descended from one login. Rotation consumes the
+	// presented token and issues its successor into the same family; presenting a token
+	// that has already been consumed means two parties hold one, which is theft until
+	// proven otherwise, and the answer is to revoke the whole family.
+	//
+	// These run at SERIALIZABLE. The check "has this token been consumed?" and the write
+	// "consume it" must be one indivisible step, or two simultaneous presentations of the
+	// same token both read "not consumed" and both succeed — which is precisely the
+	// situation reuse detection exists to notice. M0-7 built store.Isolation for this.
+	InsertRefreshToken(ctx context.Context, arg InsertRefreshTokenParams) error
 	InsertRoleInheritance(ctx context.Context, arg InsertRoleInheritanceParams) error
 	InsertRolePermission(ctx context.Context, arg InsertRolePermissionParams) error
 	// The token is never stored, only its SHA-256, so a copy of the database does not
@@ -151,6 +170,25 @@ type Querier interface {
 	// overlap window (SPEC §17).
 	PublicSigningKeys(ctx context.Context) ([]PublicSigningKeysRow, error)
 	RecentAuditEvents(ctx context.Context, arg RecentAuditEventsParams) ([]RecentAuditEventsRow, error)
+	RefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshTokenByHashRow, error)
+	// Everything rotation needs to decide, in one row.
+	//
+	// consumed_at and revoked_at are returned rather than filtered on, because "this token
+	// exists and has already been used" and "there is no such token" demand opposite
+	// responses: the first is a security event, the second is an ordinary expired-session
+	// refusal. A WHERE clause that excluded consumed rows would make them indistinguishable
+	// and reuse detection impossible.
+	// Resolves a presented token to its tenant, and nothing else.
+	//
+	// This one runs on the system pool, and it is the only refresh-token query that does.
+	// A client presents a token and no tenant — there is no tenant scope to establish until
+	// the token has been resolved — which is the same chicken-and-egg service_account and
+	// setup_token have. They solved it by being registered as row-level-security
+	// exceptions; refresh_token does not, because it does not have to: this single column
+	// read is enough to open the scope, and every other statement below then runs under
+	// RLS like any tenant data. The atomicity that matters is in the rotation transaction,
+	// not between it and this lookup: a token cannot change tenant.
+	RefreshTokenTenantByHash(ctx context.Context, tokenHash []byte) (string, error)
 	// Token signing keys (internal/keys).
 	// The previously active key becomes 'previous' rather than 'retired': tokens it
 	// signed are still in circulation and must keep verifying until they expire, which is
@@ -171,6 +209,11 @@ type Querier interface {
 	// a second query. RETURNING rather than select-then-update keeps the two from
 	// disagreeing when a session is created between them.
 	RevokeAllSessionsForUser(ctx context.Context, arg RevokeAllSessionsForUserParams) ([]string, error)
+	// Kills every token descended from one login. Consumed tokens are revoked too, so that
+	// a later replay of an earlier link in the chain is refused rather than merely noticed
+	// a second time.
+	RevokeRefreshTokenFamily(ctx context.Context, arg RevokeRefreshTokenFamilyParams) (int64, error)
+	RevokeRefreshTokensForSession(ctx context.Context, arg RevokeRefreshTokensForSessionParams) (int64, error)
 	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
 	// The HTTP surface (internal/httpapi).
 	// Resolves a bearer token to a service account. This runs on the system pool, and

@@ -161,6 +161,10 @@ func fields() []field {
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.SessionAbsoluteLifetime })},
 		{"security-session-idle-timeout", "WARDEN_SECURITY_SESSION_IDLE_TIMEOUT", "how long an unused session survives",
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.SessionIdleTimeout })},
+		{"security-refresh-token-absolute-lifetime", "WARDEN_SECURITY_REFRESH_TOKEN_ABSOLUTE_LIFETIME", "maximum life of a refresh chain, measured from the login",
+			durationSetter(func(c *Config) *time.Duration { return &c.Security.RefreshTokenAbsoluteLifetime })},
+		{"security-refresh-token-idle-lifetime", "WARDEN_SECURITY_REFRESH_TOKEN_IDLE_LIFETIME", "maximum gap between refreshes",
+			durationSetter(func(c *Config) *time.Duration { return &c.Security.RefreshTokenIdleLifetime })},
 
 		{"log-level", "WARDEN_LOG_LEVEL", "log level: debug, info, warn or error",
 			func(c *Config, v string) error { c.Log.Level = v; return nil }},

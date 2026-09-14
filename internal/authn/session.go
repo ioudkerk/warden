@@ -469,9 +469,9 @@ func (s *Sessions) recordRevocation(ctx context.Context, tenantID, userID, sid s
 	if s.audit == nil || s.system == nil {
 		return
 	}
-	action, targetType, targetID := "session.revoked", "session", sid
+	action, targetType, targetID := "session.revoked", targetSession, sid
 	if sid == "" {
-		action, targetType, targetID = "session.revoked_all", "user", userID
+		action, targetType, targetID = "session.revoked_all", targetUser, userID
 	}
 	err := s.system.InSystem(ctx, "recording a session revocation", func(ctx context.Context, tx pgx.Tx) error {
 		_, appendErr := s.audit.Append(ctx, tx, audit.Entry{

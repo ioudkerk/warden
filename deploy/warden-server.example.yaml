@@ -96,6 +96,15 @@ security:
   session_absolute_lifetime: 720h # 30 days
   session_idle_timeout: 168h      # 7 days
 
+  # The rotating refresh chain (SPEC §8.3). The absolute lifetime is measured from the
+  # login that started the family, so rotation cannot extend a chain indefinitely by
+  # issuing successors; the idle lifetime bounds the gap between refreshes.
+  #
+  # SPEC §8.3 makes these per-application. They are deployment-wide for now because
+  # applications have no override to read yet.
+  refresh_token_absolute_lifetime: 720h # 30 days
+  refresh_token_idle_lifetime: 168h     # 7 days
+
   # A Have I Been Pwned corpus for the breached-password check that SPEC §7.2 makes
   # mandatory: the "hash:count" download, sorted by hash. It is searched in place, so
   # the full multi-gigabyte file is fine — it is never loaded into memory.
