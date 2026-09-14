@@ -86,6 +86,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runKeys(rest, stdout, stderr)
 	case "password":
 		return runPassword(rest, stdout, stderr)
+	case "client":
+		return runClient(rest, stdout, stderr)
 
 	default:
 		usage(stderr)
@@ -454,6 +456,11 @@ Administration (until the console arrives in M6). Each needs database.system_url
                                                set a user's password
   warden password policy -tenant <slug> [-min-length N] [-check-breached false] ...
                                                show or change a tenant's password policy
+  warden client register -tenant <slug> -key <key> -redirect-uri <uri> [-confidential]
+                                               register an OAuth/OIDC client. Public by
+                                               default; PKCE is required either way
+  warden client list|show|secret|disable|enable|delete -tenant <slug> [-key <key>]
+                                               manage registered clients
 
 The password subcommands read the password from standard input, never from a flag:
 arguments are visible in "ps" and land in shell history.

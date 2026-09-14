@@ -247,11 +247,59 @@ library, with no Warden-specific client code.
 | M1-3 | **Deferred, not skipped — take with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle. **Blocked:** none of those endpoints exist yet — login is M1-6, reset and invite are M1-9 — so the test that defines "done" cannot be written. The core (counter, backoff, per-account cap) is HTTP-independent and could land earlier; what must not happen is M1-6 shipping a login endpoint with no brute-force protection, because M1-2 closed the account-existence oracle but nothing yet throttles online guessing |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled |
+| M1-6 [B] | **In progress (1 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry, with "absent not disabled" enforced by schema constraint. **Remaining:** the fosite storage adapter and provider; authorize + login + token (with **M1-3** folded in); then userinfo, introspect, revoke, logout, PAR, device |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
+
+### Notes from M1-6 (in progress)
+
+M1-6 is four commits, not one. This is the first: the client registry everything else
+needs.
+
+**"Absent, not disabled" is a schema constraint.** The exit condition asks for the
+implicit and resource-owner-password grants to be absent rather than switched off, and a
+constant somebody could change does not meet that bar. `oauth_client_no_forbidden_grants`
+and `oauth_client_no_forbidden_response_types` make a client that asks for them
+*unrepresentable*: no console, no migration and no future handler can enable one, because
+the row will not store. The registry refuses them earlier with a message that explains
+why; the constraint is what makes it true. Six more constraints encode the rest — a public
+client may not hold a secret, may not opt out of PKCE, and a client doing the code flow
+must have somewhere to send the code.
+
+**Client ids are generated, not chosen.** The token endpoint receives a `client_id` and
+nothing else, so ids must be unique across the deployment before any tenant scope exists —
+two tenants each naming a client `billing-web` would be indistinguishable at exactly the
+moment it matters. Opaque ids also stop an authorize URL leaking a customer's name. The
+chosen handle lives in `key`, unique per tenant, and never appears in a protocol message.
+
+**`oauth_client` is not `application`.** They are different concepts wearing similar
+names: an application declares a permission surface and is global with per-tenant
+enrollment; a client performs a login and receives tokens. One application may have
+several clients.
+
+**Redirect URIs are validated at registration**, not only at request time. The comparison
+at request time is string equality (SPEC §17), so a registered wildcard would simply never
+match — a silent failure discovered during a login. Wildcards, fragments, schemeless and
+non-loopback `http` are refused with the reason. Loopback `http` is allowed, per
+RFC 8252 §8.3.
+
+**`authn.DecoyHash` is now shared, and its caching is a security property.** The token
+endpoint must not answer faster for an unknown `client_id` than for a real one, so an
+unknown client is verified against a decoy exactly as an unknown user is. Generating a
+fresh decoy per call would hash twice — once to build it, once to verify — making the miss
+reliably *slower* than the hit and just as good an oracle. It is cached per parameter set.
+
+**Dependency cost, recorded rather than absorbed.** fosite v0.49.0 takes the module count
+from 44 to 87 and adds about 35 *linked* modules, among them `gobuffalo/pop` (a full ORM),
+`zipkin-go`, `logrus` and `ristretto`. The whole cascade comes from one import —
+`fosite` → `ory/x/otelx` → all of the above. Every fosite release from v0.45 onward has it;
+only v0.44.0 (2023) is clean, which is not a sensible pin for a security component. The
+binary grows 41 MB → 44 MB. This is accepted because SPEC §19 and this task both name
+fosite, and because `govulncheck` does reachability analysis so unreachable code in those
+modules should not become a triage queue — but the **SBOM required by SPEC §17 will list
+them**, and that should not be a surprise at release time.
 
 ### Notes from M1-5
 

@@ -81,9 +81,28 @@ func TestAMigratedDatabaseContainsNoUsableCredential(t *testing.T) {
 func TestNoCredentialLiteralsInMigrationsOrServerCode(t *testing.T) {
 	// Patterns that would indicate a shipped credential rather than a reference to
 	// one. Deliberately narrow: a broad scan produces noise nobody reads.
-	suspicious := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(password|passwd|secret|token)\s*(:?=|:)\s*["'][^"'\n]{6,}["']`),
-		regexp.MustCompile(`(?i)CREATE\s+ROLE\s+\w+.*PASSWORD\s+'[^']+'`),
+	// The assigned value is captured, because it is what decides whether a match is a
+	// finding. Narrowing the *name* side instead — demanding a word boundary before
+	// "password" — would stop this firing on GrantRefreshToken at the cost of no longer
+	// seeing clientSecret or apiToken, which is the wrong trade on a tripwire.
+	assignment := regexp.MustCompile(
+		`(?i)(password|passwd|secret|token)\s*(:?=|:)\s*["']([^"'\n]{6,})["']`)
+	createRole := regexp.MustCompile(`(?i)CREATE\s+ROLE\s+\w+.*PASSWORD\s+'[^']+'`)
+
+	// Protocol vocabulary that matches the shape of a credential assignment and is not
+	// one. Every entry is a name defined by an RFC, so the list grows only when a
+	// standard does — which is the property that keeps it from becoming a place to hide
+	// an inconvenient finding.
+	notSecrets := map[string]bool{
+		"refresh_token":       true, // RFC 6749 grant type and token type
+		"authorization_code":  true, // RFC 6749 grant type
+		"client_credentials":  true, // RFC 6749 grant type
+		"client_secret_basic": true, // RFC 8414 auth method
+		"client_secret_post":  true, // RFC 8414 auth method
+		"private_key_jwt":     true, // RFC 8414 auth method
+		"access_token":        true, // RFC 6749 token type
+		"id_token":            true, // OIDC Core response and token type
+		"urn:ietf:params:oauth:grant-type:device_code": true, // RFC 8628
 	}
 	// A migration that seeds a credential table is the specific thing SPEC §20.2
 	// forbids: it would ship in every deployment. The same statement in Go is how
@@ -127,10 +146,14 @@ func TestNoCredentialLiteralsInMigrationsOrServerCode(t *testing.T) {
 			if readErr != nil {
 				return nil //nolint:nilerr // unreadable files are not findings
 			}
-			for _, pattern := range suspicious {
-				if match := pattern.Find(content); match != nil {
-					t.Errorf("%s appears to contain a shipped credential: %q", rel, string(match))
+			for _, match := range assignment.FindAllSubmatch(content, -1) {
+				if notSecrets[string(match[3])] {
+					continue
 				}
+				t.Errorf("%s appears to contain a shipped credential: %q", rel, string(match[0]))
+			}
+			if match := createRole.Find(content); match != nil {
+				t.Errorf("%s appears to contain a shipped credential: %q", rel, string(match))
 			}
 			if strings.Contains(rel, "store/migrations") {
 				if match := migrationOnly.Find(content); match != nil {

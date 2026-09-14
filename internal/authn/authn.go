@@ -78,12 +78,6 @@ type Authenticator struct {
 
 	audit *audit.Writer
 
-	// decoy is a real Argon2id hash of a random string, verified against when no
-	// credential was found. See authenticate.
-	decoyOnce sync.Once
-	decoy     string
-	decoyErr  error
-
 	// policies caches per-tenant policy. A password change is rare and this is not on
 	// any hot path; the cache exists so that a login attempt against a tenant with a
 	// configured policy does not differ in timing from one against a tenant without,
@@ -253,27 +247,50 @@ func (a *Authenticator) authenticate(ctx context.Context, tenantID, email, passw
 }
 
 // decoyHash returns a hash to verify against when there is no real one.
+func (a *Authenticator) decoyHash() (string, error) { return DecoyHash(a.params) }
+
+// decoys caches one decoy per parameter set. Parameters change about once a year, so
+// this holds one or two entries for the life of the process.
+var decoys sync.Map // Params -> *decoyCache
+
+type decoyCache struct {
+	once sync.Once
+	hash string
+	err  error
+}
+
+// DecoyHash returns a hash to verify a presented credential against when there is no
+// real one to check — an unknown user, an account with no password, an unregistered
+// client id.
 //
-// It is computed once, from a random password nobody holds, under the current
-// parameters — so verifying against it costs exactly what verifying a real credential
-// costs. Generating it lazily rather than in New keeps a process that never
-// authenticates from paying 64 MiB and a few tens of milliseconds at startup.
+// Verifying against it costs exactly what verifying a real credential costs, which is
+// what makes the two paths indistinguishable by timing (SPEC §7.2).
 //
-// One known imperfection, worth stating rather than hiding: a tenant whose stored
-// hashes still carry *older* parameters verifies faster than the decoy, so during the
-// window between raising the parameters and the population having logged in once, a
-// timing difference exists between "unknown user" and "known user on an old hash". It
-// is bounded by the rehash-on-login rollout and it is the reason NeedsRehash exists.
-func (a *Authenticator) decoyHash() (string, error) {
-	a.decoyOnce.Do(func() {
+// **It is cached, and the caching is part of the security property rather than an
+// optimisation.** Generating a fresh decoy per call would mean hashing once to build it
+// and once to verify against it — twice the work of the path it is imitating, making
+// the miss reliably *slower* than the hit and just as good an oracle as being faster.
+//
+// One known imperfection, stated rather than hidden: a credential still stored under
+// *older* parameters verifies faster than a decoy built from the current ones, so
+// between raising the parameters and the population having logged in once, a timing
+// difference exists between "unknown" and "known, on an old hash". It is bounded by the
+// rehash-on-login rollout, which is what NeedsRehash exists for.
+func DecoyHash(p Params) (string, error) {
+	entry, _ := decoys.LoadOrStore(p, &decoyCache{})
+	cached, ok := entry.(*decoyCache)
+	if !ok {
+		return "", errors.New("the decoy cache holds the wrong type")
+	}
+	cached.once.Do(func() {
 		filler := make([]byte, 32)
 		if _, err := rand.Read(filler); err != nil {
-			a.decoyErr = fmt.Errorf("generating the decoy credential: %w", err)
+			cached.err = fmt.Errorf("generating the decoy credential: %w", err)
 			return
 		}
-		a.decoy, a.decoyErr = Hash(base64.RawStdEncoding.EncodeToString(filler), a.params)
+		cached.hash, cached.err = Hash(base64.RawStdEncoding.EncodeToString(filler), p)
 	})
-	return a.decoy, a.decoyErr
+	return cached.hash, cached.err
 }
 
 // touch records that a credential was used, outside the authentication transaction.

@@ -284,6 +284,9 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			{`INSERT INTO ui_binding (id, tenant_id, ui_element_id, requires, mode)
 			  VALUES ($1, $2, 'uie_shared', '{"any_of":[{"permission":"billing.invoice:read"}]}', 'hidden')`,
 				[]any{"uib_" + suffix, tn}},
+			{`INSERT INTO oauth_client (id, tenant_id, key, name, redirect_uris)
+			  VALUES ($1, $2, $3, $4, '{https://app.example.test/callback}')`,
+				[]any{"oac_" + suffix, tn, "client-" + suffix, "Client " + suffix}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -774,7 +777,7 @@ func TestTenantListIsStable(t *testing.T) {
 	want := []string{
 		"app_enrollment", "app_user", "credential", "decision_event", "denial",
 		"grant_", "group_", "group_member", "identity", "idp_connection",
-		"refresh_token", "resource_node", "role", "role_inheritance",
+		"oauth_client", "refresh_token", "resource_node", "role", "role_inheritance",
 		"role_permission", "session", "tenant", "ui_binding",
 	}
 	sort.Strings(got)

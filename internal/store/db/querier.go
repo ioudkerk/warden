@@ -65,6 +65,7 @@ type Querier interface {
 	// the row is kept only long enough for the UI to be honest about recent activity.
 	DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteGrant(ctx context.Context, arg DeleteGrantParams) error
+	DeleteOAuthClient(ctx context.Context, arg DeleteOAuthClientParams) (int64, error)
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
 	DeleteRolePermissions(ctx context.Context, roleID string) error
 	DeprecateUIElement(ctx context.Context, arg DeprecateUIElementParams) error
@@ -80,6 +81,7 @@ type Querier interface {
 	// Grants
 	// ---------------------------------------------------------------------------------
 	InsertGrant(ctx context.Context, arg InsertGrantParams) error
+	InsertOAuthClient(ctx context.Context, arg InsertOAuthClientParams) error
 	InsertPermission(ctx context.Context, arg InsertPermissionParams) error
 	// ---------------------------------------------------------------------------------
 	// Refresh tokens (SPEC §8.3, threat 7 of §17.1)
@@ -118,6 +120,7 @@ type Querier interface {
 	// Redemption invalidates every other outstanding token for the same user
 	// (docs/design-email.md §8). Two live setup links is one more than anyone needs.
 	InvalidateOtherSetupTokens(ctx context.Context, arg InvalidateOtherSetupTokensParams) (int64, error)
+	ListOAuthClients(ctx context.Context, tenantID string) ([]ListOAuthClientsRow, error)
 	ListSigningKeys(ctx context.Context) ([]ListSigningKeysRow, error)
 	// The administrative audit log (internal/audit).
 	//
@@ -145,6 +148,17 @@ type Querier interface {
 	ModelRolePermissions(ctx context.Context, tenantID string) ([]ModelRolePermissionsRow, error)
 	ModelRoles(ctx context.Context, tenantID string) ([]ModelRolesRow, error)
 	ModelSubjects(ctx context.Context, tenantID string) ([]ModelSubjectsRow, error)
+	OAuthClientByID(ctx context.Context, arg OAuthClientByIDParams) (OAuthClientByIDRow, error)
+	OAuthClientByKey(ctx context.Context, arg OAuthClientByKeyParams) (OAuthClientByKeyRow, error)
+	// OAuth 2.0 / OIDC clients (internal/oidcop).
+	//
+	// One query here runs on the system pool and the rest are tenant-scoped, for the same
+	// reason refresh tokens split that way: the token endpoint receives a client_id and
+	// nothing else, so the tenant has to be resolved before a tenant scope can exist. That
+	// single column read opens the scope; everything after it runs under row-level
+	// security, and oauth_client stays registered as tenant-scoped.
+	// Resolves a client id to its tenant. System pool; see the header.
+	OAuthClientTenant(ctx context.Context, id string) (string, error)
 	// Local credentials (internal/authn).
 	//
 	// Two of these run on the system pool and the rest are tenant-scoped, and the split is
@@ -227,6 +241,11 @@ type Querier interface {
 	// would have to unwrap the pointer to the same effect.
 	SessionByID(ctx context.Context, arg SessionByIDParams) (SessionByIDRow, error)
 	SetGrantGrantedBy(ctx context.Context, arg SetGrantGrantedByParams) error
+	SetOAuthClientDisabled(ctx context.Context, arg SetOAuthClientDisabledParams) (int64, error)
+	// Rotates a confidential client's secret. The old one stops working immediately;
+	// SPEC §8.4's overlap window is for service accounts, which are a different credential
+	// with a different rotation story.
+	SetOAuthClientSecret(ctx context.Context, arg SetOAuthClientSecretParams) (int64, error)
 	// Set in a second pass, so a type may name a parent declared after it.
 	SetResourceTypeParent(ctx context.Context, arg SetResourceTypeParentParams) error
 	// jsonb_strip_nulls keeps a cleared field from being stored as an explicit null, which

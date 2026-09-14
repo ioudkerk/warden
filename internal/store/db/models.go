@@ -209,6 +209,29 @@ type IdpConnection struct {
 	UpdatedAt    time.Time
 }
 
+// An OAuth 2.0 / OIDC client (SPEC §7.7). Distinct from `application`, which declares a permission surface.
+type OauthClient struct {
+	// The protocol client_id. Opaque and deployment-unique: the token endpoint resolves it before any tenant scope exists.
+	ID         string
+	TenantID   string
+	Key        string
+	Name       string
+	Public     bool
+	SecretHash *string
+	// Exact-match allowlist. No wildcards — the comparison is string equality (SPEC §17).
+	RedirectUris            []string
+	GrantTypes              []string
+	ResponseTypes           []string
+	Scopes                  []string
+	Audiences               []string
+	TokenEndpointAuthMethod string
+	PostLogoutRedirectUris  []string
+	RequirePkce             bool
+	DisabledAt              *time.Time
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+}
+
 // The atom of authorization: app.resource:action. Materialized from resource_type × action at sync time (SPEC §9.2).
 type Permission struct {
 	ID             string
