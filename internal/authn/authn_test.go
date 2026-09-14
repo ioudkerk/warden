@@ -28,9 +28,11 @@ const dsnEnv = "WARDEN_TEST_DATABASE_URL"
 const goodPassword = "correct horse battery staple"
 
 type fixture struct {
-	a        *authn.Authenticator
-	p        *provision.Provisioner
-	tenantID string
+	a          *authn.Authenticator
+	p          *provision.Provisioner
+	tenantPool *store.Store
+	systemPool *store.Store
+	tenantID   string
 	// maria has a password; bob exists with none.
 	maria, bob string
 	mariaEmail string
@@ -139,7 +141,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	f := &fixture{
-		p: p, tenantID: tenantID,
+		p: p, tenantPool: tenantPool, systemPool: system, tenantID: tenantID,
 		mariaEmail: "maria@acme.test", bobEmail: "bob@acme.test",
 	}
 	if f.maria, err = p.CreateUser(ctx, "acme", f.mariaEmail, nil); err != nil {

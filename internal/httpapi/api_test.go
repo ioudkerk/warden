@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
@@ -41,6 +42,7 @@ type fixture struct {
 	sink     *decisionlog.Sink
 	metrics  *metrics.Metrics
 	keys     *keys.Manager
+	sessions *authn.Sessions
 }
 
 // newFixture builds two tenants, each with a user and its own service-account token.
@@ -195,11 +197,40 @@ func build(t *testing.T, mayExplain bool, c cache.Cache) fixture {
 	}
 	f.keys = km
 
+	// Most tests pass no cache at all, so the default is the in-process backend — a
+	// real implementation of the same interface, which is what makes the session
+	// routes exercisable here without a Redis. The readiness tests deliberately pass a
+	// stub that stores nothing; those get no session store, and the routes answer 503,
+	// which is what a deployment without a working cache tier should do anyway.
+	if c == nil {
+		inProcess := config.Defaults()
+		inProcess.Environment = config.EnvDevelopment
+		inProcess.Cache.Backend = config.CacheInProcess
+		opened, cacheErr := cache.Open(context.Background(), inProcess)
+		if cacheErr != nil {
+			t.Fatalf("opening the in-process cache: %v", cacheErr)
+		}
+		t.Cleanup(func() { _ = opened.Close() }) //nolint:errcheck // teardown
+		c = opened
+	}
+
+	if setErr := c.Set(context.Background(), "warden:probe", []byte("1"), time.Minute); setErr == nil {
+		sessions, sessionErr := authn.NewSessions(tenantPool, system, c, authn.SessionOptions{
+			AbsoluteLifetime: 30 * 24 * time.Hour,
+			IdleTimeout:      7 * 24 * time.Hour,
+			Log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if sessionErr != nil {
+			t.Fatalf("sessions: %v", sessionErr)
+		}
+		f.sessions = sessions
+	}
+
 	server, err := httpapi.New(httpapi.Deps{
 		Config: cfg, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Tenant: tenantPool, System: system,
 		Decisions: sink, Metrics: f.metrics, Cache: c,
-		Keys: km,
+		Keys: km, Sessions: f.sessions,
 	})
 	if err != nil {
 		t.Fatalf("server: %v", err)
@@ -525,14 +556,46 @@ func TestExplainRequiresAuthentication(t *testing.T) {
 
 // --- readiness --------------------------------------------------------------------
 
+// unusableCache supplies the key-value half of cache.Cache for the readiness stubs
+// below, which exercise Ping and nothing else. Every operation fails loudly rather
+// than returning a zero value, so a test that starts depending on one of them fails
+// with a reason instead of quietly observing an empty cache.
+type unusableCache struct{}
+
+func (unusableCache) Get(context.Context, string) ([]byte, error) {
+	return nil, errors.New("this stub cache does not store anything")
+}
+
+func (unusableCache) GetMany(context.Context, ...string) ([][]byte, error) {
+	return nil, errors.New("this stub cache does not store anything")
+}
+
+func (unusableCache) Set(context.Context, string, []byte, time.Duration) error {
+	return errors.New("this stub cache does not store anything")
+}
+
+func (unusableCache) Delete(context.Context, ...string) error {
+	return errors.New("this stub cache does not store anything")
+}
+
+func (unusableCache) Expire(context.Context, string, time.Duration) (bool, error) {
+	return false, errors.New("this stub cache does not store anything")
+}
+
 // failingCache stands in for an unreachable cache tier.
-type failingCache struct{ backend string }
+type failingCache struct {
+	unusableCache
+	backend string
+}
 
 func (c failingCache) Ping(context.Context) error { return errors.New("connection refused") }
 func (c failingCache) Backend() string            { return c.backend }
 func (c failingCache) Close() error               { return nil }
 
-type healthyCache struct{ backend string }
+type healthyCache struct {
+	unusableCache
+	backend string
+}
 
 func (c healthyCache) Ping(context.Context) error { return nil }
 func (c healthyCache) Backend() string            { return c.backend }

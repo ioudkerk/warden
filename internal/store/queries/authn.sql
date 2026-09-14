@@ -110,3 +110,55 @@ UPDATE setup_token SET consumed_at = now()
 -- name: InvalidateOtherSetupTokens :execrows
 UPDATE setup_token SET consumed_at = now()
  WHERE user_id = @user_id AND id <> @id AND consumed_at IS NULL;
+
+-- ---------------------------------------------------------------------------------
+-- Sessions (SPEC §8.3)
+-- ---------------------------------------------------------------------------------
+--
+-- Redis holds the authoritative session record; these rows are the mirror the spec
+-- asks for, and they serve two purposes Redis cannot. They are what the
+-- active-sessions UI lists, and they are how "revoke everything for this user" finds
+-- the keys to delete — Redis can answer "is this session valid?" in one lookup but
+-- cannot enumerate a user's sessions without a scan.
+
+-- name: InsertSession :exec
+INSERT INTO session (id, tenant_id, user_id, amr, auth_time, ip, user_agent, expires_at)
+VALUES (@id, @tenant_id, @user_id, @amr, @auth_time, @ip, @user_agent, @expires_at);
+
+-- ip is coalesced to text on the way out. The column is inet, which pgx will not scan
+-- into a *string in binary format; and the empty string is a better "no address" than
+-- a null here, because every caller renders this into a list for a person to read and
+-- would have to unwrap the pointer to the same effect.
+-- name: SessionByID :one
+SELECT id, tenant_id, user_id, amr, auth_time, coalesce(ip::text, '')::text AS ip, user_agent,
+       created_at, expires_at, revoked_at
+  FROM session
+ WHERE tenant_id = @tenant_id AND id = @id;
+
+-- The active-sessions list. Revoked and expired rows are excluded rather than shown
+-- greyed out: this feeds a "these are your signed-in devices" screen, and a list that
+-- includes sessions the user cannot act on is a list they will misread.
+-- name: ActiveSessionsForUser :many
+SELECT id, tenant_id, user_id, amr, auth_time, coalesce(ip::text, '')::text AS ip, user_agent,
+       created_at, expires_at
+  FROM session
+ WHERE tenant_id = @tenant_id AND user_id = @user_id
+   AND revoked_at IS NULL AND expires_at > now()
+ ORDER BY created_at DESC;
+
+-- name: RevokeSession :execrows
+UPDATE session SET revoked_at = now()
+ WHERE tenant_id = @tenant_id AND id = @id AND revoked_at IS NULL;
+
+-- Returns the ids it revoked, so the caller knows which cache keys to delete without
+-- a second query. RETURNING rather than select-then-update keeps the two from
+-- disagreeing when a session is created between them.
+-- name: RevokeAllSessionsForUser :many
+UPDATE session SET revoked_at = now()
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND revoked_at IS NULL
+RETURNING id;
+
+-- Sessions whose absolute lifetime has passed are of no further interest to anyone;
+-- the row is kept only long enough for the UI to be honest about recent activity.
+-- name: DeleteExpiredSessions :execrows
+DELETE FROM session WHERE expires_at < @before;

@@ -245,13 +245,49 @@ library, with no Warden-specific client code.
 | M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
 | M1-2 [B] | **Status: done.** Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Met. `TestUnknownUserAndWrongPasswordTakeTheSameTime` measures both paths against the cost of one Argon2id hash; they differ by under 1% of it, and the test fails loudly if either path skips the hash |
 | M1-3 | Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle |
-| M1-4 | Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | `POST /v1/users/{id}/revoke-all` invalidates within 1 s |
+| M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Replaying a rotated token kills the family and emits `security.refresh_token_reuse` |
 | M1-6 [B] | OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
+
+### Notes from M1-4
+
+**Nothing caches a session in process, and that is the whole design.** Redis is
+authoritative for validity, Postgres is the mirror SPEC §8.3 asks for, and every
+validation reads the cache tier. There is no propagation step, which is why the exit
+condition — a second — is met in under two milliseconds. The test asserts the margin as
+well as the budget: if it ever starts reporting hundreds of milliseconds, someone has
+added a local session cache and quietly turned a guarantee into a promise about a TTL.
+
+**Revoke-all uses a marker, not an enumeration.** Deleting the sessions a query found
+leaves a race — a login committing between the enumeration and the delete produces a
+session the revocation never saw. Instead `warden:revoked-before:{tenant}:{user}` records
+the instant, and a session whose `auth_time` precedes it is refused wherever it is
+presented. Deleting the individual keys afterwards is housekeeping. The Postgres mirror
+still earns its place: Redis can answer "is this session valid?" in one lookup but cannot
+enumerate a user's sessions without a scan, and the active-sessions UI needs the list.
+
+**A tenant-crossing bug, found by its own test.** Session cache keys are named by sid
+alone, and `Revoke` deleted the key *before* checking who the session belonged to — so any
+tenant could end any other tenant's session by id. The Postgres update was correctly
+tenant-scoped, which is exactly why it was easy to miss: the mirror said no rows changed
+while the session was already gone from the cache. `TestSessionEndpointsAreTenantScoped`
+caught it; `Sessions.belongsToTenant` is the fix, and removing it makes that test fail
+again. Scoping handlers to the caller's tenant is necessary and was assumed sufficient.
+
+**The cache tier grew primitives.** `cache.Cache` had only Ping/Backend/Close; it now has
+Get/GetMany/Set/Delete/Expire, implemented for both backends. The in-process backend
+evaluates expiry on read rather than running a sweeper goroutine, and copies values in and
+out so the two backends do not differ on whether a caller may mutate what it read.
+
+**A sharp edge worth knowing.** The Go tests and the compose stack share one Postgres, and
+the test fixtures drop and recreate the `public` schema — which erases
+`schema_migrations` while leaving the tables. The next `docker compose up` then fails with
+`relation "tenant" already exists`. `make dev-reset-db` is the fix, and it is needed after
+running the integration tests against a live dev stack.
 
 ### Notes from M1-2
 

@@ -30,6 +30,65 @@ func (q *Queries) ActivateUser(ctx context.Context, arg ActivateUserParams) erro
 	return err
 }
 
+const activeSessionsForUser = `-- name: ActiveSessionsForUser :many
+SELECT id, tenant_id, user_id, amr, auth_time, coalesce(ip::text, '')::text AS ip, user_agent,
+       created_at, expires_at
+  FROM session
+ WHERE tenant_id = $1 AND user_id = $2
+   AND revoked_at IS NULL AND expires_at > now()
+ ORDER BY created_at DESC
+`
+
+type ActiveSessionsForUserParams struct {
+	TenantID string
+	UserID   string
+}
+
+type ActiveSessionsForUserRow struct {
+	ID        string
+	TenantID  string
+	UserID    string
+	Amr       []string
+	AuthTime  time.Time
+	Ip        string
+	UserAgent *string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+// The active-sessions list. Revoked and expired rows are excluded rather than shown
+// greyed out: this feeds a "these are your signed-in devices" screen, and a list that
+// includes sessions the user cannot act on is a list they will misread.
+func (q *Queries) ActiveSessionsForUser(ctx context.Context, arg ActiveSessionsForUserParams) ([]ActiveSessionsForUserRow, error) {
+	rows, err := q.db.Query(ctx, activeSessionsForUser, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ActiveSessionsForUserRow{}
+	for rows.Next() {
+		var i ActiveSessionsForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.UserID,
+			&i.Amr,
+			&i.AuthTime,
+			&i.Ip,
+			&i.UserAgent,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const consumeSetupToken = `-- name: ConsumeSetupToken :execrows
 UPDATE setup_token SET consumed_at = now()
  WHERE id = $1 AND consumed_at IS NULL
@@ -46,6 +105,60 @@ func (q *Queries) ConsumeSetupToken(ctx context.Context, id string) (int64, erro
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
+DELETE FROM session WHERE expires_at < $1
+`
+
+// Sessions whose absolute lifetime has passed are of no further interest to anyone;
+// the row is kept only long enough for the UI to be honest about recent activity.
+func (q *Queries) DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredSessions, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const insertSession = `-- name: InsertSession :exec
+
+INSERT INTO session (id, tenant_id, user_id, amr, auth_time, ip, user_agent, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`
+
+type InsertSessionParams struct {
+	ID        string
+	TenantID  string
+	UserID    string
+	Amr       []string
+	AuthTime  time.Time
+	Ip        *string
+	UserAgent *string
+	ExpiresAt time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// Sessions (SPEC §8.3)
+// ---------------------------------------------------------------------------------
+//
+// Redis holds the authoritative session record; these rows are the mirror the spec
+// asks for, and they serve two purposes Redis cannot. They are what the
+// active-sessions UI lists, and they are how "revoke everything for this user" finds
+// the keys to delete — Redis can answer "is this session valid?" in one lookup but
+// cannot enumerate a user's sessions without a scan.
+func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
+	_, err := q.db.Exec(ctx, insertSession,
+		arg.ID,
+		arg.TenantID,
+		arg.UserID,
+		arg.Amr,
+		arg.AuthTime,
+		arg.Ip,
+		arg.UserAgent,
+		arg.ExpiresAt,
+	)
+	return err
 }
 
 const invalidateOtherSetupTokens = `-- name: InvalidateOtherSetupTokens :execrows
@@ -125,6 +238,105 @@ func (q *Queries) PasswordCredentialByEmail(ctx context.Context, arg PasswordCre
 		&i.CredentialID,
 		&i.SecretHash,
 		&i.CredentialExpiresAt,
+	)
+	return i, err
+}
+
+const revokeAllSessionsForUser = `-- name: RevokeAllSessionsForUser :many
+UPDATE session SET revoked_at = now()
+ WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING id
+`
+
+type RevokeAllSessionsForUserParams struct {
+	TenantID string
+	UserID   string
+}
+
+// Returns the ids it revoked, so the caller knows which cache keys to delete without
+// a second query. RETURNING rather than select-then-update keeps the two from
+// disagreeing when a session is created between them.
+func (q *Queries) RevokeAllSessionsForUser(ctx context.Context, arg RevokeAllSessionsForUserParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, revokeAllSessionsForUser, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeSession = `-- name: RevokeSession :execrows
+UPDATE session SET revoked_at = now()
+ WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL
+`
+
+type RevokeSessionParams struct {
+	TenantID string
+	ID       string
+}
+
+func (q *Queries) RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeSession, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const sessionByID = `-- name: SessionByID :one
+SELECT id, tenant_id, user_id, amr, auth_time, coalesce(ip::text, '')::text AS ip, user_agent,
+       created_at, expires_at, revoked_at
+  FROM session
+ WHERE tenant_id = $1 AND id = $2
+`
+
+type SessionByIDParams struct {
+	TenantID string
+	ID       string
+}
+
+type SessionByIDRow struct {
+	ID        string
+	TenantID  string
+	UserID    string
+	Amr       []string
+	AuthTime  time.Time
+	Ip        string
+	UserAgent *string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	RevokedAt *time.Time
+}
+
+// ip is coalesced to text on the way out. The column is inet, which pgx will not scan
+// into a *string in binary format; and the empty string is a better "no address" than
+// a null here, because every caller renders this into a list for a person to read and
+// would have to unwrap the pointer to the same effect.
+func (q *Queries) SessionByID(ctx context.Context, arg SessionByIDParams) (SessionByIDRow, error) {
+	row := q.db.QueryRow(ctx, sessionByID, arg.TenantID, arg.ID)
+	var i SessionByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.UserID,
+		&i.Amr,
+		&i.AuthTime,
+		&i.Ip,
+		&i.UserAgent,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }

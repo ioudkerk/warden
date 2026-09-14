@@ -90,6 +90,12 @@ security:
   # Must be shorter than key_rotation_interval, or keys are never actually retired.
   key_overlap_window: 24h
 
+  # A browser SSO session (SPEC §8.3). The absolute lifetime is the ceiling however
+  # active the session is; the idle timeout slides, extended by every use, and must not
+  # exceed the absolute one or it would never be what ends a session.
+  session_absolute_lifetime: 720h # 30 days
+  session_idle_timeout: 168h      # 7 days
+
   # A Have I Been Pwned corpus for the breached-password check that SPEC §7.2 makes
   # mandatory: the "hash:count" download, sorted by hash. It is searched in place, so
   # the full multi-gigabyte file is fine — it is never loaded into memory.

@@ -157,6 +157,10 @@ func fields() []field {
 			durationSetter(func(c *Config) *time.Duration { return &c.Security.KeyOverlapWindow })},
 		{"security-breached-password-file", "WARDEN_SECURITY_BREACHED_PASSWORD_FILE", "Have I Been Pwned corpus for the breached-password check",
 			func(c *Config, v string) error { c.Security.BreachedPasswordFile = v; return nil }},
+		{"security-session-absolute-lifetime", "WARDEN_SECURITY_SESSION_ABSOLUTE_LIFETIME", "maximum life of a session, however active",
+			durationSetter(func(c *Config) *time.Duration { return &c.Security.SessionAbsoluteLifetime })},
+		{"security-session-idle-timeout", "WARDEN_SECURITY_SESSION_IDLE_TIMEOUT", "how long an unused session survives",
+			durationSetter(func(c *Config) *time.Duration { return &c.Security.SessionIdleTimeout })},
 
 		{"log-level", "WARDEN_LOG_LEVEL", "log level: debug, info, warn or error",
 			func(c *Config, v string) error { c.Log.Level = v; return nil }},

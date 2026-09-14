@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/authz"
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
@@ -43,6 +44,7 @@ type Server struct {
 	cache     cache.Cache
 	tracer    trace.Tracer
 	keys      *keys.Manager
+	sessions  *authn.Sessions
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
@@ -73,6 +75,11 @@ type Deps struct {
 	// role has nothing to sign, and the JWKS route is simply absent when it is nil,
 	// rather than present and answering with an error.
 	Keys *keys.Manager
+
+	// Sessions serves SPEC §8.3's session management. Optional for the same reason,
+	// though the routes are registered either way so that a misconfigured deployment
+	// answers 503 with a reason rather than 404, which would look like a version skew.
+	Sessions *authn.Sessions
 }
 
 // New builds the server.
@@ -90,7 +97,7 @@ func New(d Deps) (*Server, error) {
 		cfg: d.Config, log: d.Log, engine: engine,
 		tenant: d.Tenant, system: d.System, decisions: d.Decisions,
 		metrics: d.Metrics, cache: d.Cache, tracer: tracerOf(d.Tracing),
-		keys: d.Keys,
+		keys: d.Keys, sessions: d.Sessions,
 	}, nil
 }
 
@@ -179,6 +186,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
 	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))
 	mux.HandleFunc("POST /v1/authz/filter", s.requireCaller(s.handleFilter))
+
+	mux.HandleFunc("GET /v1/users/{id}/sessions", s.requireCaller(s.requireSessions(s.handleUserSessions)))
+	mux.HandleFunc("POST /v1/sessions/{id}/revoke", s.requireCaller(s.requireSessions(s.handleRevokeSession)))
+	mux.HandleFunc("POST /v1/users/{id}/revoke-all", s.requireCaller(s.requireSessions(s.handleRevokeAllSessions)))
 
 	mux.HandleFunc("GET /v1/ui/bundle", s.requireCaller(s.handleUIBundle))
 	mux.HandleFunc("POST /v1/ui/resolve", s.requireCaller(s.handleUIResolve))

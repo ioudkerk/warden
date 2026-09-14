@@ -16,6 +16,10 @@ type Querier interface {
 	// the moment that happens: before it the account has no credential and can do nothing,
 	// which is the property SPEC §20.2 is after.
 	ActivateUser(ctx context.Context, arg ActivateUserParams) error
+	// The active-sessions list. Revoked and expired rows are excluded rather than shown
+	// greyed out: this feeds a "these are your signed-in devices" screen, and a list that
+	// includes sessions the user cannot act on is a list they will misread.
+	ActiveSessionsForUser(ctx context.Context, arg ActiveSessionsForUserParams) ([]ActiveSessionsForUserRow, error)
 	ActiveSigningKey(ctx context.Context) (ActiveSigningKeyRow, error)
 	// The active key's metadata, without its private half. The rotation scheduler asks
 	// "is the current key due?" far more often than anything asks to sign, and opening a
@@ -52,6 +56,9 @@ type Querier interface {
 	// settles rather than one the application hopes not to lose.
 	ConsumeSetupToken(ctx context.Context, id string) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
+	// Sessions whose absolute lifetime has passed are of no further interest to anyone;
+	// the row is kept only long enough for the UI to be honest about recent activity.
+	DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteGrant(ctx context.Context, arg DeleteGrantParams) error
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
 	DeleteRolePermissions(ctx context.Context, roleID string) error
@@ -74,6 +81,16 @@ type Querier interface {
 	// The token is never stored, only its SHA-256, so a copy of the database does not
 	// confer the ability to impersonate the application.
 	InsertServiceAccount(ctx context.Context, arg InsertServiceAccountParams) error
+	// ---------------------------------------------------------------------------------
+	// Sessions (SPEC §8.3)
+	// ---------------------------------------------------------------------------------
+	//
+	// Redis holds the authoritative session record; these rows are the mirror the spec
+	// asks for, and they serve two purposes Redis cannot. They are what the
+	// active-sessions UI lists, and they are how "revoke everything for this user" finds
+	// the keys to delete — Redis can answer "is this session valid?" in one lookup but
+	// cannot enumerate a user's sessions without a scan.
+	InsertSession(ctx context.Context, arg InsertSessionParams) error
 	InsertSetupToken(ctx context.Context, arg InsertSetupTokenParams) error
 	InsertSigningKey(ctx context.Context, arg InsertSigningKeyParams) error
 	InsertTenant(ctx context.Context, arg InsertTenantParams) error
@@ -150,12 +167,22 @@ type Querier interface {
 	// shortening the window takes effect on the next sweep instead of on the next
 	// migration.
 	RetireOverlappedSigningKeys(ctx context.Context, cutoff time.Time) (int64, error)
+	// Returns the ids it revoked, so the caller knows which cache keys to delete without
+	// a second query. RETURNING rather than select-then-update keeps the two from
+	// disagreeing when a session is created between them.
+	RevokeAllSessionsForUser(ctx context.Context, arg RevokeAllSessionsForUserParams) ([]string, error)
+	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
 	// The HTTP surface (internal/httpapi).
 	// Resolves a bearer token to a service account. This runs on the system pool, and
 	// necessarily so: it has to find which tenant the token belongs to before a tenant
 	// scope can exist. service_account is registered as a deliberate exception to
 	// row-level security for exactly this reason.
 	ServiceAccountByTokenHash(ctx context.Context, tokenHash []byte) (ServiceAccountByTokenHashRow, error)
+	// ip is coalesced to text on the way out. The column is inet, which pgx will not scan
+	// into a *string in binary format; and the empty string is a better "no address" than
+	// a null here, because every caller renders this into a list for a person to read and
+	// would have to unwrap the pointer to the same effect.
+	SessionByID(ctx context.Context, arg SessionByIDParams) (SessionByIDRow, error)
 	SetGrantGrantedBy(ctx context.Context, arg SetGrantGrantedByParams) error
 	// Set in a second pass, so a type may name a parent declared after it.
 	SetResourceTypeParent(ctx context.Context, arg SetResourceTypeParentParams) error

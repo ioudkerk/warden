@@ -180,6 +180,17 @@ type SecurityConfig struct {
 	// KeyRotationInterval is the signing-key rotation schedule (SPEC §17).
 	KeyRotationInterval time.Duration `yaml:"key_rotation_interval"`
 
+	// SessionAbsoluteLifetime is how long a browser SSO session may live, however
+	// active it is. SPEC §8.3 gives 30 days for the refresh token a session backs, and
+	// the session is the artifact that outlives token refresh, so they match.
+	SessionAbsoluteLifetime time.Duration `yaml:"session_absolute_lifetime"`
+
+	// SessionIdleTimeout ends a session that has gone unused. It slides: every
+	// successful validation extends it. The absolute lifetime is the ceiling that
+	// sliding cannot push past, which is what stops a session living forever because
+	// something polls it.
+	SessionIdleTimeout time.Duration `yaml:"session_idle_timeout"`
+
 	// BreachedPasswordFile points at a Have I Been Pwned corpus — the "hash:count"
 	// download, sorted by hash. SPEC §7.2 makes the breached-password check
 	// mandatory, and Warden ships a small built-in list so that the check is never a
@@ -264,6 +275,9 @@ func Defaults() *Config {
 			AccessTokenTTL:        10 * time.Minute, // SPEC §8.2 default
 			KeyRotationInterval:   90 * 24 * time.Hour,
 			KeyOverlapWindow:      24 * time.Hour,
+
+			SessionAbsoluteLifetime: 30 * 24 * time.Hour, // SPEC §8.3
+			SessionIdleTimeout:      7 * 24 * time.Hour,  // SPEC §8.3
 		},
 
 		Log: LogConfig{

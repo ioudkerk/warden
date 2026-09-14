@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/warden-project/warden/internal/audit"
 	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
@@ -304,11 +305,29 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	}()
 	log.Info("cache connected", "backend", cacheClient.Backend())
 
+	// Sessions need the cache tier for validity and the mirror for the active-sessions
+	// list, so they are built after both. Without the system pool the mirror cannot be
+	// purged and revocations cannot be audited, which is a degraded session store
+	// rather than none — it is built either way and says what is missing.
+	sessions, err := authn.NewSessions(db, system, cacheClient, authn.SessionOptions{
+		AbsoluteLifetime: cfg.Security.SessionAbsoluteLifetime,
+		IdleTimeout:      cfg.Security.SessionIdleTimeout,
+		Log:              log,
+		Audit:            audit.NewWriter(),
+	})
+	if err != nil {
+		return err
+	}
+	if system == nil {
+		log.Warn("session revocations will not be audited and expired sessions will not be " +
+			"purged: database.system_url is not configured")
+	}
+
 	server, err := httpapi.New(httpapi.Deps{
 		Config: cfg, Log: log,
 		Tenant: db, System: system,
 		Decisions: decisions, Metrics: metricSet, Cache: cacheClient, Tracing: tracing,
-		Keys: keyManager,
+		Keys: keyManager, Sessions: sessions,
 	})
 	if err != nil {
 		return err

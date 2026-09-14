@@ -342,6 +342,21 @@ func (c *Config) validateSecurity(errs *Errors, lookupEnv secrets.LookupEnvFunc,
 			"is %s; signing keys must rotate at least yearly (SPEC §17)", c.Security.KeyRotationInterval))
 	}
 
+	switch {
+	case c.Security.SessionAbsoluteLifetime <= 0:
+		errs.add("security.session_absolute_lifetime", "must be positive")
+	case c.Security.SessionIdleTimeout <= 0:
+		errs.add("security.session_idle_timeout", "must be positive")
+	case c.Security.SessionIdleTimeout > c.Security.SessionAbsoluteLifetime:
+		// Not merely redundant: an idle timeout above the absolute lifetime reads as
+		// "sessions last a week of inactivity" while the absolute ceiling quietly ends
+		// them sooner, so the setting that appears to govern does not.
+		errs.add("security.session_idle_timeout", fmt.Sprintf(
+			"is %s, longer than security.session_absolute_lifetime (%s); the absolute "+
+				"lifetime would end every session first, making this setting inert",
+			c.Security.SessionIdleTimeout, c.Security.SessionAbsoluteLifetime))
+	}
+
 	// The overlap window is what makes rotation invisible to relying parties. Too
 	// short and it stops being an overlap: a token signed a moment before the
 	// rotation outlives the key that verifies it. Too long and a key that has been
