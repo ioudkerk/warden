@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -56,6 +57,16 @@ type Cache interface {
 	// Expire resets a key's time to live, for the sliding idle timeout of a session.
 	// It reports whether the key existed.
 	Expire(ctx context.Context, key string, ttl time.Duration) (bool, error)
+
+	// Increment adds one to a counter and returns the new value, setting the time to
+	// live when the key is created.
+	//
+	// Atomic, and that is the whole reason it exists rather than being a Get followed
+	// by a Set. The caller is the login rate limiter: two simultaneous wrong passwords
+	// that both read 3 and both write 4 have counted one attempt, and an attacker who
+	// can make requests in parallel — which is every attacker — would raise the
+	// effective limit by their own concurrency.
+	Increment(ctx context.Context, key string, ttl time.Duration) (int64, error)
 }
 
 // Open connects to the configured backend.
@@ -151,6 +162,22 @@ func (c *redisCache) Expire(ctx context.Context, key string, ttl time.Duration) 
 	return c.client.Expire(ctx, key, ttl).Result()
 }
 
+func (c *redisCache) Increment(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	// INCR then EXPIRE in one round trip. The expiry is set unconditionally rather
+	// than only on creation: a counter whose key survived without one would never
+	// reset, and a user locked out permanently by a Redis hiccup is worse than a
+	// window that occasionally slides.
+	pipe := c.client.TxPipeline()
+	incr := pipe.Incr(ctx, key)
+	if ttl > 0 {
+		pipe.Expire(ctx, key, ttl)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, err
+	}
+	return incr.Val(), nil
+}
+
 // inProcess is the single-node backend of SPEC §19. It is always reachable, because
 // it is this process — which is exactly why it cannot propagate a change to another
 // replica, and why config refuses it in production.
@@ -229,6 +256,28 @@ func (c *inProcess) Delete(_ context.Context, keys ...string) error {
 		delete(c.entries, key)
 	}
 	return nil
+}
+
+func (c *inProcess) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var count int64
+	if value, found := c.live(key); found {
+		parsed, err := strconv.ParseInt(string(value), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("counter %q holds %q, which is not a number", key, value)
+		}
+		count = parsed
+	}
+	count++
+
+	entry := inProcessEntry{value: []byte(strconv.FormatInt(count, 10))}
+	if ttl > 0 {
+		entry.expires = time.Now().Add(ttl)
+	}
+	c.entries[key] = entry
+	return count, nil
 }
 
 func (c *inProcess) Expire(_ context.Context, key string, ttl time.Duration) (bool, error) {

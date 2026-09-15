@@ -244,7 +244,7 @@ library, with no Warden-specific client code.
 | --- | --- | --- |
 | M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
 | M1-2 [B] | **Status: done.** Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Met. `TestUnknownUserAndWrongPasswordTakeTheSameTime` measures both paths against the cost of one Argon2id hash; they differ by under 1% of it, and the test fails loudly if either path skips the hash |
-| M1-3 | **Deferred, not skipped — take with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | Enumeration test across login, reset and invite endpoints finds no oracle. **Blocked:** none of those endpoints exist yet — login is M1-6, reset and invite are M1-9 — so the test that defines "done" cannot be written. The core (counter, backoff, per-account cap) is HTTP-independent and could land earlier; what must not happen is M1-6 shipping a login endpoint with no brute-force protection, because M1-2 closed the account-existence oracle but nothing yet throttles online guessing |
+| M1-3 | **Core done; the HTTP half lands with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one). **Remaining:** `429` + `Retry-After` on the login endpoint, and the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so the sweep cannot be complete before then |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | **In progress (2 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry, with "absent not disabled" enforced by schema constraint; the fosite storage adapter, the composed provider and the discovery document. **Remaining:** authorize + login + token (with **M1-3** folded in); then userinfo, introspect, revoke, logout, PAR, device |
@@ -324,6 +324,41 @@ should not be a surprise at release time, and the table above is what to answer 
 
 Every fosite release from v0.45 onward carries this chain; only v0.44.0 (2023) is clean,
 which is not a sensible pin for a security component.
+
+### Notes from M1-3 (core)
+
+**Two counters, because they answer different attacks.** The (account, IP) counter slows
+somebody guessing one account from one place and costs them doubling time; the per-account
+counter is the backstop against a distributed attempt, where each source looks innocent
+and only the account sees the volume. The account cap is deliberately generous and expires
+by itself, because it is also the lever for locking a real person out on purpose.
+
+**It counts what was presented, not what exists.** An attempt against an address with no
+account increments exactly as one against a real user. Anything else is an enumeration
+oracle — an attacker who is *never* rate-limited has learned the address is unknown — and
+it would have undone M1-2's timing work at the layer above it.
+`TestAnUnknownAddressIsLimitedIdentically` is the guard.
+
+**Counters live in the cache tier, not in the process.** A per-process counter multiplies
+the effective limit by the replica count, which is the quietest possible way to not have
+rate limiting. `TestTheCounterIsSharedAcrossReplicas` alternates failures between two
+limiters over one cache and asserts they add up. The pepper that keys the identifier hash
+must be derived from the KEK for the same reason: a per-process pepper gives each replica
+its own key space.
+
+**Identifiers are HMAC'd into cache keys.** The addresses people fail to log in as are
+worth as much to an attacker as a user list, and HMAC rather than a bare hash means
+someone holding the cache cannot confirm a guessed address by hashing it themselves.
+
+**An off-by-one the test caught.** `FreeAttempts: 3` granted four free attempts: the delay
+was computed from failures *past* the allowance rather than *at* it, so the third failure —
+the one that should impose the first delay — imposed none. Reverting the `+1` still fails
+`TestTheFirstFewFailuresCostNothing`.
+
+**`cache.Increment` is atomic, and that is the point.** Two simultaneous wrong passwords
+that both read 3 and both write 4 have counted one attempt, so an attacker with any
+concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
+the in-process backend holds its mutex across the read and the write.
 
 ### Notes from M1-6, part 2
 

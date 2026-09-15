@@ -582,6 +582,10 @@ func (unusableCache) Expire(context.Context, string, time.Duration) (bool, error
 	return false, errors.New("this stub cache does not store anything")
 }
 
+func (unusableCache) Increment(context.Context, string, time.Duration) (int64, error) {
+	return 0, errors.New("this stub cache does not store anything")
+}
+
 // failingCache stands in for an unreachable cache tier.
 type failingCache struct {
 	unusableCache

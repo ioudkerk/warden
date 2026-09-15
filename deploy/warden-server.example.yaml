@@ -105,6 +105,26 @@ security:
   refresh_token_absolute_lifetime: 720h # 30 days
   refresh_token_idle_lifetime: 168h     # 7 days
 
+  # Login rate limiting (SPEC §7.2): exponential backoff per (account, IP) plus a
+  # global per-account cap.
+  #
+  # The two counters answer different attacks. The pair backoff slows somebody guessing
+  # one account from one place — the common case, and one that should cost time rather
+  # than lock anybody out. The account cap is the backstop against a distributed attempt
+  # where every source looks innocent; it is deliberately generous, because it is also
+  # the lever for locking a real person out on purpose.
+  #
+  # Counters live in the cache tier so they are shared across replicas. A per-process
+  # counter would multiply the effective limit by the number of processes, which is the
+  # quietest possible way to not have rate limiting.
+  lockout:
+    free_attempts: 5      # failures before any delay
+    base_delay: 1s        # doubles with each further failure
+    max_delay: 15m
+    pair_window: 1h       # how long (account, IP) failures are remembered
+    account_cap: 100      # failures across all sources before outright refusal
+    account_window: 1h
+
   # A Have I Been Pwned corpus for the breached-password check that SPEC §7.2 makes
   # mandatory: the "hash:count" download, sorted by hash. It is searched in place, so
   # the full multi-gigabyte file is fine — it is never loaded into memory.

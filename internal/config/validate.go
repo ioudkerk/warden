@@ -369,6 +369,23 @@ func (c *Config) validateSecurity(errs *Errors, lookupEnv secrets.LookupEnvFunc,
 			c.Security.RefreshTokenIdleLifetime, c.Security.RefreshTokenAbsoluteLifetime))
 	}
 
+	switch {
+	case c.Security.Lockout.FreeAttempts < 0:
+		errs.add("security.lockout.free_attempts", "cannot be negative")
+	case c.Security.Lockout.BaseDelay <= 0:
+		errs.add("security.lockout.base_delay", "must be positive")
+	case c.Security.Lockout.MaxDelay < c.Security.Lockout.BaseDelay:
+		errs.add("security.lockout.max_delay", fmt.Sprintf(
+			"is %s, below security.lockout.base_delay (%s); the backoff would shrink",
+			c.Security.Lockout.MaxDelay, c.Security.Lockout.BaseDelay))
+	case c.Security.Lockout.PairWindow <= 0:
+		errs.add("security.lockout.pair_window", "must be positive")
+	case c.Security.Lockout.AccountCap < 1:
+		errs.add("security.lockout.account_cap", "must be at least 1; zero would refuse every login")
+	case c.Security.Lockout.AccountWindow <= 0:
+		errs.add("security.lockout.account_window", "must be positive")
+	}
+
 	// The overlap window is what makes rotation invisible to relying parties. Too
 	// short and it stops being an overlap: a token signed a moment before the
 	// rotation outlives the key that verifies it. Too long and a key that has been

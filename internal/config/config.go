@@ -202,6 +202,10 @@ type SecurityConfig struct {
 	RefreshTokenAbsoluteLifetime time.Duration `yaml:"refresh_token_absolute_lifetime"`
 	RefreshTokenIdleLifetime     time.Duration `yaml:"refresh_token_idle_lifetime"`
 
+	// Lockout is SPEC §7.2's login rate limiting: exponential backoff per
+	// (account, IP) plus a global per-account cap.
+	Lockout LockoutConfig `yaml:"lockout"`
+
 	// BreachedPasswordFile points at a Have I Been Pwned corpus — the "hash:count"
 	// download, sorted by hash. SPEC §7.2 makes the breached-password check
 	// mandatory, and Warden ships a small built-in list so that the check is never a
@@ -224,6 +228,31 @@ type SecurityConfig struct {
 	// It also has to outlast the caching that relying parties do of their own
 	// accord, which is why the default is a day rather than a quarter of an hour.
 	KeyOverlapWindow time.Duration `yaml:"key_overlap_window"`
+}
+
+// LockoutConfig tunes login rate limiting (SPEC §7.2).
+//
+// The defaults are chosen so that somebody who has forgotten their password notices
+// nothing for the first few tries, while an automated attempt is reduced to a handful of
+// guesses per hour from any one source. Loosening them is a decision, which is why each
+// is a setting rather than a constant.
+type LockoutConfig struct {
+	// FreeAttempts is how many failures an (account, IP) pair gets before any delay.
+	FreeAttempts int `yaml:"free_attempts"`
+	// BaseDelay is the first delay past the allowance; it doubles with each failure.
+	BaseDelay time.Duration `yaml:"base_delay"`
+	// MaxDelay caps the doubling, so that a user locked out by somebody else's
+	// guessing has a bounded wait.
+	MaxDelay time.Duration `yaml:"max_delay"`
+	// PairWindow is how long pair failures are remembered.
+	PairWindow time.Duration `yaml:"pair_window"`
+	// AccountCap is the failures an account tolerates across every source before
+	// attempts are refused outright. It is the backstop against a distributed attempt,
+	// and it is generous because it is also the lever for locking somebody out on
+	// purpose.
+	AccountCap int `yaml:"account_cap"`
+	// AccountWindow is the account counter's memory.
+	AccountWindow time.Duration `yaml:"account_window"`
 }
 
 // LogConfig configures diagnostic output.
@@ -286,6 +315,15 @@ func Defaults() *Config {
 			AccessTokenTTL:        10 * time.Minute, // SPEC §8.2 default
 			KeyRotationInterval:   90 * 24 * time.Hour,
 			KeyOverlapWindow:      24 * time.Hour,
+
+			Lockout: LockoutConfig{
+				FreeAttempts:  5,
+				BaseDelay:     time.Second,
+				MaxDelay:      15 * time.Minute,
+				PairWindow:    time.Hour,
+				AccountCap:    100,
+				AccountWindow: time.Hour,
+			},
 
 			SessionAbsoluteLifetime: 30 * 24 * time.Hour, // SPEC §8.3
 			SessionIdleTimeout:      7 * 24 * time.Hour,  // SPEC §8.3
