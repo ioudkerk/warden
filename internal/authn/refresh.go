@@ -523,7 +523,12 @@ func (r *RefreshTokens) RevokeFamily(ctx context.Context, tenantID, familyID, re
 		sessionID: sample.SessionID, userID: sample.Subject,
 		clientID: sample.ClientID, tokenID: sample.ID,
 		revokedCount: revoked,
-		// The alarm, not a repeat: the caller detected this replay just now.
+		// Nothing was revoked because everything already was, so the alarm has been
+		// raised for this family before and this presentation is a subsequent attempt.
+		// Without this, a caller that revokes an already-dead family — which fosite
+		// does, every time somebody retries a stolen token — would raise a fresh alarm
+		// per attempt rather than one per incident.
+		alreadyRevoked: revoked == 0,
 	})
 	_ = reason
 	return nil

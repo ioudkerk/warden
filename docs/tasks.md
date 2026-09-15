@@ -247,7 +247,7 @@ library, with no Warden-specific client code.
 | M1-3 | **Core done; the HTTP half lands with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one). **Remaining:** `429` + `Retry-After` on the login endpoint, and the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so the sweep cannot be complete before then |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | **In progress (2 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry, with "absent not disabled" enforced by schema constraint; the fosite storage adapter, the composed provider and the discovery document. **Remaining:** authorize + login + token (with **M1-3** folded in); then userinfo, introspect, revoke, logout, PAR, device |
+| M1-6 [B] | **In progress (3 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in. A stock client can now log a user in and refresh. **Remaining:** userinfo, introspect, revoke, logout, PAR and device, then the certification-style checks |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
@@ -359,6 +359,51 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-6, part 3
+
+The authorization code flow works end to end. `TestTheAuthorizationCodeFlow` walks every
+step a stock OIDC library performs — authorize, login page, password, redirect, code,
+exchange — with nothing but HTTP between the test and the server, and the same sequence
+was driven against the running deployment with `curl` alone.
+
+**The tenant is established at the edge, before fosite sees anything.** fosite's storage
+interfaces take a signature and nothing else; there is no tenant parameter anywhere in
+them. Both endpoints resolve the client to its tenant and put it in the context, so every
+storage call afterwards has a scope without re-resolving one, and one tenant's codes
+cannot be redeemed in another's exchange.
+
+**An unknown client or an unregistered redirect_uri is refused directly, never by
+redirect.** Redirecting an error to a URI no registered client has vouched for is how an
+authorization endpoint becomes an open redirect, and the victim is mid-login.
+`safeReturnTo` applies the same rule to the login page's own destination: only a relative
+path under `/oauth2/authorize`, so an absolute, protocol-relative or backslash-prefixed
+value is refused.
+
+**There is no consent screen, deliberately.** Every client here is one the tenant's own
+administrator registered, so consent is implied by registration. A third-party client —
+registered by somebody other than the resource owner — would need one, and nothing in the
+model distinguishes those yet. Recorded because it is a gap, not an oversight.
+
+**Cookies.** `__Host-` prefixed in production, which is a browser-enforced guarantee that
+a sibling subdomain cannot set or overwrite the session; a different name in development,
+where the prefix's mandatory Secure attribute cannot be satisfied over http, so a cookie
+set in development is never mistaken for one carrying the guarantees. `SameSite=Lax` on
+the session, because the authorization endpoint is reached by a top-level navigation from
+the client's site and `Strict` would withhold the cookie on exactly that request;
+`SameSite=Strict` on the CSRF cookie, which no cross-site navigation legitimately needs.
+
+**One theft, one alarm — found on a live run.** The first end-to-end run produced *two*
+`security.refresh_token_reuse` rows for a single replay. `GetRefreshTokenSession` returned
+`ErrInactiveToken` for both consumed and revoked tokens, so the legitimate client's
+collateral token sent fosite into reuse handling a second time. Two independent fixes now
+hold it — the storage returns `ErrNotFound` for revoked-but-unconsumed, and `RevokeFamily`
+classifies a revocation that changed no rows as a repeat. Either alone is sufficient;
+`TestOneTheftRaisesOneAlarm` reports three alarms when both are removed.
+
+**`sid` and `tid` reach the id token through `Extra`**, which fosite flattens to the top
+level rather than nesting under `ext`. Without `sid` a relying party cannot tie a token to
+the session that issued it, and back-channel logout has nothing to target.
 
 ### Notes from M1-6, part 2
 

@@ -212,29 +212,6 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		log.Info("system database connected", "role", system.Role())
 	}
 
-	// Validate the breached-password corpus now rather than at the first password
-	// change. The failure this catches is the quiet one: a file in the wrong format
-	// loads happily and answers "not breached" to everything, which turns the one
-	// mandatory check in SPEC §7.2 into a no-op that looks like it is working.
-	//
-	// Opened and closed, not held: nothing serves a login yet. The authenticator opens
-	// its own when the OIDC endpoints arrive in M1-6.
-	if cfg.Security.BreachedPasswordFile != "" {
-		corpus, corpusErr := authn.OpenHIBPFile(cfg.Security.BreachedPasswordFile)
-		if corpusErr != nil {
-			return corpusErr
-		}
-		if closeErr := corpus.Close(); closeErr != nil {
-			log.Warn("closing the breached-password corpus", "error", closeErr)
-		}
-		log.Info("breached-password corpus validated", "path", cfg.Security.BreachedPasswordFile)
-	} else {
-		log.Warn("no breached-password corpus configured; the mandatory check in SPEC §7.2 "+
-			"runs against the built-in list only",
-			"entries", authn.NewEmbeddedSet().Size(),
-			"setting", "security.breached_password_file")
-	}
-
 	// Signing keys are deployment-level, so key management needs the system pool.
 	// Without one, this process can neither publish JWKS nor sign a token; it says so
 	// once at startup rather than failing per request.
@@ -346,6 +323,54 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		go authn.RunPurge(ctx, sessions, refreshTokens, log)
 	}
 
+	// The interactive login: password verification, and the rate limiting that must be
+	// in front of it before any endpoint exposes it (M1-3).
+	//
+	// Opening the breached-password corpus here is also what validates it, and the
+	// failure it catches is the quiet one: a file in the wrong format loads happily and
+	// answers "not breached" to everything, turning the one mandatory check in
+	// SPEC §7.2 into a no-op that looks like it is working. Until this commit the
+	// corpus was opened and closed at startup purely for that check, because nothing
+	// served a login; now something does.
+	//
+	// The limiter's pepper is
+	// KEK-derived so every replica keys its counters the same way — a per-process
+	// pepper would give each one its own key space and multiply the effective limit.
+	breached, closeBreached, err := openBreachSet(cfg, stderr)
+	if err != nil {
+		return err
+	}
+	defer closeBreached()
+
+	authenticator, err := authn.New(db, system, authn.Options{
+		Breached: breached,
+		Log:      log,
+		Audit:    audit.NewWriter(),
+	})
+	if err != nil {
+		return err
+	}
+
+	lockoutPepper, err := keyring.Derive("warden/login-lockout/pepper", 32)
+	if err != nil {
+		return err
+	}
+	lockout, err := authn.NewLockout(cacheClient, authn.LockoutOptions{
+		Policy: authn.LockoutPolicy{
+			FreeAttempts:  cfg.Security.Lockout.FreeAttempts,
+			BaseDelay:     cfg.Security.Lockout.BaseDelay,
+			MaxDelay:      cfg.Security.Lockout.MaxDelay,
+			PairWindow:    cfg.Security.Lockout.PairWindow,
+			AccountCap:    cfg.Security.Lockout.AccountCap,
+			AccountWindow: cfg.Security.Lockout.AccountWindow,
+		},
+		Log:    log,
+		Pepper: lockoutPepper,
+	})
+	if err != nil {
+		return err
+	}
+
 	// The OpenID Provider. It needs the client registry, the storage adapter over both
 	// pools, the refresh-token store (so a replayed token still revokes its family) and
 	// the signing keys.
@@ -378,6 +403,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		Tenant: db, System: system,
 		Decisions: decisions, Metrics: metricSet, Cache: cacheClient, Tracing: tracing,
 		Keys: keyManager, Sessions: sessions, Provider: provider,
+		Authn: authenticator, Lockout: lockout,
 	})
 	if err != nil {
 		return err

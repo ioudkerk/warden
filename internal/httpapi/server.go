@@ -47,6 +47,8 @@ type Server struct {
 	keys      *keys.Manager
 	sessions  *authn.Sessions
 	provider  *oidcop.Provider
+	authn     *authn.Authenticator
+	lockout   *authn.Lockout
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
@@ -85,6 +87,12 @@ type Deps struct {
 
 	// Provider is the OpenID Provider (SPEC §7.7). Optional on the same terms.
 	Provider *oidcop.Provider
+
+	// Authn verifies passwords for the interactive login, and Lockout rate-limits it
+	// (SPEC §7.2). Both are needed for the sign-in page; without them the login routes
+	// answer 503 rather than serving a form that cannot work.
+	Authn   *authn.Authenticator
+	Lockout *authn.Lockout
 }
 
 // New builds the server.
@@ -103,6 +111,7 @@ func New(d Deps) (*Server, error) {
 		tenant: d.Tenant, system: d.System, decisions: d.Decisions,
 		metrics: d.Metrics, cache: d.Cache, tracer: tracerOf(d.Tracing),
 		keys: d.Keys, sessions: d.Sessions, provider: d.Provider,
+		authn: d.Authn, lockout: d.Lockout,
 	}, nil
 }
 
@@ -191,6 +200,13 @@ func (s *Server) Handler() http.Handler {
 	// holding nothing reads in order to find everything else.
 	mux.HandleFunc("GET /.well-known/openid-configuration",
 		s.requireProvider(s.handleOpenIDConfiguration))
+
+	// The authorization code flow. Unauthenticated in the service-account sense: these
+	// are the endpoints through which a person and a client authenticate themselves.
+	mux.HandleFunc("GET /oauth2/authorize", s.requireProvider(s.requireLogin(s.handleAuthorize)))
+	mux.HandleFunc("POST /oauth2/token", s.requireProvider(s.handleToken))
+	mux.HandleFunc("GET /login", s.requireLogin(s.handleLoginForm))
+	mux.HandleFunc("POST /login", s.requireLogin(s.handleLoginSubmit))
 
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))

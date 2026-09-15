@@ -100,6 +100,10 @@ func NewStorage(tenant, system *store.Store, clients *Clients, opts StorageOptio
 	}, nil
 }
 
+// Clients returns the registry, for handlers that need to resolve a client to its
+// tenant before fosite is involved.
+func (s *Storage) Clients() *Clients { return s.clients }
+
 // signatureHash is what actually goes in the database.
 func signatureHash(signature string) []byte {
 	sum := sha256.Sum256([]byte(signature))

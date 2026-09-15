@@ -151,10 +151,23 @@ func (s *Storage) GetRefreshTokenSession(
 
 	switch {
 	case row.ConsumedAt != nil:
-		// The signal that drives fosite's reuse handling.
+		// Consumed and presented again: a replay. ErrInactiveToken is the signal
+		// fosite's refresh handler tests for, and it is what makes it revoke the
+		// exchange.
 		return request, fosite.ErrInactiveToken
+
 	case row.RevokedAt != nil:
-		return request, fosite.ErrInactiveToken
+		// Revoked but never consumed. This is the token the legitimate client was
+		// still holding when somebody else's replay killed the family — collateral
+		// damage, not evidence, and M1-5 draws exactly this distinction.
+		//
+		// ErrNotFound rather than ErrInactiveToken, and the difference matters:
+		// ErrInactiveToken sends fosite into its reuse handling, which revokes the
+		// family again and raises a second security event for an incident already
+		// reported. A live run produced two events for one theft before this line
+		// said ErrNotFound.
+		return request, fosite.ErrNotFound
+
 	case !time.Now().Before(row.ExpiresAt):
 		return request, fosite.ErrTokenExpired
 	}

@@ -38,6 +38,12 @@ type Session struct {
 func (s *Session) WardenSessionID() string { return s.SessionID }
 
 // NewSession builds a session for a user who has authenticated.
+//
+// `sid` and `tid` go in Extra, which fosite flattens to the top level of the token
+// rather than nesting under "ext" — so they appear exactly as SPEC §8.2 writes them.
+// `sid` is not decoration: it is what back-channel logout and "which session issued
+// this token?" both target, and an id token without one leaves a relying party unable
+// to tie a token to the session it came from.
 func NewSession(issuer, tenantID, sessionID, subject string, authTime time.Time, amr []string) *Session {
 	return &Session{
 		DefaultSession: &openid.DefaultSession{
@@ -47,6 +53,10 @@ func NewSession(issuer, tenantID, sessionID, subject string, authTime time.Time,
 				RequestedAt:                     time.Now().UTC(),
 				AuthTime:                        authTime,
 				AuthenticationMethodsReferences: amr,
+				Extra: map[string]any{
+					"sid": sessionID,
+					"tid": tenantID,
+				},
 			},
 			Headers: &jwt.Headers{Extra: map[string]any{}},
 			Subject: subject,
