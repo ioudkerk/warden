@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/ory/fosite"
 
@@ -46,6 +47,20 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	ctx = oidcop.WithTenant(ctx, tenantID)
 	r = r.WithContext(ctx)
 
+	session, signedIn := s.currentSession(r)
+	authenticated := signedIn && session.TenantID == tenantID
+
+	// A pushed request is checked for a session *before* fosite is asked to resolve it,
+	// and only a pushed one. The request_uri is single use — fosite deletes the row
+	// while parsing — so resolving it and then stopping to ask for a password would burn
+	// it, and the browser would come back holding a reference to something that no
+	// longer exists. Nothing is skipped by going early: a pushed request was fully
+	// validated when it was pushed, which is the whole point of pushing it.
+	if isPushedRequest(r) && !authenticated {
+		s.redirectToLogin(w, r)
+		return
+	}
+
 	request, err := s.provider.NewAuthorizeRequest(ctx, r)
 	if err != nil {
 		// From here on fosite knows the redirect_uri is registered, so errors go back
@@ -54,8 +69,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, signedIn := s.currentSession(r)
-	if !signedIn || session.TenantID != tenantID {
+	if !authenticated {
 		// Either nobody is signed in, or the session belongs to a different tenant —
 		// which happens when one browser is used for two deployments' clients, and
 		// must start a fresh login rather than silently authorize as the wrong person.
@@ -83,6 +97,59 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.provider.WriteAuthorizeResponse(ctx, w, request, response)
+}
+
+// isPushedRequest reports whether this authorization request is the continuation of a
+// pushed one (RFC 9126).
+func isPushedRequest(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Query().Get("request_uri"), pushedRequestURIPrefix)
+}
+
+// pushedRequestURIPrefix is the URN scheme RFC 9126 §2.2 registers, and fosite's default.
+const pushedRequestURIPrefix = "urn:ietf:params:oauth:request_uri:"
+
+// handlePushedAuthorize is the pushed authorization request endpoint (RFC 9126).
+//
+// It is the authorization request, sent back-channel and authenticated, in exchange for a
+// single-use reference. What that buys is worth stating: the parameters never travel
+// through the browser, so they cannot be read from a referrer, a history entry or a
+// server log, and they cannot be tampered with between the client and Warden — the
+// front-channel request carries only the reference.
+//
+// Offered, not required: `require_pushed_authorization_requests` is false in the
+// discovery document, because insisting on it would break every client that does not
+// implement it for a benefit each client can choose for itself.
+func (s *Server) handlePushedAuthorize(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if err := r.ParseForm(); err != nil {
+		writeProblem(w, http.StatusBadRequest, "invalid_request", "The request body could not be read.")
+		return
+	}
+
+	tenantID, err := s.tenantForClientRequest(r)
+	if err != nil {
+		s.log.Debug("a pushed authorization request named no resolvable client", "error", err)
+		s.provider.WritePushedAuthorizeError(ctx, w, nil, fosite.ErrInvalidClient)
+		return
+	}
+	ctx = oidcop.WithTenant(ctx, tenantID)
+	r = r.WithContext(ctx)
+
+	request, err := s.provider.NewPushedAuthorizeRequest(ctx, r)
+	if err != nil {
+		// Never a redirect, whatever the request said: this is a back-channel call from
+		// the client, and the error belongs in the response body.
+		s.provider.WritePushedAuthorizeError(ctx, w, request, err)
+		return
+	}
+
+	response, err := s.provider.NewPushedAuthorizeResponse(ctx, request, oidcop.NewEmptySession())
+	if err != nil {
+		s.provider.WritePushedAuthorizeError(ctx, w, request, err)
+		return
+	}
+	s.provider.WritePushedAuthorizeResponse(ctx, w, request, response)
 }
 
 // redirectToLogin sends the browser to the sign-in page, remembering where to come back.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -467,6 +468,15 @@ func (s *Storage) CreatePARSession(ctx context.Context, requestURI string, reque
 	return s.create(ctx, kindPAR, requestURI, request, time.Now().UTC().Add(parLifetime))
 }
 
+// GetPARSession rebuilds a pushed request.
+//
+// The rebuild has to be complete, and that is easy to get wrong: when fosite finds a
+// request_uri it takes what this returns and *returns immediately*, without parsing the
+// query string at all. Anything left at its zero value here is simply gone from the
+// authorization request — a missing response_type produces "unsupported response type",
+// and a missing redirect_uri produces an error with nowhere to send it. Only the generic
+// Request fields survive the round trip through the database, so the four that live on
+// AuthorizeRequest are read back out of the stored form.
 func (s *Storage) GetPARSession(ctx context.Context, requestURI string) (fosite.AuthorizeRequester, error) {
 	stored, err := s.get(ctx, kindPAR, requestURI, nil)
 	if err != nil {
@@ -476,7 +486,27 @@ func (s *Storage) GetPARSession(ctx context.Context, requestURI string) (fosite.
 	if !ok {
 		return nil, errors.New("the stored pushed authorization request has the wrong type")
 	}
-	return &fosite.AuthorizeRequest{Request: *request}, nil
+
+	authorize := &fosite.AuthorizeRequest{Request: *request}
+	form := request.GetRequestForm()
+	authorize.State = form.Get("state")
+	if responseType := form.Get("response_type"); responseType != "" {
+		authorize.ResponseTypes = fosite.Arguments(strings.Fields(responseType))
+	}
+	authorize.ResponseMode = fosite.ResponseModeType(form.Get("response_mode"))
+
+	if raw := form.Get("redirect_uri"); raw != "" {
+		// Matched against the client's registered list again rather than parsed and
+		// trusted. It was checked when the request was pushed, so this is the second
+		// check on the same rule — and the one that holds if a row is ever written by
+		// something other than the push endpoint.
+		matched, matchErr := fosite.MatchRedirectURIWithClientRedirectURIs(raw, request.GetClient())
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		authorize.RedirectURI = matched
+	}
+	return authorize, nil
 }
 
 func (s *Storage) DeletePARSession(ctx context.Context, requestURI string) error {

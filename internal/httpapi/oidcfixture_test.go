@@ -49,6 +49,7 @@ type oidcFixture struct {
 	resource       *oidcop.Client
 	resourceSecret string
 	audience       string
+	postLogoutURI  string
 
 	email    string
 	password string
@@ -238,12 +239,14 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 
 	const redirectURI = "https://app.acme.test/callback"
 	const audience = "https://api.acme.test"
+	const postLogoutURI = "https://app.acme.test/signed-out"
 	client, _, err := clients.Register(ctx, oidcop.NewClientOptions{
 		TenantID: tenantID, Key: "app", Name: "The ACME application",
-		Public:       true,
-		RedirectURIs: []string{redirectURI},
-		Scopes:       []string{"openid", "profile", "email", "offline_access"},
-		Audiences:    []string{audience},
+		Public:                 true,
+		RedirectURIs:           []string{redirectURI},
+		Scopes:                 []string{"openid", "profile", "email", "offline_access"},
+		Audiences:              []string{audience},
+		PostLogoutRedirectURIs: []string{postLogoutURI},
 	})
 	if err != nil {
 		t.Fatalf("client: %v", err)
@@ -278,7 +281,8 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		handler: server.Handler(), keys: km, issuer: issuer,
 		client: client, redirectURI: redirectURI,
 		resource: resource, resourceSecret: resourceSecret, audience: audience,
-		email: email, password: password, userID: userID,
+		postLogoutURI: postLogoutURI,
+		email:         email, password: password, userID: userID,
 	}
 }
 

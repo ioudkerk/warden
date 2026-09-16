@@ -212,6 +212,11 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 
 		GlobalSecret: opts.GlobalSecret,
 
+		// The lifetime the PAR response advertises. Set explicitly so that the
+		// expires_in a client is told matches the expires_at the row carries; with
+		// fosite's default they would be two different numbers describing one deadline.
+		PushedAuthorizeContextLifespan: parLifetime,
+
 		// Refresh tokens are rotated and their reuse is detected, so a grace period
 		// would be a window in which a stolen token is honoured. Warden has none, and
 		// the storage adapter's RevokeRefreshTokenMaybeGracePeriod says the same.

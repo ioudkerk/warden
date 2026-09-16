@@ -215,6 +215,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /oauth2/userinfo", s.requireProvider(s.handleUserinfo))
 	mux.HandleFunc("POST /oauth2/introspect", s.requireProvider(s.handleIntrospect))
 	mux.HandleFunc("POST /oauth2/revoke", s.requireProvider(s.handleRevoke))
+	mux.HandleFunc("POST /oauth2/par", s.requireProvider(s.handlePushedAuthorize))
+
+	// RP-initiated logout. Both methods: a relying party sends the browser here with a
+	// GET, and the confirmation page it may land on posts back.
+	mux.HandleFunc("GET /oauth2/logout", s.requireProvider(s.handleLogout))
+	mux.HandleFunc("POST /oauth2/logout", s.requireProvider(s.handleLogout))
 
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))

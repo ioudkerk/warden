@@ -247,7 +247,7 @@ library, with no Warden-specific client code.
 | M1-3 | **Core done; the HTTP half lands with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one). **Remaining:** `429` + `Retry-After` on the login endpoint, and the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so the sweep cannot be complete before then |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | **In progress (4a of 4c).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in; **userinfo, introspection and revocation**, plus the client credentials grant the discovery document was already advertising. **Remaining:** logout and PAR (4b), the device grant (4c — fosite has no RFC 8628 handler, so it is hand-written), then the certification-style checks |
+| M1-6 [B] | **In progress (4b of 4c).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in; **userinfo, introspection and revocation**, plus the client credentials grant the discovery document was already advertising; **RP-initiated logout and pushed authorization requests**. **Remaining:** the device grant (4c — fosite has no RFC 8628 handler, so it is hand-written), then the certification-style checks |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
@@ -359,6 +359,57 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-6, part 4b: logout and pushed authorization requests
+
+**Pushed authorization requests were stored but could not be used.** fosite deletes the
+`request_uri` row *while parsing the authorization request* and, when it finds one,
+returns immediately without reading the query string at all — so whatever
+`GetPARSession` leaves at its zero value is simply gone. Only the generic `Request`
+fields survived the round trip, which meant the redirect URI, the response type and the
+state all arrived empty: an authorization request with no response type and nowhere to
+send the answer. They are now read back out of the stored form, and the redirect URI is
+re-matched against the client's registered list rather than parsed and trusted.
+`TestThePushedAuthorizationRequestFlow` redirects to `""` without the fix.
+
+**The login round trip would have burned the one-shot reference.** A pushed request that
+arrives with no session used to be resolved by fosite — consuming the row — and only then
+sent to the login page, so the browser came back holding a reference to something that no
+longer existed. The session check now happens *before* fosite for pushed requests, and
+only for those. Nothing is skipped by going early: a pushed request was fully validated
+when it was pushed, which is the point of pushing it. The alternative, re-storing the row
+with a longer life so a human has time to type a password, would have widened a window
+RFC 9126 deliberately keeps at a minute.
+
+**Logging out has to end everything the session issued.** Nothing in fosite's storage
+consults a Warden session — a refresh token is valid because its own row says so — so a
+logout that only dropped the cookie would leave a thirty-day credential working, and the
+client holding it could sign the user straight back in. `Storage.EndSession` revokes the
+refresh tokens, deletes the session's `oauth_session` rows and then revokes the session,
+in that order: the longest-lived credential dies first, so a failure halfway leaves the
+user signed in with dead tokens rather than signed out with a live one. Removing either
+half fails `TestLogoutEndsEverythingTheSessionIssued` on a different line.
+
+**A GET can be caused by any page on the internet, so logout asks first.** An `<img>` tag
+pointing at `/oauth2/logout` would otherwise sign a user out from anywhere. Two things
+make a request trustworthy enough to act on without asking: a form post carrying the CSRF
+token, or an `id_token_hint` that verifies against the published keys *and* names the very
+session the browser is presenting. Anything else renders a confirmation page. A forged
+hint therefore costs an attacker a click they cannot make.
+
+**The hint's signature is checked; its expiry deliberately is not.** RP-Initiated Logout §2
+says an expired id token is still a valid hint, and insisting otherwise would mean a client
+could not log a user out with the token it was handed ten minutes ago. A 24-hour age bound
+stands in, so an id token recovered from a log file a year later is not a way to target a
+session. An unverifiable hint is treated as no hint rather than as an error: refusing would
+make a key rotation look like a broken provider to every client still holding an older
+token.
+
+**`post_logout_redirect_uri` is matched exactly against the client's registered list, and
+a failure is answered directly rather than by redirect** — this endpoint is reached with a
+session cookie attached, which is the worst place to have an open redirect. When an
+`id_token_hint` and a `client_id` name different clients the request is refused outright:
+that is how somebody would try to borrow another client's allowlist.
 
 ### Notes from M1-6, part 4a: userinfo, introspection and revocation
 

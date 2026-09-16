@@ -461,3 +461,94 @@ func (f *oidcFixture) postFormWithBasic(
 	f.handler.ServeHTTP(rec, req)
 	return rec
 }
+
+// --- pushed authorization requests (RFC 9126) ----------------------------------------
+
+// TestThePushedAuthorizationRequestFlow is the whole point of PAR: the parameters are
+// sent back-channel and authenticated, and the browser carries only a reference.
+func TestThePushedAuthorizationRequestFlow(t *testing.T) {
+	f := newOIDCFixture(t)
+	verifier, challenge := pkcePair(t)
+
+	pushed := f.postForm(t, "/oauth2/par", url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.client.ID},
+		"redirect_uri":          {f.redirectURI},
+		"scope":                 {"openid email"},
+		"state":                 {"state-for-the-par-case"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}, nil)
+	if pushed.Code != http.StatusCreated && pushed.Code != http.StatusOK {
+		t.Fatalf("the PAR endpoint = %d, body %s", pushed.Code, pushed.Body.String())
+	}
+
+	var response map[string]any
+	if err := json.Unmarshal(pushed.Body.Bytes(), &response); err != nil {
+		t.Fatalf("the PAR response is not JSON: %s", pushed.Body.String())
+	}
+	requestURI, ok := response["request_uri"].(string)
+	if !ok || !strings.HasPrefix(requestURI, "urn:ietf:params:oauth:request_uri:") {
+		t.Fatalf("request_uri = %v; RFC 9126 §2.2 registers the urn: form", response["request_uri"])
+	}
+	if response["expires_in"] == nil {
+		t.Fatalf("no expires_in: a client cannot tell how long it has: %v", response)
+	}
+
+	// The authorization request now carries the reference and the client id, and
+	// nothing else. Nobody is signed in, so it goes to the login page first — and the
+	// reference must survive that round trip, because fosite consumes it exactly once.
+	authorize := "/oauth2/authorize?" + url.Values{
+		"client_id": {f.client.ID}, "request_uri": {requestURI},
+	}.Encode()
+
+	rec := f.do(t, http.MethodGet, authorize, nil, nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("a pushed request with no session = %d, body %s; want the login page",
+			rec.Code, rec.Body.String())
+	}
+	loginURL := rec.Header().Get("Location")
+	page := f.do(t, http.MethodGet, loginURL, nil, nil)
+	signedIn := f.postForm(t, "/login", url.Values{
+		"csrf_token": {f.csrfFrom(t, page)},
+		"return_to":  {f.returnToFrom(t, loginURL)},
+		"email":      {f.email}, "password": {f.password},
+	}, f.cookies(page))
+	if signedIn.Code != http.StatusSeeOther {
+		t.Fatalf("signing in = %d, body %s", signedIn.Code, signedIn.Body.String())
+	}
+
+	rec = f.do(t, http.MethodGet, authorize, nil, f.cookies(signedIn))
+	location, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parsing the redirect: %v", err)
+	}
+	if !strings.HasPrefix(location.String(), f.redirectURI) {
+		t.Fatalf("a pushed request redirected to %q; the redirect_uri, the response type "+
+			"and the state all live in the pushed row and have to come back out of it "+
+			"(error=%q)", location, location.Query().Get("error"))
+	}
+	if location.Query().Get("state") != "state-for-the-par-case" {
+		t.Fatalf("state = %q; it was pushed, so it must come back", location.Query().Get("state"))
+	}
+	code := location.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code: %q", location)
+	}
+
+	tokens := f.exchange(t, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {f.redirectURI}, "client_id": {f.client.ID},
+		"code_verifier": {verifier},
+	})
+	if tokens["id_token"] == nil {
+		t.Fatalf("the exchange after a pushed request produced no id token: %v", tokens)
+	}
+
+	// And the reference is spent: a second attempt finds nothing.
+	replay := f.do(t, http.MethodGet, authorize, nil, f.cookies(signedIn))
+	replayed, replayErr := url.Parse(replay.Header().Get("Location"))
+	if replayErr == nil && replayed.Query().Get("code") != "" {
+		t.Fatal("a request_uri was usable twice; RFC 9126 §2.2 makes it single use")
+	}
+}
