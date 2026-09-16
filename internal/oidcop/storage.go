@@ -154,6 +154,55 @@ func (s *Storage) TenantOfRefreshToken(ctx context.Context, signature string) (s
 	return s.refreshTenantOf(ctx, signature)
 }
 
+// ErrClientOutsideScope is returned when a request's tenant scope and the client it
+// authenticated as belong to different tenants.
+//
+// That combination should be impossible, and the fact that it was not is why this check
+// exists. The scope is established at the HTTP edge from whichever parameter names a
+// client; the client is authenticated later, by fosite, from whichever credential it
+// prefers. Those two are different pieces of code reading the same request, and when
+// their precedence disagreed — fosite prefers HTTP Basic, the edge preferred the form
+// body — a client could authenticate as itself while the request ran in somebody else's
+// tenant. It was exploitable: a confidential client in one tenant obtained an id token
+// for a user in another.
+//
+// So the two are reconciled here, at the point where it matters, rather than by keeping
+// two parsers in step for ever.
+var ErrClientOutsideScope = errors.New(
+	"the authenticated client does not belong to the tenant this request is scoped to")
+
+// requireClientInScope refuses a request whose client belongs to another tenant.
+func (s *Storage) requireClientInScope(ctx context.Context, client fosite.Client) error {
+	scope, ok := TenantFrom(ctx)
+	if !ok {
+		// No scope to contradict. The callers that reach here without one resolve the
+		// tenant from the client itself, which cannot disagree with it.
+		return nil
+	}
+	if client == nil {
+		return errors.New("a request reached storage with no client")
+	}
+
+	tenantID, err := s.tenantOfClient(ctx, client)
+	if err != nil {
+		return err
+	}
+	if tenantID != scope {
+		s.log.Error("a client authenticated in one tenant while its request was scoped to another",
+			"client_id", client.GetID(), "client_tenant", tenantID, "request_tenant", scope)
+		return ErrClientOutsideScope
+	}
+	return nil
+}
+
+// tenantOfClient reads the tenant off a client, preferring the value it already carries.
+func (s *Storage) tenantOfClient(ctx context.Context, client fosite.Client) (string, error) {
+	if warden, ok := client.(*Client); ok && warden.TenantID != "" {
+		return warden.TenantID, nil
+	}
+	return s.clients.TenantOf(ctx, client.GetID())
+}
+
 // --- fosite.ClientManager ----------------------------------------------------------
 
 // GetClient loads a client for fosite.
@@ -250,6 +299,12 @@ func (s *Storage) create(ctx context.Context, kind, signature string, request fo
 			return err
 		}
 		tenantID = resolved
+	}
+	// Nothing is written into a tenant that is not the client's own. Row-level security
+	// cannot catch this one: the scope says tenant A and the row says tenant A, so the
+	// policy is satisfied — it is the *client* that belongs somewhere else.
+	if err := s.requireClientInScope(ctx, request.GetClient()); err != nil {
+		return err
 	}
 
 	form := encodeForm(request.GetRequestForm())

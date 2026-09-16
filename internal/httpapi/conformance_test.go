@@ -400,3 +400,36 @@ func decodeJWTSegment(t *testing.T, token string, index int) map[string]any {
 	}
 	return out
 }
+
+// TestTransportHeadersAreSetEverywhere covers SPEC §17's transport row.
+//
+// HSTS is the one worth having a test for. It is easy to believe a load balancer sets it,
+// easy to be wrong, and the failure is silent: everything works, over http, for anybody
+// positioned to offer it.
+func TestTransportHeadersAreSetEverywhere(t *testing.T) {
+	f := newOIDCFixture(t)
+
+	for _, path := range []string{
+		"/healthz", "/.well-known/openid-configuration", "/.well-known/jwks.json", "/login",
+	} {
+		rec := f.do(t, http.MethodGet, path, nil, nil)
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q", path, got)
+		}
+	}
+
+	// This fixture runs on http, where HSTS must *not* be sent: a browser told to pin
+	// localhost to https stays pinned for every other project on that machine.
+	rec := f.do(t, http.MethodGet, "/healthz", nil, nil)
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "" {
+		t.Fatalf("HSTS was sent over http: %q", got)
+	}
+
+	// On https it must be. The header is decided by the issuer's scheme, so a second
+	// server built the same way but with an https issuer is the whole test.
+	secure := f.withHTTPSIssuer(t)
+	rec = secure.do(t, http.MethodGet, "/healthz", nil, nil)
+	if got := rec.Header().Get("Strict-Transport-Security"); !strings.Contains(got, "max-age=") {
+		t.Fatalf("no HSTS on an https deployment: %q (SPEC §17 requires it)", got)
+	}
+}

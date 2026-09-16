@@ -51,6 +51,10 @@ func (s *Storage) CreateRefreshTokenSession(
 		tenantID = resolved
 	}
 
+	if err := s.requireClientInScope(ctx, request.GetClient()); err != nil {
+		return err
+	}
+
 	form := encodeForm(request.GetRequestForm())
 	sessionData, err := encodeSession(request.GetSession())
 	if err != nil {

@@ -244,7 +244,36 @@ func (s *Server) Handler() http.Handler {
 	// observe wraps withRequestLimits rather than the reverse, so a request rejected
 	// for an oversized body is still logged and counted. A limit that silently drops
 	// traffic is indistinguishable from an outage.
-	return s.observe(s.withRequestLimits(mux))
+	return s.observe(s.withRequestLimits(s.withSecurityHeaders(mux)))
+}
+
+// withSecurityHeaders applies the transport protections SPEC §17 asks for, on every
+// response rather than on the handlers that remembered to.
+//
+// HSTS is the one that matters and the one that was missing. Warden serves tokens, a
+// login form and a discovery document; a single plaintext request to any of them is a
+// chance to intercept a session cookie or substitute the endpoints a client will use for
+// ever after. The header tells the browser never to try http again.
+//
+// Conditioned on the issuer being https, for the same reason the Secure cookie attribute
+// is: a development deployment on http://localhost that sent HSTS would pin the developer's
+// browser to https for localhost — across every other project on that machine — and the
+// only cure is clearing site data.
+func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.secureCookies() {
+			// One year, and subdomains of the issuer's host included: the `__Host-`
+			// cookie prefix already assumes no sibling can interfere, and this is the
+			// transport half of the same assumption. Not `preload`, which is a
+			// submission to a list baked into browsers and is not ours to make
+			// irreversibly on an operator's behalf.
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		// Applied to JSON as well as HTML. A browser that sniffs a JSON error body as
+		// HTML is how a reflected value becomes script.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // withRequestLimits applies the protections that must not depend on a handler

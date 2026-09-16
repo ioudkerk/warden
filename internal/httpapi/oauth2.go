@@ -178,11 +178,33 @@ func (s *Server) handlePushedAuthorize(w http.ResponseWriter, r *http.Request) {
 	ctx = oidcop.WithTenant(ctx, tenantID)
 	r = r.WithContext(ctx)
 
+	// Authenticated here as well as inside fosite, because the two answers have to be
+	// compared. fosite's PAR handler authenticates the client and then rebuilds the
+	// request from the form — and `newAuthorizeRequest` loads the client named by
+	// `client_id`, overwriting the one that authenticated whenever the body carries a
+	// different name. The pushed request would then belong to a client that proved
+	// nothing. RFC 9126 §2 requires the opposite: the request is the authenticating
+	// client's, and nobody else's.
+	authenticated, err := s.provider.AuthenticateClient(ctx, r, r.PostForm)
+	if err != nil {
+		s.log.Debug("a pushed authorization request could not authenticate its client", "error", err)
+		s.provider.WritePushedAuthorizeError(ctx, w, nil, err)
+		return
+	}
+
 	request, err := s.provider.NewPushedAuthorizeRequest(ctx, r)
 	if err != nil {
 		// Never a redirect, whatever the request said: this is a back-channel call from
 		// the client, and the error belongs in the response body.
 		s.provider.WritePushedAuthorizeError(ctx, w, request, err)
+		return
+	}
+
+	if request.GetClient().GetID() != authenticated.GetID() {
+		s.log.Warn("a client pushed an authorization request naming a different client",
+			"authenticated", authenticated.GetID(), "named", request.GetClient().GetID())
+		s.provider.WritePushedAuthorizeError(ctx, w, request, fosite.ErrInvalidClient.WithHint(
+			"A pushed authorization request must name the client that authenticated it."))
 		return
 	}
 
@@ -262,14 +284,22 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) tenantForClientRequest(r *http.Request) (string, error) {
 	clients := s.provider.Storage().Clients()
 
-	if clientID := r.PostFormValue("client_id"); clientID != "" {
-		return clients.TenantOf(r.Context(), clientID)
-	}
+	// HTTP Basic first, and the order is not a style choice. fosite reads the credential
+	// this way round — `clientCredentialsFromRequest` takes Basic when it is present and
+	// only then falls back to the body — so reading it the other way round meant a
+	// request carrying both could be *scoped* from the form while being *authenticated*
+	// from the header. That divergence was exploitable across tenants.
+	//
+	// The order makes the common case right; it is not what makes it safe. The storage
+	// refuses a client that does not belong to the scope whatever this returns.
 	if clientID, _, ok := r.BasicAuth(); ok && clientID != "" {
 		// The id may be percent-encoded in the Basic credential, per RFC 6749 §2.3.1.
 		if decoded, err := url.QueryUnescape(clientID); err == nil {
 			clientID = decoded
 		}
+		return clients.TenantOf(r.Context(), clientID)
+	}
+	if clientID := r.PostFormValue("client_id"); clientID != "" {
 		return clients.TenantOf(r.Context(), clientID)
 	}
 	return "", errNoClientInTokenRequest
@@ -337,41 +367,50 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 // let a caller from one tenant set the scope for a token in another.
 func (s *Server) introspectionCaller(r *http.Request) (caller fosite.Client, tenantID string, err error) {
 	ctx := r.Context()
-	clients := s.provider.Storage().Clients()
 
-	if id, _, ok := r.BasicAuth(); ok && id != "" {
-		if decoded, unescapeErr := url.QueryUnescape(id); unescapeErr == nil {
-			id = decoded
-		}
-		client, lookupErr := clients.Lookup(ctx, id)
+	// fosite's own order, and following it exactly is the point. Its introspection
+	// handler takes the bearer token when there is one and looks at Basic only
+	// otherwise — so reading Basic first here meant the identity Warden authorized
+	// against was not the identity fosite authenticated. With a *wrong* secret in the
+	// Basic header and a valid token of one's own in the body, a caller could borrow any
+	// client's entitlements: the forged header decided the authorization and fosite
+	// never checked it, because it had already accepted the token.
+	//
+	// Every identity returned from here is one this function has itself verified.
+	if token := fosite.AccessTokenFromRequest(r); token != "" {
+		signature := s.provider.AccessTokenSignature(ctx, token)
+		tenant, lookupErr := s.provider.Storage().TenantOfAccessToken(ctx, signature)
 		if lookupErr != nil {
 			return nil, "", lookupErr
 		}
-		return client, client.TenantID, nil
+		use, requester, introspectErr := s.provider.IntrospectToken(
+			oidcop.WithTenant(ctx, tenant), token, fosite.AccessToken, oidcop.NewEmptySession())
+		if introspectErr != nil {
+			return nil, "", introspectErr
+		}
+		if use != fosite.AccessToken {
+			return nil, "", errNoClientInTokenRequest
+		}
+		return requester.GetClient(), tenant, nil
 	}
 
-	// A resource server authenticating with an access token of its own. The token names
-	// its tenant and the client it was issued to, which is everything needed; fosite
-	// will validate it again in a moment, and doing it here as well costs one lookup on
-	// a path that is not hot.
-	token := fosite.AccessTokenFromRequest(r)
-	if token == "" {
+	// HTTP Basic, authenticated rather than merely read. AuthenticateClient is fosite's
+	// own, so the secret is compared with the same Argon2id hasher and the same rules
+	// about which methods a client may use.
+	client, err := s.provider.AuthenticateClient(ctx, r, r.PostForm)
+	if err != nil {
+		return nil, "", err
+	}
+	if client.IsPublic() {
+		// A public client proves nothing by naming itself, so it cannot be the basis of
+		// an authorization decision here. fosite would refuse it a moment later anyway.
 		return nil, "", errNoClientInTokenRequest
 	}
-	signature := s.provider.AccessTokenSignature(ctx, token)
-	tenant, lookupErr := s.provider.Storage().TenantOfAccessToken(ctx, signature)
-	if lookupErr != nil {
-		return nil, "", lookupErr
+	tenant, err := s.provider.Storage().Clients().TenantOf(ctx, client.GetID())
+	if err != nil {
+		return nil, "", err
 	}
-	use, requester, introspectErr := s.provider.IntrospectToken(
-		oidcop.WithTenant(ctx, tenant), token, fosite.AccessToken, oidcop.NewEmptySession())
-	if introspectErr != nil {
-		return nil, "", introspectErr
-	}
-	if use != fosite.AccessToken {
-		return nil, "", errNoClientInTokenRequest
-	}
-	return requester.GetClient(), tenant, nil
+	return client, tenant, nil
 }
 
 // mayIntrospect decides whether a caller is entitled to know about a token.

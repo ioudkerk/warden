@@ -360,6 +360,79 @@ that both read 3 and both write 4 have counted one attempt, so an attacker with 
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
 
+### Security review of M0 and M1-1…M1-6
+
+A review of everything implemented so far, run before starting M1-7. Four defects were
+found and fixed; each has a regression test that fails when the fix is reverted.
+
+**One root cause produced the two worst ones: two pieces of code reading the same request
+and disagreeing.** Every endpoint that authenticates a client has to answer two questions —
+which tenant is this, and which client is this. Warden answered the first at the edge,
+because the storage needs a scope before fosite runs. fosite answered the second, from
+whichever credential it prefers. Their precedence was opposite: fosite takes HTTP Basic
+over the form body, `tenantForClientRequest` took the form body over Basic.
+
+1. **Cross-tenant token issuance through the device grant (critical).** A confidential
+   client of tenant B posted Basic credentials for itself and a form `client_id` naming a
+   client of tenant A. The device authorization was written into tenant A, where a tenant A
+   user was shown "Connect <the rival's name>?", approved it, and the rival collected an id
+   token for `sub: usr_maria_acme, tid: ten_acme` — a user who is not its own. Confirmed
+   end to end before the fix.
+
+2. **Introspection authorized an identity nobody proved (high).** fosite's introspection
+   endpoint takes a bearer token over Basic credentials: when a token is present it
+   authenticates *that* and never reads the header. Warden read the header first to decide
+   who was asking. So a caller could put a valid token of their own in the body, claim in
+   Basic to be a client they are not — with a secret that is simply wrong — and have the
+   forged identity decide what they were allowed to see. It disclosed another client's
+   token's `sub`, `sid`, `scope`, `exp` and `client_id`.
+
+The fix is in two layers, and the second is the one that matters. The edge now follows
+fosite's precedence, which makes the common case right. And `Storage.requireClientInScope`
+refuses to write any artifact into a tenant that is not its client's — enforced where the
+row is written rather than by keeping two parsers in step for ever. Reverting only the
+precedence leaves the device and client-credentials attacks blocked by the storage guard.
+
+3. **Pushed authorization requests were not bound to the authenticating client (medium).**
+   This one is fosite's: `NewPushedAuthorizeRequest` authenticates the client and then
+   rebuilds the request with `newAuthorizeRequest`, which loads whatever `client_id` the
+   body names — overwriting the client that authenticated. Any client holding its own
+   credentials could mint `request_uri` values bound to another client, including a
+   confidential one whose secret it does not have. RFC 9126 §2 requires the opposite.
+   Nothing is stolen by it — the code still goes to the victim client's registered redirect
+   URI and still needs that client's secret — but the attacker chooses the parameters of a
+   request the victim client will be asked to complete. The endpoint now authenticates the
+   client itself and refuses a request naming a different one.
+
+4. **HSTS was missing entirely (medium).** SPEC §17's transport row asks for it and nothing
+   set it. Now sent on every response when the issuer is https, and deliberately not when
+   it is not: a development deployment that sent HSTS would pin the developer's browser to
+   https for localhost across every other project on the machine.
+
+**Two things are recorded as known and not fixed here.** Suspension is not enforced on a
+live session or at token issuance — `Sessions.Validate` checks expiry and the revocation
+marker but not the user's status, so the plan's revoke-on-transition (M1-10) is the only
+thing that will stop a suspended user's existing cookie from minting fresh tokens. It is
+not exploitable today, because nothing can suspend a user yet; when M1-10 lands, a status
+check at issuance should back the revocation up, so a missed revocation fails closed. And
+the audit log is a hash chain with no external anchor: it detects an edit, not a rewrite,
+because anybody who can write the table can recompute every hash. Publishing the head
+periodically is what closes that, and it belongs with M2-12.
+
+**Checked and found sound**, so that the absence of findings is not mistaken for absence of
+review: no dynamic SQL anywhere, every query parameterized through sqlc; the tenant scope
+set with `set_config(..., is_local => true)`, itself parameterized; all 39 system-pool call
+sites, each either a one-column scope resolution or genuinely deployment-global; constant-
+time comparison in the three places that compare a secret; the decoy-hash timing property;
+envelope encryption (fresh DEK per value, the version-and-key-id header as additional
+authenticated data, caller-supplied AAD binding a ciphertext to its row, deliberately vague
+decryption errors, and `KEK.Bytes()` copying so that `newGCM`'s defensive zeroing cannot
+destroy the live key); the audit chain's length-prefixed canonical form and its advisory-lock
+serialisation; every authenticated endpoint taking the tenant from the caller rather than
+from input; and the configuration's production restrictions — https issuer, distinct
+database roles, Redis, a 5–15 minute access-token bound, and a key overlap window no shorter
+than the token lifetime.
+
 ### Notes from M1-6, part 4c: the device grant, and the conformance checks
 
 **fosite implements no part of RFC 8628.** Not a disabled handler — the string

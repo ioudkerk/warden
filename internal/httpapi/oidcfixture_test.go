@@ -50,12 +50,23 @@ type oidcFixture struct {
 	resourceSecret string
 	device         *oidcop.Client
 	deviceOnly     *oidcop.Client
-	audience       string
-	postLogoutURI  string
+
+	confidential       *oidcop.Client
+	confidentialSecret string
+
+	// A client belonging to a different tenant entirely.
+	rival         *oidcop.Client
+	rivalSecret   string
+	audience      string
+	postLogoutURI string
 
 	email    string
 	password string
 	userID   string
+
+	// Kept so a test can build a second server that differs in one setting.
+	cfg  *config.Config
+	deps httpapi.Deps
 }
 
 func newOIDCFixture(t *testing.T) *oidcFixture {
@@ -296,12 +307,42 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		t.Fatalf("device-only client: %v", err)
 	}
 
-	server, err := httpapi.New(httpapi.Deps{
+	// A confidential client of this tenant that performs the code flow. Pushing an
+	// authorization request for it is supposed to require its secret.
+	confidential, confidentialSecret, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: tenantID, Key: "backoffice", Name: "The ACME back office",
+		Public:       false,
+		RedirectURIs: []string{"https://backoffice.acme.test/callback"},
+		Scopes:       []string{"openid", "profile", "email", "offline_access"},
+	})
+	if err != nil {
+		t.Fatalf("confidential client: %v", err)
+	}
+
+	// A second tenant, with a confidential client of its own. Nothing in the ordinary
+	// flows touches it; it exists so that "one tenant cannot act in another" can be
+	// tested rather than assumed.
+	otherTenantID, err := p.CreateTenant(ctx, "rival", "Rival")
+	if err != nil {
+		t.Fatalf("second tenant: %v", err)
+	}
+	rival, rivalSecret, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: otherTenantID, Key: "rival-app", Name: "The rival application",
+		Public:     false,
+		GrantTypes: []string{oidcop.GrantClientCredentials, oidcop.GrantDeviceCode},
+		Scopes:     []string{"openid", "profile", "email", "offline_access"},
+	})
+	if err != nil {
+		t.Fatalf("rival client: %v", err)
+	}
+
+	deps := httpapi.Deps{
 		Config: cfg, Log: log,
 		Tenant: tenantPool, System: system,
 		Cache: cacheClient, Keys: km, Sessions: sessions,
 		Provider: provider, Authn: authenticator, Lockout: lockout,
-	})
+	}
+	server, err := httpapi.New(deps)
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -310,11 +351,35 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		handler: server.Handler(), keys: km, issuer: issuer,
 		client: client, redirectURI: redirectURI,
 		resource: resource, resourceSecret: resourceSecret, audience: audience,
-		device:        device,
-		deviceOnly:    deviceOnly,
+		device:     device,
+		deviceOnly: deviceOnly,
+		rival:      rival, rivalSecret: rivalSecret,
+		confidential: confidential, confidentialSecret: confidentialSecret,
 		postLogoutURI: postLogoutURI,
 		email:         email, password: password, userID: userID,
+		cfg: cfg, deps: deps,
 	}
+}
+
+// withHTTPSIssuer returns a second server built from the same dependencies but with an
+// https issuer, for the handful of behaviours that turn on the deployment's scheme.
+func (f *oidcFixture) withHTTPSIssuer(t *testing.T) *oidcFixture {
+	t.Helper()
+	secureCfg := *f.cfg
+	secureCfg.Issuer = "https://warden.test"
+
+	server, err := httpapi.New(httpapi.Deps{
+		Config: &secureCfg, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tenant: f.deps.Tenant, System: f.deps.System,
+		Cache: f.deps.Cache, Keys: f.deps.Keys, Sessions: f.deps.Sessions,
+		Provider: f.deps.Provider, Authn: f.deps.Authn, Lockout: f.deps.Lockout,
+	})
+	if err != nil {
+		t.Fatalf("second server: %v", err)
+	}
+	clone := *f
+	clone.handler = server.Handler()
+	return &clone
 }
 
 // securityEvents counts audit rows of one action.

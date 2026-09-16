@@ -76,7 +76,7 @@ func (s *Server) handleDeviceAuthorization(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	codes, err := s.provider.Storage().CreateDeviceAuthorization(ctx, tenantID, client.GetID(), scopes, audiences)
+	codes, err := s.provider.Storage().CreateDeviceAuthorization(ctx, tenantID, client, scopes, audiences)
 	if err != nil {
 		s.log.Error("creating a device authorization", "error", err)
 		s.provider.WriteAccessError(ctx, w, nil, fosite.ErrServerError)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/ory/fosite"
 
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
@@ -99,8 +100,16 @@ type NewDeviceCodes struct {
 
 // CreateDeviceAuthorization starts a device flow.
 func (s *Storage) CreateDeviceAuthorization(
-	ctx context.Context, tenantID, clientID string, scopes, audiences []string,
+	ctx context.Context, tenantID string, client fosite.Client, scopes, audiences []string,
 ) (*NewDeviceCodes, error) {
+	// The device grant is where the scope-versus-client mismatch was worst: an approval
+	// recorded in one tenant, against a client in another, ends with a person in tenant A
+	// handing tokens to a client of tenant B. Refused before the row exists.
+	if err := s.requireClientInScope(WithTenant(ctx, tenantID), client); err != nil {
+		return nil, err
+	}
+	clientID := client.GetID()
+
 	// Generated before the transaction opens, per M0-7: the store's retry loop re-runs
 	// the callback from the top, and a code minted inside it would be a different code
 	// on the second attempt — the device would be handed one value and the database
