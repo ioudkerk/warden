@@ -567,3 +567,49 @@ func clientFromRow(r db.OAuthClientByIDRow) *Client {
 func clientFromKeyRow(r db.OAuthClientByKeyRow) *Client {
 	return clientFromRow(db.OAuthClientByIDRow(r))
 }
+
+// --- the secret hasher fosite uses --------------------------------------------------
+
+// secretHasher lets fosite compare client secrets with Warden's hasher instead of its
+// own.
+//
+// fosite's default is bcrypt. Warden's credentials are Argon2id with the parameters
+// SPEC §7.2 fixes, and a provider holding two hashing schemes would eventually store a
+// secret under one and verify it under the other. Since the registry writes the hash,
+// the provider has to read it the same way — so this delegates to internal/authn, and
+// there is exactly one place that knows what a Warden secret hash looks like.
+//
+// The symptom when this is missing is worth recording: every confidential client fails
+// authentication with "client credentials are invalid", at every endpoint, while public
+// clients keep working — so a deployment using only public clients never notices.
+type secretHasher struct{ params authn.Params }
+
+// errSecretMismatch is what fosite tests for; it only checks for non-nil.
+var errSecretMismatch = errors.New("the client secret does not match")
+
+func (h secretHasher) Compare(_ context.Context, hash, data []byte) error {
+	if len(hash) == 0 {
+		// A public client, or a confidential one with no secret stored. Comparing
+		// nothing must fail rather than succeed.
+		return errSecretMismatch
+	}
+	ok, err := authn.Verify(string(data), string(hash))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errSecretMismatch
+	}
+	return nil
+}
+
+func (h secretHasher) Hash(_ context.Context, data []byte) ([]byte, error) {
+	encoded, err := authn.Hash(string(data), h.params)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(encoded), nil
+}
+
+// NewSecretHasher returns the hasher the provider is configured with.
+func NewSecretHasher(params authn.Params) fosite.Hasher { return secretHasher{params: params} }

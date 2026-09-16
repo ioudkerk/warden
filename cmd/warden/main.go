@@ -376,7 +376,11 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	// the signing keys.
 	var provider *oidcop.Provider
 	if system != nil && keyManager != nil {
-		clients, clientErr := oidcop.NewClients(db, system, authn.DefaultParams())
+		// One set of parameters for both: the registry hashes client secrets with
+		// them and the provider verifies with them, and two copies would eventually be
+		// two different values.
+		clientParams := authn.DefaultParams()
+		clients, clientErr := oidcop.NewClients(db, system, clientParams)
 		if clientErr != nil {
 			return clientErr
 		}
@@ -386,7 +390,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		if storageErr != nil {
 			return storageErr
 		}
-		providerOpts, optErr := oidcop.ProviderOptionsFrom(cfg, keyManager, keyring, log)
+		providerOpts, optErr := oidcop.ProviderOptionsFrom(cfg, keyManager, keyring, clientParams, log)
 		if optErr != nil {
 			return optErr
 		}

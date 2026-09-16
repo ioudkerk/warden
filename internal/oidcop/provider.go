@@ -13,9 +13,11 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
+	"github.com/ory/fosite/handler/oauth2"
 	"github.com/ory/fosite/handler/openid"
 	"github.com/ory/fosite/token/jwt"
 
+	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/secrets"
@@ -66,6 +68,42 @@ func NewSession(issuer, tenantID, sessionID, subject string, authTime time.Time,
 	}
 }
 
+// GetExtraClaims makes Warden's own identifiers visible to token introspection.
+//
+// fosite's introspection response copies whatever a session offers here, skipping the
+// names RFC 7662 reserves. What Warden adds is `sid` and `tid`: a resource server that
+// introspects a token can then tie it to the session that issued it — which is what
+// makes "this token came from a session that has since been ended" answerable — without
+// a second lookup and without Warden inventing a private extension field.
+//
+// fosite's own DefaultSession implements this and openid.DefaultSession does not, so
+// without this method the two identifiers are in the id token and nowhere else.
+func (s *Session) GetExtraClaims() map[string]any {
+	extra := map[string]any{}
+	if s.TenantID != "" {
+		extra["tid"] = s.TenantID
+	}
+	if s.SessionID != "" {
+		extra["sid"] = s.SessionID
+	}
+	return extra
+}
+
+// NewEmptySession returns a session of the concrete type the storage decodes into.
+//
+// fosite hands the storage whatever session the caller supplied and expects its own type
+// back; an endpoint that passed a bare &Session{} would depend on the stored JSON having
+// populated every embedded pointer, which is true until a session is stored without
+// claims. Building it here means one place knows the shape.
+func NewEmptySession() *Session {
+	return &Session{
+		DefaultSession: &openid.DefaultSession{
+			Claims:  &jwt.IDTokenClaims{Extra: map[string]any{}},
+			Headers: &jwt.Headers{Extra: map[string]any{}},
+		},
+	}
+}
+
 // Clone is required by fosite, which copies sessions between requests.
 func (s *Session) Clone() fosite.Session {
 	if s == nil {
@@ -90,6 +128,10 @@ type Provider struct {
 	// config is retained so the discovery document and the handlers can answer from
 	// the same values fosite enforces, rather than from a second copy that drifts.
 	config *fosite.Config
+
+	// strategy is the token strategy the provider was composed with. The introspection
+	// endpoint needs it to derive a signature from a presented token.
+	strategy *oauth2.HMACSHAStrategy
 }
 
 // ProviderOptions configure a Provider.
@@ -106,6 +148,9 @@ type ProviderOptions struct {
 	// signatures the storage adapter stores. It must be stable across replicas and
 	// across restarts: change it and every outstanding code and token stops verifying.
 	GlobalSecret []byte
+	// SecretParams are the Argon2id parameters client secrets are hashed with. They
+	// must match the registry's, which is the only thing that writes them.
+	SecretParams authn.Params
 }
 
 // NewProvider builds the provider.
@@ -173,6 +218,11 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 		RefreshTokenScopes: []string{"offline", "offline_access"},
 
 		SendDebugMessagesToClients: false,
+
+		// Warden's own hasher, not fosite's bcrypt. The registry writes client secrets
+		// as Argon2id, so the provider has to read them the same way; without this
+		// every confidential client fails authentication at every endpoint.
+		ClientSecretsHasher: NewSecretHasher(opts.SecretParams),
 	}
 
 	// The signing key is fetched per request rather than pinned here, so a rotation
@@ -181,11 +231,18 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 		return opts.Keys.SigningKey(ctx)
 	}
 
+	// Retained rather than passed anonymously: the introspection endpoint has to turn
+	// a bearer token back into the signature the storage is keyed by, and doing that
+	// with a second strategy built from the same configuration would be one more place
+	// for the two to disagree about what a token looks like.
+	strategy := compose.NewOAuth2HMACStrategy(cfg)
+
 	provider := compose.Compose(
 		cfg,
 		storage,
-		compose.NewOAuth2HMACStrategy(cfg),
+		strategy,
 		compose.OAuth2AuthorizeExplicitFactory,
+		compose.OAuth2ClientCredentialsGrantFactory,
 		compose.OAuth2RefreshTokenGrantFactory,
 		compose.OAuth2TokenIntrospectionFactory,
 		compose.OAuth2TokenRevocationFactory,
@@ -208,7 +265,23 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 		keys:           opts.Keys,
 		log:            log,
 		config:         cfg,
+		strategy:       strategy,
 	}, nil
+}
+
+// AccessTokenSignature returns the storage key for a presented access token.
+//
+// Warden's tokens are opaque: the half after the dot is the signature, and it is what
+// oauth_session is keyed by. Callers use it to resolve a token to its tenant before the
+// provider is asked to do anything with it — introspection needs a scope in order to
+// refuse a token belonging to somebody else's tenant, and it has only the token.
+func (p *Provider) AccessTokenSignature(ctx context.Context, token string) string {
+	return p.strategy.AccessTokenSignature(ctx, token)
+}
+
+// RefreshTokenSignature is the same for a refresh token.
+func (p *Provider) RefreshTokenSignature(ctx context.Context, token string) string {
+	return p.strategy.RefreshTokenSignature(ctx, token)
 }
 
 // Issuer returns the provider's issuer, which is the "iss" of every token it signs.
@@ -357,7 +430,10 @@ func (p *Provider) Algorithms(ctx context.Context) ([]string, error) {
 func (p *Provider) Config() *fosite.Config { return p.config }
 
 // providerConfigFromWarden maps Warden's configuration onto the provider's.
-func ProviderOptionsFrom(cfg *config.Config, km *keys.Manager, keyring *secrets.Keyring, log *slog.Logger) (ProviderOptions, error) {
+func ProviderOptionsFrom(
+	cfg *config.Config, km *keys.Manager, keyring *secrets.Keyring,
+	params authn.Params, log *slog.Logger,
+) (ProviderOptions, error) {
 	secret, err := NewGlobalSecret(keyring)
 	if err != nil {
 		return ProviderOptions{}, err
@@ -369,5 +445,6 @@ func ProviderOptionsFrom(cfg *config.Config, km *keys.Manager, keyring *secrets.
 		Keys:            km,
 		Log:             log,
 		GlobalSecret:    secret,
+		SecretParams:    params,
 	}, nil
 }

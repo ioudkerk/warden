@@ -638,3 +638,55 @@ func (q *Queries) SetOAuthClientSecret(ctx context.Context, arg SetOAuthClientSe
 	}
 	return result.RowsAffected(), nil
 }
+
+const userProfile = `-- name: UserProfile :one
+
+SELECT id,
+       email::text AS email,
+       email_verified,
+       coalesce(display_name, '')::text AS display_name,
+       status,
+       attributes,
+       updated_at
+  FROM app_user
+ WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+`
+
+type UserProfileParams struct {
+	TenantID string
+	ID       string
+}
+
+type UserProfileRow struct {
+	ID            string
+	Email         string
+	EmailVerified bool
+	DisplayName   string
+	Status        string
+	Attributes    dbtypes.JSONMap
+	UpdatedAt     time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// Userinfo (SPEC §7.7)
+// ---------------------------------------------------------------------------------
+// The claims the userinfo endpoint may release, in one read.
+//
+// status comes back with them rather than being filtered in the WHERE clause: a token
+// belonging to a suspended user must be refused, and refusing needs to know that the
+// user exists and is suspended — filtering here would make that indistinguishable from
+// a subject that was never real.
+func (q *Queries) UserProfile(ctx context.Context, arg UserProfileParams) (UserProfileRow, error) {
+	row := q.db.QueryRow(ctx, userProfile, arg.TenantID, arg.ID)
+	var i UserProfileRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.EmailVerified,
+		&i.DisplayName,
+		&i.Status,
+		&i.Attributes,
+		&i.UpdatedAt,
+	)
+	return i, err
+}

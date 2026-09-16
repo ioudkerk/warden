@@ -286,8 +286,33 @@ func (s *Storage) revokeFamilyForRequest(ctx context.Context, requestID string) 
 	// M1-5 owns what happens next: the family dies, the session ends, and the event is
 	// written. Doing it here instead would be a second implementation of the one thing
 	// this task is actually about.
+	//
+	// Which of the two it is depends on who asked. fosite calls this same method from
+	// two places — its reuse handling, and RFC 7009's revocation endpoint — and the
+	// difference between them is the difference between an alarm and a log line. There
+	// is no way to tell from the arguments, so the revocation endpoint says so in the
+	// context and reuse is the default. Defaulting the other way would silence a real
+	// alarm the first time a caller forgot to mark itself.
+	if clientRequestedRevocation(ctx) {
+		return s.refresh.RevokeFamilyOnRequest(ctx, family.TenantID, family.FamilyID,
+			"the client revoked this token")
+	}
 	return s.refresh.RevokeFamily(ctx, family.TenantID, family.FamilyID,
 		"the authorization server detected a replayed token")
+}
+
+// clientRevocationKey marks a request as RFC 7009 revocation rather than reuse handling.
+type clientRevocationKey struct{}
+
+// WithClientRevocation notes that the revocation about to happen was asked for by the
+// client, so it is recorded as routine rather than raised as a security event.
+func WithClientRevocation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clientRevocationKey{}, true)
+}
+
+func clientRequestedRevocation(ctx context.Context) bool {
+	asked, ok := ctx.Value(clientRevocationKey{}).(bool)
+	return ok && asked
 }
 
 // RevokeAccessToken removes the access tokens of one exchange.

@@ -138,6 +138,21 @@ func (s *Storage) tenantOf(ctx context.Context, kind, signature string) (string,
 	return tenantID, err
 }
 
+// TenantOfAccessToken resolves an access token's signature to the tenant it was issued
+// in, on the system pool.
+//
+// This is the introspection endpoint's first move. A resource server presents its own
+// credentials and somebody else's token, and the two have to be checked against each
+// other — which needs both tenants, and the token arrives carrying nothing but itself.
+func (s *Storage) TenantOfAccessToken(ctx context.Context, signature string) (string, error) {
+	return s.tenantOf(ctx, kindAccessToken, signature)
+}
+
+// TenantOfRefreshToken is the same for a refresh token, which lives in the other table.
+func (s *Storage) TenantOfRefreshToken(ctx context.Context, signature string) (string, error) {
+	return s.refreshTenantOf(ctx, signature)
+}
+
 // --- fosite.ClientManager ----------------------------------------------------------
 
 // GetClient loads a client for fosite.

@@ -363,6 +363,16 @@ type Querier interface {
 	UpsertUIElement(ctx context.Context, arg UpsertUIElementParams) error
 	UserForPasswordChange(ctx context.Context, arg UserForPasswordChangeParams) (UserForPasswordChangeRow, error)
 	UserIDByEmail(ctx context.Context, arg UserIDByEmailParams) (string, error)
+	// ---------------------------------------------------------------------------------
+	// Userinfo (SPEC §7.7)
+	// ---------------------------------------------------------------------------------
+	// The claims the userinfo endpoint may release, in one read.
+	//
+	// status comes back with them rather than being filtered in the WHERE clause: a token
+	// belonging to a suspended user must be refused, and refusing needs to know that the
+	// user exists and is suspended — filtering here would make that indistinguishable from
+	// a subject that was never real.
+	UserProfile(ctx context.Context, arg UserProfileParams) (UserProfileRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

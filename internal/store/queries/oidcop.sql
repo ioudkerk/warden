@@ -129,3 +129,24 @@ SELECT tenant_id, family_id, session_id, client_id, subject
  WHERE tenant_id = @tenant_id AND request_id = @request_id
  ORDER BY issued_at DESC
  LIMIT 1;
+
+-- ---------------------------------------------------------------------------------
+-- Userinfo (SPEC §7.7)
+-- ---------------------------------------------------------------------------------
+
+-- The claims the userinfo endpoint may release, in one read.
+--
+-- status comes back with them rather than being filtered in the WHERE clause: a token
+-- belonging to a suspended user must be refused, and refusing needs to know that the
+-- user exists and is suspended — filtering here would make that indistinguishable from
+-- a subject that was never real.
+-- name: UserProfile :one
+SELECT id,
+       email::text AS email,
+       email_verified,
+       coalesce(display_name, '')::text AS display_name,
+       status,
+       attributes,
+       updated_at
+  FROM app_user
+ WHERE tenant_id = @tenant_id AND id = @id AND deleted_at IS NULL;

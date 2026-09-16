@@ -610,7 +610,12 @@ func newProviderFixture(t *testing.T) *providerFixture {
 		t.Fatalf("storage: %v", err)
 	}
 
-	opts, err := oidcop.ProviderOptionsFrom(cfg, km, keyring, log)
+	// The same cheap parameters the registry hashes with: the provider verifies client
+	// secrets with these, and a mismatch means no confidential client can authenticate.
+	params := authn.DefaultParams()
+	params.Memory, params.Time = 8*1024, 1
+
+	opts, err := oidcop.ProviderOptionsFrom(cfg, km, keyring, params, log)
 	if err != nil {
 		t.Fatalf("provider options: %v", err)
 	}

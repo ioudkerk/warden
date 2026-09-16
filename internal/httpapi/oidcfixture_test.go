@@ -43,6 +43,13 @@ type oidcFixture struct {
 	client      *oidcop.Client
 	redirectURI string
 
+	// resource is a confidential client standing in for a resource server: it is the
+	// thing that introspects tokens and revokes them, and it can only do either because
+	// it holds a secret. audience is what a token says it is for.
+	resource       *oidcop.Client
+	resourceSecret string
+	audience       string
+
 	email    string
 	password string
 	userID   string
@@ -202,7 +209,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	providerOpts, err := oidcop.ProviderOptionsFrom(cfg, km, keyring, log)
+	providerOpts, err := oidcop.ProviderOptionsFrom(cfg, km, keyring, params, log)
 	if err != nil {
 		t.Fatalf("provider options: %v", err)
 	}
@@ -230,14 +237,31 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	}
 
 	const redirectURI = "https://app.acme.test/callback"
+	const audience = "https://api.acme.test"
 	client, _, err := clients.Register(ctx, oidcop.NewClientOptions{
 		TenantID: tenantID, Key: "app", Name: "The ACME application",
 		Public:       true,
 		RedirectURIs: []string{redirectURI},
 		Scopes:       []string{"openid", "profile", "email", "offline_access"},
+		Audiences:    []string{audience},
 	})
 	if err != nil {
 		t.Fatalf("client: %v", err)
+	}
+
+	// The resource server. Confidential, because RFC 7662 requires the introspection
+	// endpoint to be authenticated and a client that cannot hold a secret cannot
+	// authenticate; and registered with the same audience, which is how a token says
+	// which resource server it was issued for.
+	resource, resourceSecret, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: tenantID, Key: "api", Name: "The ACME API",
+		Public:     false,
+		GrantTypes: []string{oidcop.GrantClientCredentials},
+		Scopes:     []string{"openid", "profile", "email", "offline_access"},
+		Audiences:  []string{audience},
+	})
+	if err != nil {
+		t.Fatalf("resource client: %v", err)
 	}
 
 	server, err := httpapi.New(httpapi.Deps{
@@ -253,6 +277,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	return &oidcFixture{
 		handler: server.Handler(), keys: km, issuer: issuer,
 		client: client, redirectURI: redirectURI,
+		resource: resource, resourceSecret: resourceSecret, audience: audience,
 		email: email, password: password, userID: userID,
 	}
 }

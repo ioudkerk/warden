@@ -390,8 +390,11 @@ func (r *RefreshTokens) Rotate(ctx context.Context, presented, clientID string) 
 // transaction that detected it.
 type reuseEvent struct {
 	tenantID, familyID, sessionID, userID, clientID, tokenID string
-	firstConsumedAt                                          time.Time
-	revokedCount                                             int64
+	// reason is what the caller said it was revoking for. It reaches the audit entry,
+	// so an investigator reads why rather than inferring it from the action alone.
+	reason          string
+	firstConsumedAt time.Time
+	revokedCount    int64
 	// alreadyRevoked means the family had been revoked before this presentation, so
 	// the alarm has already been raised once and this is a subsequent attempt.
 	alreadyRevoked bool
@@ -410,7 +413,20 @@ type reuseEvent struct {
 const (
 	ActionRefreshTokenReuse       = "security.refresh_token_reuse"
 	ActionRefreshTokenReuseRepeat = "security.refresh_token_reuse_repeat"
+
+	// ActionRefreshTokenRevoked is the routine one: a client asked for a token to be
+	// revoked and it was. Not in the security namespace, because nothing went wrong —
+	// and keeping it out of there is what lets an alert match security.* and mean it.
+	ActionRefreshTokenRevoked = "oauth.refresh_token_revoked"
 )
+
+// reuseReason is what the audit entry says happened, preferring the caller's words.
+func reuseReason(given string) string {
+	if given != "" {
+		return given
+	}
+	return "a refresh token was presented after it had already been used"
+}
 
 // handleReuse ends the session and records the replay.
 //
@@ -463,7 +479,7 @@ func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
 			TenantID:   e.tenantID,
 			Action:     action,
 			TargetType: targetUser, TargetID: e.userID,
-			Reason: "a refresh token was presented after it had already been used",
+			Reason: reuseReason(e.reason),
 			After: map[string]any{
 				"family_id":         e.familyID,
 				"session_id":        e.sessionID,
@@ -489,6 +505,83 @@ func (r *RefreshTokens) handleReuse(ctx context.Context, e *reuseEvent) {
 // revoked — and this is where that lands, so there is one implementation of what a
 // detected reuse means rather than two that can drift apart.
 func (r *RefreshTokens) RevokeFamily(ctx context.Context, tenantID, familyID, reason string) error {
+	revoked, sample, err := r.revokeFamilyRows(ctx, tenantID, familyID)
+	if err != nil || sample == nil {
+		return err
+	}
+
+	r.handleReuse(ctx, &reuseEvent{
+		tenantID: tenantID, familyID: familyID,
+		sessionID: sample.SessionID, userID: sample.Subject,
+		clientID: sample.ClientID, tokenID: sample.ID,
+		revokedCount: revoked, reason: reason,
+		// Nothing was revoked because everything already was, so the alarm has been
+		// raised for this family before and this presentation is a subsequent attempt.
+		// Without this, a caller that revokes an already-dead family — which fosite
+		// does, every time somebody retries a stolen token — would raise a fresh alarm
+		// per attempt rather than one per incident.
+		alreadyRevoked: revoked == 0,
+	})
+	return nil
+}
+
+// RevokeFamilyOnRequest revokes a chain because somebody asked, rather than because
+// something went wrong.
+//
+// The separation from RevokeFamily is the whole point of having two methods. A client
+// calling RFC 7009's revocation endpoint is doing exactly what it is supposed to do:
+// signing a user out, discarding a credential it no longer needs. Routing that through
+// the reuse path would raise security.refresh_token_reuse — an alarm that means
+// "somebody probably holds a credential they should not" — for a well-behaved client,
+// and an alarm that fires on correct behaviour is one an operator learns to ignore.
+//
+// It also leaves the browser session alone. Revoking a grant is not signing out: the
+// tokens issued to *this* client die, and the person stays signed in to the provider,
+// which is what RFC 7009 describes and what the logout endpoint is for otherwise.
+func (r *RefreshTokens) RevokeFamilyOnRequest(ctx context.Context, tenantID, familyID, reason string) error {
+	revoked, sample, err := r.revokeFamilyRows(ctx, tenantID, familyID)
+	if err != nil || sample == nil {
+		return err
+	}
+	if revoked == 0 {
+		// Already gone. Revocation is idempotent and RFC 7009 requires a 200 either
+		// way, so there is nothing to record: the event was written the first time.
+		return nil
+	}
+
+	r.log.Info("a refresh token family was revoked at the client's request",
+		"tenant_id", tenantID, "family_id", familyID, "client_id", sample.ClientID,
+		"user_id", sample.Subject, "tokens_revoked", revoked, "reason", reason)
+
+	if r.audit == nil || r.system == nil {
+		return nil
+	}
+	if auditErr := r.system.InSystem(ctx, "recording a token revocation", func(ctx context.Context, tx pgx.Tx) error {
+		_, appendErr := r.audit.Append(ctx, tx, audit.Entry{
+			TenantID:   tenantID,
+			Action:     ActionRefreshTokenRevoked,
+			TargetType: targetUser, TargetID: sample.Subject,
+			Reason: reason,
+			After: map[string]any{
+				"family_id": familyID, "session_id": sample.SessionID,
+				"client_id": sample.ClientID, "tokens_revoked": revoked,
+			},
+		})
+		return appendErr
+	}); auditErr != nil {
+		// Not fatal: the tokens are already dead, which is what the caller asked for.
+		r.log.Error("could not record a token revocation in the audit log", "error", auditErr)
+	}
+	return nil
+}
+
+// revokeFamilyRows kills every token in a family and reports what it found.
+//
+// A nil sample means there was nothing to revoke — the family was swept, or never
+// existed — which is not an error for either caller: revocation is idempotent.
+func (r *RefreshTokens) revokeFamilyRows(
+	ctx context.Context, tenantID, familyID string,
+) (int64, *db.RefreshTokenFamilyMemberRow, error) {
 	var (
 		revoked int64
 		sample  db.RefreshTokenFamilyMemberRow
@@ -511,27 +604,12 @@ func (r *RefreshTokens) RevokeFamily(ctx context.Context, tenantID, familyID, re
 		return revokeErr
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Nothing to revoke. Not an error: the family may already have been swept.
-		return nil
+		return 0, nil, nil
 	}
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
-
-	r.handleReuse(ctx, &reuseEvent{
-		tenantID: tenantID, familyID: familyID,
-		sessionID: sample.SessionID, userID: sample.Subject,
-		clientID: sample.ClientID, tokenID: sample.ID,
-		revokedCount: revoked,
-		// Nothing was revoked because everything already was, so the alarm has been
-		// raised for this family before and this presentation is a subsequent attempt.
-		// Without this, a caller that revokes an already-dead family — which fosite
-		// does, every time somebody retries a stolen token — would raise a fresh alarm
-		// per attempt rather than one per incident.
-		alreadyRevoked: revoked == 0,
-	})
-	_ = reason
-	return nil
+	return revoked, &sample, nil
 }
 
 // RevokeForSession kills every refresh token belonging to a session.

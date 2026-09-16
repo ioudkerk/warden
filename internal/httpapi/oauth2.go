@@ -104,7 +104,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	// The tenant again, and the harder case: on a refresh there is no client_id in the
 	// body at all for a confidential client using Basic auth, so it comes from the
 	// credentials.
-	tenantID, err := s.tenantForTokenRequest(r)
+	tenantID, err := s.tenantForClientRequest(r)
 	if err != nil {
 		s.log.Debug("a token request named no resolvable client", "error", err)
 		// fosite's own error, so the body is the shape RFC 6749 requires.
@@ -114,11 +114,26 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	ctx = oidcop.WithTenant(ctx, tenantID)
 	r = r.WithContext(ctx)
 
-	session := &oidcop.Session{}
-	request, err := s.provider.NewAccessRequest(ctx, r, session)
+	request, err := s.provider.NewAccessRequest(ctx, r, oidcop.NewEmptySession())
 	if err != nil {
 		s.provider.WriteAccessError(ctx, w, request, err)
 		return
+	}
+
+	// The client credentials grant needs its scopes granted here, and only it.
+	//
+	// fosite's handler validates the requested scopes against the client's allowlist
+	// and then leaves them ungranted, because in every other grant a person decided.
+	// Here there is no person: the client authenticated as itself, and the registration
+	// is the decision. Without this the grant issues a token with no scopes at all,
+	// which every resource server would refuse.
+	if request.GetGrantTypes().ExactOne("client_credentials") {
+		for _, scope := range request.GetRequestedScopes() {
+			request.GrantScope(scope)
+		}
+		for _, audience := range request.GetRequestedAudience() {
+			request.GrantAudience(audience)
+		}
 	}
 
 	response, err := s.provider.NewAccessResponse(ctx, request)
@@ -129,13 +144,13 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	s.provider.WriteAccessResponse(ctx, w, request, response)
 }
 
-// tenantForTokenRequest resolves the tenant from whichever way the client identified
+// tenantForClientRequest resolves the tenant from whichever way the client identified
 // itself.
 //
-// Three places, in the order the specification allows them: the form body, HTTP Basic
-// credentials, and — for a refresh where a public client sends only the token — the
-// stored token itself.
-func (s *Server) tenantForTokenRequest(r *http.Request) (string, error) {
+// Two places, in the order the specification allows them: the form body and HTTP Basic
+// credentials. Shared by the token, revocation and pushed-authorization endpoints, which
+// all authenticate a client the same way.
+func (s *Server) tenantForClientRequest(r *http.Request) (string, error) {
 	clients := s.provider.Storage().Clients()
 
 	if clientID := r.PostFormValue("client_id"); clientID != "" {
@@ -158,7 +173,160 @@ type tokenRequestError struct{ message string }
 
 func (e *tokenRequestError) Error() string { return e.message }
 
-// handleUserinfo, handleIntrospect, handleRevoke, handleLogout, handlePAR and the device
-// endpoints arrive in part 4. They are not registered until they exist: a route that
-// answers "not implemented" is worse than a 404, because a client library treats the
-// first as a server fault and the second as a provider that does not offer the feature.
+// --- introspection (RFC 7662) -------------------------------------------------------
+
+// handleIntrospect answers "is this token still good, and what does it say?".
+//
+// The endpoint exists for resource servers, and the thing that makes it safe is that it
+// is authenticated in both directions: the caller proves who it is, and Warden then
+// decides whether that caller is entitled to know anything about this particular token.
+// An introspection endpoint without the second check is a token scanner.
+func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if err := r.ParseForm(); err != nil {
+		s.provider.WriteIntrospectionError(ctx, w,
+			fosite.ErrInvalidRequest.WithHint("The request body could not be read."))
+		return
+	}
+
+	caller, tenantID, err := s.introspectionCaller(r)
+	if err != nil {
+		s.log.Debug("an introspection request could not be attributed to a client", "error", err)
+		s.provider.WriteIntrospectionError(ctx, w,
+			fosite.ErrRequestUnauthorized.WithHint(
+				"Introspection requires client credentials or an access token."))
+		return
+	}
+	ctx = oidcop.WithTenant(ctx, tenantID)
+	r = r.WithContext(ctx)
+
+	responder, err := s.provider.NewIntrospectionRequest(ctx, r, oidcop.NewEmptySession())
+	if err != nil {
+		s.provider.WriteIntrospectionError(ctx, w, err)
+		return
+	}
+
+	if !mayIntrospect(caller, responder) {
+		// Answered as inactive rather than as an error, per RFC 7662 §2.2: "a token the
+		// protected resource is not allowed to know about" is reported exactly like an
+		// expired one, so the answer carries no information about whether it exists.
+		s.log.Warn("a client asked about a token that was not issued to it and does not name it",
+			"caller", caller.GetID(), "tenant_id", tenantID)
+		s.provider.WriteIntrospectionError(ctx, w, fosite.ErrInactiveToken)
+		return
+	}
+
+	s.provider.WriteIntrospectionResponse(ctx, w, responder)
+}
+
+// introspectionCaller identifies the client asking, and the tenant it belongs to.
+//
+// fosite accepts two credentials here — HTTP Basic, or an access token of its own — and
+// this reads them the same way so that the tenant established for the request is the
+// tenant of whoever fosite is about to authenticate. Resolving it any other way would
+// let a caller from one tenant set the scope for a token in another.
+func (s *Server) introspectionCaller(r *http.Request) (caller fosite.Client, tenantID string, err error) {
+	ctx := r.Context()
+	clients := s.provider.Storage().Clients()
+
+	if id, _, ok := r.BasicAuth(); ok && id != "" {
+		if decoded, unescapeErr := url.QueryUnescape(id); unescapeErr == nil {
+			id = decoded
+		}
+		client, lookupErr := clients.Lookup(ctx, id)
+		if lookupErr != nil {
+			return nil, "", lookupErr
+		}
+		return client, client.TenantID, nil
+	}
+
+	// A resource server authenticating with an access token of its own. The token names
+	// its tenant and the client it was issued to, which is everything needed; fosite
+	// will validate it again in a moment, and doing it here as well costs one lookup on
+	// a path that is not hot.
+	token := fosite.AccessTokenFromRequest(r)
+	if token == "" {
+		return nil, "", errNoClientInTokenRequest
+	}
+	signature := s.provider.AccessTokenSignature(ctx, token)
+	tenant, lookupErr := s.provider.Storage().TenantOfAccessToken(ctx, signature)
+	if lookupErr != nil {
+		return nil, "", lookupErr
+	}
+	use, requester, introspectErr := s.provider.IntrospectToken(
+		oidcop.WithTenant(ctx, tenant), token, fosite.AccessToken, oidcop.NewEmptySession())
+	if introspectErr != nil {
+		return nil, "", introspectErr
+	}
+	if use != fosite.AccessToken {
+		return nil, "", errNoClientInTokenRequest
+	}
+	return requester.GetClient(), tenant, nil
+}
+
+// mayIntrospect decides whether a caller is entitled to know about a token.
+//
+// Three ways to qualify: the token was issued to you; it names you by client id in its
+// audience; or its audience includes something you are registered to serve. The last is
+// the ordinary case — a resource server is not the client that obtained the token, and
+// the audience is precisely how a token says which resource server it is for, usually as
+// an API's URI rather than as a client id. Anything else is a stranger asking about
+// somebody else's credential.
+func mayIntrospect(caller fosite.Client, responder fosite.IntrospectionResponder) bool {
+	if !responder.IsActive() || responder.GetAccessRequester() == nil {
+		return true // nothing is disclosed by an "inactive" answer
+	}
+	requester := responder.GetAccessRequester()
+	if requester.GetClient().GetID() == caller.GetID() {
+		return true
+	}
+	granted := requester.GetGrantedAudience()
+	if granted.Has(caller.GetID()) {
+		return true
+	}
+	for _, registered := range caller.GetAudience() {
+		if registered != "" && granted.Has(registered) {
+			return true
+		}
+	}
+	return false
+}
+
+// --- revocation (RFC 7009) ----------------------------------------------------------
+
+// handleRevoke retires a token at the client's request.
+//
+// The contrast with reuse detection is the point. Both end with a family of refresh
+// tokens revoked, but this one is a client behaving correctly, so it is recorded as
+// oauth.refresh_token_revoked rather than raised as security.refresh_token_reuse — an
+// alarm that fires on correct behaviour is an alarm somebody will learn to ignore. The
+// context carries that distinction, because fosite calls the same storage method for
+// both and nothing in the arguments says which is which.
+//
+// It also leaves the browser session alone: revoking a grant is not signing out. That
+// is what /oauth2/logout is for.
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if err := r.ParseForm(); err != nil {
+		s.provider.WriteRevocationResponse(ctx, w,
+			fosite.ErrInvalidRequest.WithHint("The request body could not be read."))
+		return
+	}
+
+	tenantID, err := s.tenantForClientRequest(r)
+	if err != nil {
+		s.log.Debug("a revocation request named no resolvable client", "error", err)
+		s.provider.WriteRevocationResponse(ctx, w, fosite.ErrInvalidClient)
+		return
+	}
+
+	ctx = oidcop.WithClientRevocation(oidcop.WithTenant(ctx, tenantID))
+	r = r.WithContext(ctx)
+
+	// An unknown token is not an error: RFC 7009 §2.2 requires 200, because the client's
+	// goal — that the token no longer works — is already met, and answering differently
+	// would turn the endpoint into an oracle for which tokens exist.
+	s.provider.WriteRevocationResponse(ctx, w, s.provider.NewRevocationRequest(ctx, r))
+}

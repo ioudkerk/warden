@@ -208,6 +208,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login", s.requireLogin(s.handleLoginForm))
 	mux.HandleFunc("POST /login", s.requireLogin(s.handleLoginSubmit))
 
+	// The endpoints a client uses once it holds a token. Both methods on userinfo,
+	// because OpenID Connect Core §5.3.1 requires both and relying-party libraries are
+	// split down the middle about which to use.
+	mux.HandleFunc("GET /oauth2/userinfo", s.requireProvider(s.handleUserinfo))
+	mux.HandleFunc("POST /oauth2/userinfo", s.requireProvider(s.handleUserinfo))
+	mux.HandleFunc("POST /oauth2/introspect", s.requireProvider(s.handleIntrospect))
+	mux.HandleFunc("POST /oauth2/revoke", s.requireProvider(s.handleRevoke))
+
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
 	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))

@@ -247,7 +247,7 @@ library, with no Warden-specific client code.
 | M1-3 | **Core done; the HTTP half lands with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one). **Remaining:** `429` + `Retry-After` on the login endpoint, and the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so the sweep cannot be complete before then |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | **In progress (3 of 4).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in. A stock client can now log a user in and refresh. **Remaining:** userinfo, introspect, revoke, logout, PAR and device, then the certification-style checks |
+| M1-6 [B] | **In progress (4a of 4c).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in; **userinfo, introspection and revocation**, plus the client credentials grant the discovery document was already advertising. **Remaining:** logout and PAR (4b), the device grant (4c — fosite has no RFC 8628 handler, so it is hand-written), then the certification-style checks |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
@@ -359,6 +359,60 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-6, part 4a: userinfo, introspection and revocation
+
+**Part 4 is landing in three commits, not one.** The endpoints split cleanly by what they
+need: these three need only fosite; logout and PAR need a browser and a session; and the
+device grant needs a protocol fosite does not implement at all — there is no RFC 8628
+handler anywhere in v0.49, so it is a hand-written grant rather than a factory to compose.
+Recorded because the original plan said "part 4" and this is a change to it.
+
+**Client secrets could not be verified at all, and no test had noticed.** `Client` carried
+a comment saying the provider was configured with an Argon2id hasher "See newSecretHasher"
+— and `newSecretHasher` did not exist. fosite's default is bcrypt, so every confidential
+client failed authentication at every endpoint with "client credentials are invalid",
+while public clients kept working. Part 3 used only a public client, so the whole flow
+passed. The first confidential client in a test found it in one run. `oidcop.NewSecretHasher`
+now delegates to `internal/authn`, and one `authn.Params` value is threaded from the
+registry to the provider so the two cannot drift.
+
+**A refresh token is accepted at userinfo unless you check the token *use*.** fosite's
+introspection tries the access-token validator first and falls back to the refresh-token
+one, so a refresh token presented as a bearer credential validates — as a refresh token,
+successfully. Without the `use != fosite.AccessToken` check, `TestUserinfoRefusesARefreshToken`
+gets a full profile back from a thirty-day credential meant only for the token endpoint.
+
+**Introspection is authorized, not merely authenticated.** RFC 7662 requires the caller to
+authenticate; it leaves who may ask about *which* token to the implementation, and "any
+authenticated client" is a token scanner with a login page. A caller qualifies three ways:
+the token was issued to it, it is named in the token's audience by client id, or the
+token's audience includes something the caller is registered to serve — the last being the
+ordinary case, since a resource server is not the client that obtained the token. Anything
+else is answered `{"active": false}`, which §2.2 requires to be indistinguishable from an
+expired token.
+
+**Revocation is not reuse, and the audit log says so.** fosite calls the same storage
+method for both — a replayed token and a client politely calling RFC 7009 — and nothing in
+the arguments distinguishes them. The revocation endpoint marks the context, and
+`RevokeFamilyOnRequest` records `oauth.refresh_token_revoked` instead of raising
+`security.refresh_token_reuse`. An alarm that fires on correct behaviour is one an operator
+learns to ignore. It also leaves the browser session alone: revoking a grant is not signing
+out, which is what `/oauth2/logout` is for.
+
+**The discovery document advertised `client_credentials` and nothing served it.** The
+provider composed no such handler, so a client following the metadata would have built
+against a grant that answers `unsupported_grant_type`. The factory is now composed — SPEC
+§7.7 lists the grant at the token endpoint — which leaves one wrinkle worth knowing: fosite
+validates the requested scopes against the client's allowlist and then grants none of them,
+because in every other grant a person decided. Here there is no person, so the token
+endpoint grants them itself for this grant alone; without that the grant issues a token
+with no scopes, which every resource server would refuse.
+
+**`sid` and `tid` now reach introspection too.** fosite's response writer copies whatever a
+session offers through `ExtraClaimsSession`, and `openid.DefaultSession` does not implement
+it — so the two identifiers were in the id token and nowhere else. A resource server can
+now tie an introspected token to the session that issued it.
 
 ### Notes from M1-6, part 3
 
