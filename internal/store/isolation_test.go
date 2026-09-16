@@ -291,6 +291,11 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			                             client_id, subject, expires_at)
 			  VALUES (sha256($1::bytea), 'access_token', $2, $3, $4, $5, now() + interval '1 hour')`,
 				[]any{[]byte("sig-" + suffix), tn, "req_" + suffix, "oac_" + suffix, "usr_" + suffix}},
+			{`INSERT INTO device_authorization (id, tenant_id, client_id, device_code_hash,
+			                                    user_code_hash, expires_at)
+			  VALUES ($1, $2, $3, sha256($4::bytea), sha256($5::bytea), now() + interval '10 minutes')`,
+				[]any{"dev_" + suffix, tn, "oac_" + suffix,
+					[]byte("device-" + suffix), []byte("user-" + suffix)}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -780,9 +785,10 @@ func TestTenantListIsStable(t *testing.T) {
 	got := tenantScopedTables(t, ctx, conn)
 	want := []string{
 		"app_enrollment", "app_user", "credential", "decision_event", "denial",
-		"grant_", "group_", "group_member", "identity", "idp_connection",
-		"oauth_client", "oauth_session", "refresh_token", "resource_node", "role",
-		"role_inheritance", "role_permission", "session", "tenant", "ui_binding",
+		"device_authorization", "grant_", "group_", "group_member", "identity",
+		"idp_connection", "oauth_client", "oauth_session", "refresh_token",
+		"resource_node", "role", "role_inheritance", "role_permission", "session",
+		"tenant", "ui_binding",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {

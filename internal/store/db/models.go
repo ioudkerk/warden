@@ -137,6 +137,28 @@ type Denial struct {
 	CreatedAt      time.Time
 }
 
+// RFC 8628 device grant state (SPEC §7.7). One row per device authorization, from the device's request to the moment its tokens are issued.
+type DeviceAuthorization struct {
+	ID             string
+	TenantID       string
+	ClientID       string
+	DeviceCodeHash []byte
+	// SHA-256 of the code a person types. Short by necessity, so the verification endpoint rate-limits guesses (RFC 8628 §5.1).
+	UserCodeHash      []byte
+	RequestedScope    []string
+	GrantedScope      []string
+	RequestedAudience []string
+	GrantedAudience   []string
+	Status            string
+	Subject           string
+	SessionID         *string
+	IntervalSeconds   int32
+	LastPolledAt      *time.Time
+	ApprovedAt        *time.Time
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
+}
+
 // A slice of an application's configuration. UI bindings are environment-scoped so a change is testable in staging and promoted (SPEC §11.3).
 type Environment struct {
 	ID            string

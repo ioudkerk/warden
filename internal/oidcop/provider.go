@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -261,6 +263,21 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 			return compose.OpenIDConnectRefreshFactory(c, s,
 				compose.NewOpenIDConnectStrategy(keyGetter, c))
 		},
+		// The device grant, hand-written: fosite v0.49 implements no part of RFC 8628.
+		// It goes in as a factory like everything else, so it is consulted by the same
+		// token-endpoint pipeline and inherits client authentication and error
+		// rendering rather than reimplementing them.
+		func(c fosite.Configurator, _ any, _ any) any {
+			return &deviceGrantHandler{
+				storage:  storage,
+				sessions: storage.sessions,
+				strategy: strategy,
+				idTokens: compose.NewOpenIDConnectStrategy(keyGetter, c),
+				config:   cfg,
+				issuer:   opts.Issuer,
+				log:      log,
+			}
+		},
 	)
 
 	return &Provider{
@@ -287,6 +304,20 @@ func (p *Provider) AccessTokenSignature(ctx context.Context, token string) strin
 // RefreshTokenSignature is the same for a refresh token.
 func (p *Provider) RefreshTokenSignature(ctx context.Context, token string) string {
 	return p.strategy.RefreshTokenSignature(ctx, token)
+}
+
+// AuthenticateClient authenticates a client exactly as the token endpoint does.
+//
+// Exposed because the device authorization endpoint is Warden's own — fosite has no
+// RFC 8628 — and it must authenticate a client the same way, with the same rules about
+// public clients, the same Argon2id comparison and the same errors. A second
+// implementation would be a second set of rules to keep in step.
+func (p *Provider) AuthenticateClient(ctx context.Context, r *http.Request, form url.Values) (fosite.Client, error) {
+	inner, ok := p.OAuth2Provider.(*fosite.Fosite)
+	if !ok {
+		return nil, errors.New("the provider was not composed by fosite and cannot authenticate a client")
+	}
+	return inner.AuthenticateClient(ctx, r, form)
 }
 
 // Issuer returns the provider's issuer, which is the "iss" of every token it signs.
@@ -329,6 +360,7 @@ type Discovery struct {
 	RevocationEndpoint                 string `json:"revocation_endpoint"`
 	EndSessionEndpoint                 string `json:"end_session_endpoint"`
 	PushedAuthorizationRequestEndpoint string `json:"pushed_authorization_request_endpoint"`
+	DeviceAuthorizationEndpoint        string `json:"device_authorization_endpoint"`
 
 	ScopesSupported        []string `json:"scopes_supported"`
 	ResponseTypesSupported []string `json:"response_types_supported"`
@@ -362,6 +394,7 @@ func (p *Provider) Discovery(algorithms []string) Discovery {
 		RevocationEndpoint:                 base + "/oauth2/revoke",
 		EndSessionEndpoint:                 base + "/oauth2/logout",
 		PushedAuthorizationRequestEndpoint: base + "/oauth2/par",
+		DeviceAuthorizationEndpoint:        base + "/oauth2/device",
 
 		ScopesSupported: []string{"openid", "profile", "email", "offline_access"},
 
@@ -375,6 +408,7 @@ func (p *Provider) Discovery(algorithms []string) Discovery {
 			GrantAuthorizationCode,
 			GrantRefreshToken,
 			GrantClientCredentials,
+			GrantDeviceCode,
 		},
 
 		SubjectTypesSupported:            []string{"public"},

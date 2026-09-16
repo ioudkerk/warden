@@ -150,3 +150,68 @@ SELECT id,
        updated_at
   FROM app_user
  WHERE tenant_id = @tenant_id AND id = @id AND deleted_at IS NULL;
+
+-- ---------------------------------------------------------------------------------
+-- The device authorization grant (RFC 8628)
+-- ---------------------------------------------------------------------------------
+
+-- name: InsertDeviceAuthorization :exec
+INSERT INTO device_authorization (id, tenant_id, client_id, device_code_hash, user_code_hash,
+                                  requested_scope, requested_audience, interval_seconds,
+                                  expires_at)
+VALUES (@id, @tenant_id, @client_id, @device_code_hash, @user_code_hash,
+        @requested_scope, @requested_audience, @interval_seconds, @expires_at);
+
+-- The row a device's poll is about. Returned whatever its status: "pending", "denied"
+-- and "already redeemed" are three different answers the grant has to give, and filtering
+-- here would collapse them into "no such code".
+-- name: DeviceAuthorizationByDeviceCode :one
+SELECT id, tenant_id, client_id, requested_scope, granted_scope, requested_audience,
+       granted_audience, status, subject, session_id, interval_seconds, last_polled_at,
+       approved_at, created_at, expires_at
+  FROM device_authorization
+ WHERE tenant_id = @tenant_id AND device_code_hash = @device_code_hash;
+
+-- name: DeviceAuthorizationByUserCode :one
+SELECT id, tenant_id, client_id, requested_scope, granted_scope, requested_audience,
+       granted_audience, status, subject, session_id, interval_seconds, last_polled_at,
+       approved_at, created_at, expires_at
+  FROM device_authorization
+ WHERE tenant_id = @tenant_id AND user_code_hash = @user_code_hash;
+
+-- Records that the device asked. The value it overwrites is the one the read in the same
+-- transaction returned, which is what "are you polling too fast?" is answered from — so
+-- the read and this write belong together, and the caller runs them that way.
+-- name: TouchDeviceAuthorizationPoll :exec
+UPDATE device_authorization
+   SET last_polled_at = @at
+ WHERE tenant_id = @tenant_id AND id = @id;
+
+-- name: ApproveDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'approved', subject = @subject, session_id = @session_id,
+       granted_scope = @granted_scope, granted_audience = @granted_audience,
+       approved_at = @at
+ WHERE tenant_id = @tenant_id AND id = @id AND status = 'pending';
+
+-- name: DenyDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'denied'
+ WHERE tenant_id = @tenant_id AND id = @id AND status = 'pending';
+
+-- Single use, enforced by the WHERE clause rather than by the caller: two polls arriving
+-- together must not both issue tokens, and the row that changes no rows is the loser.
+-- name: RedeemDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'redeemed'
+ WHERE tenant_id = @tenant_id AND device_code_hash = @device_code_hash AND status = 'approved';
+
+-- name: DeleteExpiredDeviceAuthorizations :execrows
+DELETE FROM device_authorization WHERE expires_at < @before;
+
+-- Resolves a user code to its tenant. System pool, and for the same reason the client
+-- and refresh-token lookups are: the person typing a code has not signed in yet, so
+-- there is no tenant scope to read it under, and which tenant to authenticate them
+-- against is precisely what the code has to answer.
+-- name: DeviceAuthorizationTenant :one
+SELECT tenant_id FROM device_authorization WHERE user_code_hash = @user_code_hash;

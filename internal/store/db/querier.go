@@ -37,6 +37,7 @@ type Querier interface {
 	// Application manifest (warden apply)
 	// ---------------------------------------------------------------------------------
 	ApplicationExists(ctx context.Context, id string) (bool, error)
+	ApproveDeviceAuthorization(ctx context.Context, arg ApproveDeviceAuthorizationParams) (int64, error)
 	AuditChainHead(ctx context.Context) ([]byte, error)
 	// Reads the entire log in sequence order, so it must run on the system pool: the
 	// chain spans tenants, and a connection that could see only some entries would
@@ -61,6 +62,7 @@ type Querier interface {
 	CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error)
 	DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
+	DeleteExpiredDeviceAuthorizations(ctx context.Context, before time.Time) (int64, error)
 	DeleteExpiredOAuthSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteExpiredRefreshTokens(ctx context.Context, before time.Time) (int64, error)
 	// Sessions whose absolute lifetime has passed are of no further interest to anyone;
@@ -75,7 +77,18 @@ type Querier interface {
 	DeleteOAuthSessionsForSession(ctx context.Context, arg DeleteOAuthSessionsForSessionParams) (int64, error)
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
 	DeleteRolePermissions(ctx context.Context, roleID string) error
+	DenyDeviceAuthorization(ctx context.Context, arg DenyDeviceAuthorizationParams) (int64, error)
 	DeprecateUIElement(ctx context.Context, arg DeprecateUIElementParams) error
+	// The row a device's poll is about. Returned whatever its status: "pending", "denied"
+	// and "already redeemed" are three different answers the grant has to give, and filtering
+	// here would collapse them into "no such code".
+	DeviceAuthorizationByDeviceCode(ctx context.Context, arg DeviceAuthorizationByDeviceCodeParams) (DeviceAuthorizationByDeviceCodeRow, error)
+	DeviceAuthorizationByUserCode(ctx context.Context, arg DeviceAuthorizationByUserCodeParams) (DeviceAuthorizationByUserCodeRow, error)
+	// Resolves a user code to its tenant. System pool, and for the same reason the client
+	// and refresh-token lookups are: the person typing a code has not signed in yet, so
+	// there is no tenant scope to read it under, and which tenant to authenticate them
+	// against is precisely what the code has to answer.
+	DeviceAuthorizationTenant(ctx context.Context, userCodeHash []byte) (string, error)
 	EnrolTenantInEveryApplication(ctx context.Context, tenantID string) error
 	EnvironmentID(ctx context.Context, arg EnvironmentIDParams) (string, error)
 	// Read before deleting: an audit entry saying only "a grant was revoked" cannot
@@ -84,6 +97,10 @@ type Querier interface {
 	// The deployment's first owner, granted by warden init before any administrator
 	// exists to be recorded as the assigner.
 	InsertBootstrapGrant(ctx context.Context, arg InsertBootstrapGrantParams) error
+	// ---------------------------------------------------------------------------------
+	// The device authorization grant (RFC 8628)
+	// ---------------------------------------------------------------------------------
+	InsertDeviceAuthorization(ctx context.Context, arg InsertDeviceAuthorizationParams) error
 	// ---------------------------------------------------------------------------------
 	// Grants
 	// ---------------------------------------------------------------------------------
@@ -210,6 +227,9 @@ type Querier interface {
 	// overlap window (SPEC §17).
 	PublicSigningKeys(ctx context.Context) ([]PublicSigningKeysRow, error)
 	RecentAuditEvents(ctx context.Context, arg RecentAuditEventsParams) ([]RecentAuditEventsRow, error)
+	// Single use, enforced by the WHERE clause rather than by the caller: two polls arriving
+	// together must not both issue tokens, and the row that changes no rows is the loser.
+	RedeemDeviceAuthorization(ctx context.Context, arg RedeemDeviceAuthorizationParams) (int64, error)
 	RefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshTokenByHashRow, error)
 	RefreshTokenFamilyByRequest(ctx context.Context, arg RefreshTokenFamilyByRequestParams) (RefreshTokenFamilyByRequestRow, error)
 	// One member of a family, for the security event a revocation raises: it needs the
@@ -322,6 +342,10 @@ type Querier interface {
 	// verification: a successful login must not fail because this write contended, and an
 	// unsuccessful one must not be distinguishable by having skipped it.
 	TouchCredential(ctx context.Context, id string) error
+	// Records that the device asked. The value it overwrites is the one the read in the same
+	// transaction returned, which is what "are you polling too fast?" is answered from — so
+	// the read and this write belong together, and the caller runs them that way.
+	TouchDeviceAuthorizationPoll(ctx context.Context, arg TouchDeviceAuthorizationPollParams) error
 	// Serialises rotation across replicas. A transaction-scoped advisory lock is released
 	// by commit or rollback, including the rollback a crashed connection causes, so a
 	// process that dies mid-rotation does not leave the lock held. Without it, every

@@ -12,6 +12,40 @@ import (
 	"github.com/warden-project/warden/internal/store/dbtypes"
 )
 
+const approveDeviceAuthorization = `-- name: ApproveDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'approved', subject = $1, session_id = $2,
+       granted_scope = $3, granted_audience = $4,
+       approved_at = $5
+ WHERE tenant_id = $6 AND id = $7 AND status = 'pending'
+`
+
+type ApproveDeviceAuthorizationParams struct {
+	Subject         string
+	SessionID       *string
+	GrantedScope    []string
+	GrantedAudience []string
+	At              *time.Time
+	TenantID        string
+	ID              string
+}
+
+func (q *Queries) ApproveDeviceAuthorization(ctx context.Context, arg ApproveDeviceAuthorizationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, approveDeviceAuthorization,
+		arg.Subject,
+		arg.SessionID,
+		arg.GrantedScope,
+		arg.GrantedAudience,
+		arg.At,
+		arg.TenantID,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deactivateOAuthSession = `-- name: DeactivateOAuthSession :execrows
 UPDATE oauth_session SET active = false
  WHERE kind = $1 AND signature_hash = $2 AND active
@@ -24,6 +58,18 @@ type DeactivateOAuthSessionParams struct {
 
 func (q *Queries) DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deactivateOAuthSession, arg.Kind, arg.SignatureHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteExpiredDeviceAuthorizations = `-- name: DeleteExpiredDeviceAuthorizations :execrows
+DELETE FROM device_authorization WHERE expires_at < $1
+`
+
+func (q *Queries) DeleteExpiredDeviceAuthorizations(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredDeviceAuthorizations, before)
 	if err != nil {
 		return 0, err
 	}
@@ -110,6 +156,190 @@ func (q *Queries) DeleteOAuthSessionsForSession(ctx context.Context, arg DeleteO
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const denyDeviceAuthorization = `-- name: DenyDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'denied'
+ WHERE tenant_id = $1 AND id = $2 AND status = 'pending'
+`
+
+type DenyDeviceAuthorizationParams struct {
+	TenantID string
+	ID       string
+}
+
+func (q *Queries) DenyDeviceAuthorization(ctx context.Context, arg DenyDeviceAuthorizationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, denyDeviceAuthorization, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deviceAuthorizationByDeviceCode = `-- name: DeviceAuthorizationByDeviceCode :one
+SELECT id, tenant_id, client_id, requested_scope, granted_scope, requested_audience,
+       granted_audience, status, subject, session_id, interval_seconds, last_polled_at,
+       approved_at, created_at, expires_at
+  FROM device_authorization
+ WHERE tenant_id = $1 AND device_code_hash = $2
+`
+
+type DeviceAuthorizationByDeviceCodeParams struct {
+	TenantID       string
+	DeviceCodeHash []byte
+}
+
+type DeviceAuthorizationByDeviceCodeRow struct {
+	ID                string
+	TenantID          string
+	ClientID          string
+	RequestedScope    []string
+	GrantedScope      []string
+	RequestedAudience []string
+	GrantedAudience   []string
+	Status            string
+	Subject           string
+	SessionID         *string
+	IntervalSeconds   int32
+	LastPolledAt      *time.Time
+	ApprovedAt        *time.Time
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
+}
+
+// The row a device's poll is about. Returned whatever its status: "pending", "denied"
+// and "already redeemed" are three different answers the grant has to give, and filtering
+// here would collapse them into "no such code".
+func (q *Queries) DeviceAuthorizationByDeviceCode(ctx context.Context, arg DeviceAuthorizationByDeviceCodeParams) (DeviceAuthorizationByDeviceCodeRow, error) {
+	row := q.db.QueryRow(ctx, deviceAuthorizationByDeviceCode, arg.TenantID, arg.DeviceCodeHash)
+	var i DeviceAuthorizationByDeviceCodeRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ClientID,
+		&i.RequestedScope,
+		&i.GrantedScope,
+		&i.RequestedAudience,
+		&i.GrantedAudience,
+		&i.Status,
+		&i.Subject,
+		&i.SessionID,
+		&i.IntervalSeconds,
+		&i.LastPolledAt,
+		&i.ApprovedAt,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const deviceAuthorizationByUserCode = `-- name: DeviceAuthorizationByUserCode :one
+SELECT id, tenant_id, client_id, requested_scope, granted_scope, requested_audience,
+       granted_audience, status, subject, session_id, interval_seconds, last_polled_at,
+       approved_at, created_at, expires_at
+  FROM device_authorization
+ WHERE tenant_id = $1 AND user_code_hash = $2
+`
+
+type DeviceAuthorizationByUserCodeParams struct {
+	TenantID     string
+	UserCodeHash []byte
+}
+
+type DeviceAuthorizationByUserCodeRow struct {
+	ID                string
+	TenantID          string
+	ClientID          string
+	RequestedScope    []string
+	GrantedScope      []string
+	RequestedAudience []string
+	GrantedAudience   []string
+	Status            string
+	Subject           string
+	SessionID         *string
+	IntervalSeconds   int32
+	LastPolledAt      *time.Time
+	ApprovedAt        *time.Time
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
+}
+
+func (q *Queries) DeviceAuthorizationByUserCode(ctx context.Context, arg DeviceAuthorizationByUserCodeParams) (DeviceAuthorizationByUserCodeRow, error) {
+	row := q.db.QueryRow(ctx, deviceAuthorizationByUserCode, arg.TenantID, arg.UserCodeHash)
+	var i DeviceAuthorizationByUserCodeRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ClientID,
+		&i.RequestedScope,
+		&i.GrantedScope,
+		&i.RequestedAudience,
+		&i.GrantedAudience,
+		&i.Status,
+		&i.Subject,
+		&i.SessionID,
+		&i.IntervalSeconds,
+		&i.LastPolledAt,
+		&i.ApprovedAt,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const deviceAuthorizationTenant = `-- name: DeviceAuthorizationTenant :one
+SELECT tenant_id FROM device_authorization WHERE user_code_hash = $1
+`
+
+// Resolves a user code to its tenant. System pool, and for the same reason the client
+// and refresh-token lookups are: the person typing a code has not signed in yet, so
+// there is no tenant scope to read it under, and which tenant to authenticate them
+// against is precisely what the code has to answer.
+func (q *Queries) DeviceAuthorizationTenant(ctx context.Context, userCodeHash []byte) (string, error) {
+	row := q.db.QueryRow(ctx, deviceAuthorizationTenant, userCodeHash)
+	var tenant_id string
+	err := row.Scan(&tenant_id)
+	return tenant_id, err
+}
+
+const insertDeviceAuthorization = `-- name: InsertDeviceAuthorization :exec
+
+INSERT INTO device_authorization (id, tenant_id, client_id, device_code_hash, user_code_hash,
+                                  requested_scope, requested_audience, interval_seconds,
+                                  expires_at)
+VALUES ($1, $2, $3, $4, $5,
+        $6, $7, $8, $9)
+`
+
+type InsertDeviceAuthorizationParams struct {
+	ID                string
+	TenantID          string
+	ClientID          string
+	DeviceCodeHash    []byte
+	UserCodeHash      []byte
+	RequestedScope    []string
+	RequestedAudience []string
+	IntervalSeconds   int32
+	ExpiresAt         time.Time
+}
+
+// ---------------------------------------------------------------------------------
+// The device authorization grant (RFC 8628)
+// ---------------------------------------------------------------------------------
+func (q *Queries) InsertDeviceAuthorization(ctx context.Context, arg InsertDeviceAuthorizationParams) error {
+	_, err := q.db.Exec(ctx, insertDeviceAuthorization,
+		arg.ID,
+		arg.TenantID,
+		arg.ClientID,
+		arg.DeviceCodeHash,
+		arg.UserCodeHash,
+		arg.RequestedScope,
+		arg.RequestedAudience,
+		arg.IntervalSeconds,
+		arg.ExpiresAt,
+	)
+	return err
 }
 
 const insertOAuthClient = `-- name: InsertOAuthClient :exec
@@ -564,6 +794,27 @@ func (q *Queries) ProviderRefreshTokenByHash(ctx context.Context, arg ProviderRe
 	return i, err
 }
 
+const redeemDeviceAuthorization = `-- name: RedeemDeviceAuthorization :execrows
+UPDATE device_authorization
+   SET status = 'redeemed'
+ WHERE tenant_id = $1 AND device_code_hash = $2 AND status = 'approved'
+`
+
+type RedeemDeviceAuthorizationParams struct {
+	TenantID       string
+	DeviceCodeHash []byte
+}
+
+// Single use, enforced by the WHERE clause rather than by the caller: two polls arriving
+// together must not both issue tokens, and the row that changes no rows is the loser.
+func (q *Queries) RedeemDeviceAuthorization(ctx context.Context, arg RedeemDeviceAuthorizationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, redeemDeviceAuthorization, arg.TenantID, arg.DeviceCodeHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const refreshTokenFamilyByRequest = `-- name: RefreshTokenFamilyByRequest :one
 SELECT tenant_id, family_id, session_id, client_id, subject
   FROM refresh_token
@@ -637,6 +888,26 @@ func (q *Queries) SetOAuthClientSecret(ctx context.Context, arg SetOAuthClientSe
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const touchDeviceAuthorizationPoll = `-- name: TouchDeviceAuthorizationPoll :exec
+UPDATE device_authorization
+   SET last_polled_at = $1
+ WHERE tenant_id = $2 AND id = $3
+`
+
+type TouchDeviceAuthorizationPollParams struct {
+	At       *time.Time
+	TenantID string
+	ID       string
+}
+
+// Records that the device asked. The value it overwrites is the one the read in the same
+// transaction returned, which is what "are you polling too fast?" is answered from — so
+// the read and this write belong together, and the caller runs them that way.
+func (q *Queries) TouchDeviceAuthorizationPoll(ctx context.Context, arg TouchDeviceAuthorizationPollParams) error {
+	_, err := q.db.Exec(ctx, touchDeviceAuthorizationPoll, arg.At, arg.TenantID, arg.ID)
+	return err
 }
 
 const userProfile = `-- name: UserProfile :one

@@ -48,6 +48,8 @@ type oidcFixture struct {
 	// it holds a secret. audience is what a token says it is for.
 	resource       *oidcop.Client
 	resourceSecret string
+	device         *oidcop.Client
+	deviceOnly     *oidcop.Client
 	audience       string
 	postLogoutURI  string
 
@@ -258,13 +260,40 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	// which resource server it was issued for.
 	resource, resourceSecret, err := clients.Register(ctx, oidcop.NewClientOptions{
 		TenantID: tenantID, Key: "api", Name: "The ACME API",
-		Public:     false,
-		GrantTypes: []string{oidcop.GrantClientCredentials},
+		Public: false,
+		// The device grant as well, so that "a device code belongs to one client" has a
+		// second client to be tested against.
+		GrantTypes: []string{oidcop.GrantClientCredentials, oidcop.GrantDeviceCode},
 		Scopes:     []string{"openid", "profile", "email", "offline_access"},
 		Audiences:  []string{audience},
 	})
 	if err != nil {
 		t.Fatalf("resource client: %v", err)
+	}
+
+	// A thing with a screen and no browser.
+	device, _, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: tenantID, Key: "tv", Name: "The ACME television",
+		Public: true,
+		// Both grants: a device that wants to stay signed in has to hold the refresh
+		// grant as well, or the refresh token it is issued is one it may never use.
+		GrantTypes: []string{oidcop.GrantDeviceCode, oidcop.GrantRefreshToken},
+		Scopes:     []string{"openid", "profile", "email", "offline_access"},
+	})
+	if err != nil {
+		t.Fatalf("device client: %v", err)
+	}
+
+	// The same thing without the refresh grant, for the rule that a client is not handed
+	// a credential it cannot use.
+	deviceOnly, _, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: tenantID, Key: "radio", Name: "The ACME radio",
+		Public:     true,
+		GrantTypes: []string{oidcop.GrantDeviceCode},
+		Scopes:     []string{"openid", "profile", "email", "offline_access"},
+	})
+	if err != nil {
+		t.Fatalf("device-only client: %v", err)
 	}
 
 	server, err := httpapi.New(httpapi.Deps{
@@ -281,6 +310,8 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		handler: server.Handler(), keys: km, issuer: issuer,
 		client: client, redirectURI: redirectURI,
 		resource: resource, resourceSecret: resourceSecret, audience: audience,
+		device:        device,
+		deviceOnly:    deviceOnly,
 		postLogoutURI: postLogoutURI,
 		email:         email, password: password, userID: userID,
 	}

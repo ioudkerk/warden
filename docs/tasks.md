@@ -244,16 +244,16 @@ library, with no Warden-specific client code.
 | --- | --- | --- |
 | M1-1 [B] | **Status: done.** Signing key management: generation, `kid` rotation on a schedule, JWKS with current + previous | Met. `TestRotationKeepsPreviousTokensVerifiableForTheOverlapWindow` signs, rotates, and verifies the pre-rotation token against published JWKS across the window, then asserts it stops verifying after it |
 | M1-2 [B] | **Status: done.** Local credentials: Argon2id (`m=64MiB,t=3,p=2`), rehash on parameter change, per-tenant password policy, breached-password k-anonymity dataset | Met. `TestUnknownUserAndWrongPasswordTakeTheSameTime` measures both paths against the cost of one Argon2id hash; they differ by under 1% of it, and the test fails loudly if either path skips the hash |
-| M1-3 | **Core done; the HTTP half lands with M1-6.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one). **Remaining:** `429` + `Retry-After` on the login endpoint, and the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so the sweep cannot be complete before then |
+| M1-3 | **Core done; the sweep waits on M1-9.** Lockout and rate limiting: exponential backoff per (account, IP), global per-account cap, 429 + `Retry-After` | **Done:** `authn.Lockout` — both counters, the doubling backoff, the cap, shared across replicas through the cache tier, with the enumeration property tested (an unknown address is limited identically to a real one); `429` + `Retry-After` on the login endpoint, and on the device verification page, which is where RFC 8628 §5.1 requires it. **Remaining:** the enumeration sweep across login, reset and invite — reset and invite arrive in M1-9, so it cannot be complete before then |
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
-| M1-6 [B] | **In progress (4b of 4c).** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Certification-style conformance checks pass; implicit and ROPC grants are absent, not disabled. **Done:** the client registry; the storage adapter, provider and discovery; **the authorization code flow end to end** — authorize, the login page, the token endpoint, with M1-3's `429` wired in; **userinfo, introspection and revocation**, plus the client credentials grant the discovery document was already advertising; **RP-initiated logout and pushed authorization requests**. **Remaining:** the device grant (4c — fosite has no RFC 8628 handler, so it is hand-written), then the certification-style checks |
+| M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
 | M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
 
-### Notes from M1-6 (in progress)
+### Notes from M1-6, part 1: the client registry
 
 M1-6 is four commits, not one. This is the first: the client registry everything else
 needs.
@@ -359,6 +359,74 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-6, part 4c: the device grant, and the conformance checks
+
+**fosite implements no part of RFC 8628.** Not a disabled handler — the string
+`device_code` does not appear anywhere in v0.49. So the grant is hand-written, and the
+one thing worth copying from it is *where* it was written: as a `fosite.TokenEndpointHandler`
+plugged into the same pipeline as the others, so it inherits client authentication, the
+token strategies and the error rendering rather than reimplementing them. Three error
+values had to be defined (`authorization_pending`, `slow_down`, `expired_token`) because
+fosite has no reason to carry them; a device's client library switches on exactly those
+names to decide whether to keep waiting.
+
+**Two codes, because they are handed to two different parties.** The device code is a
+machine credential at full entropy. The user code is typed by a person off a screen, so it
+is eight characters from a twenty-letter alphabet with no vowels and none of the pairs
+people mistype — about thirty-four bits, which is plenty against a person and nothing
+against a script. Both are hashed at rest, and the verification page is rate-limited
+through M1-3's limiter, which is what RFC 8628 §5.1 actually requires.
+
+**The code comes before the password, and it has to.** Signing in needs a tenant, and
+before a code is typed nothing says which tenant the person belongs to — the deployment is
+multi-tenant and an email address is unique only within one. So `/device` resolves the
+typed code to its tenant on the system pool, the same shape as resolving a client id or a
+refresh token, and *that* is what the login page authenticates against. An unresolvable
+code does not fail: it authenticates against a tenant that does not exist, where the
+credential check does its usual constant work and answers exactly as a wrong password
+does. Otherwise the login form would be an oracle for which user codes exist, and a code
+short enough to type is short enough to enumerate.
+
+**Signing out stops a device that was approved and never polled.** The grant re-validates
+the approving session on every poll, so an approval is only as alive as the session that
+made it. Without it, "sign out everywhere" would quietly mean "everywhere except the
+television in the other room" — `TestSigningOutStopsAnApprovedDevice` hands over tokens
+when that check is removed.
+
+**The single-use rule needed a test that actually races.** A sequential replay is caught
+earlier, by the status the row already carries, so the first version of the test passed
+with the `WHERE status = 'approved'` guard removed — it was not testing what it claimed.
+Releasing eight polls from a barrier does test it: without the guard, several of them are
+issued tokens from one approval.
+
+**The tenant-isolation registry caught the new table on its own.** `TestTenantListIsStable`
+failed the moment `device_authorization` existed, and `TestTenantIsolation` failed until it
+was seeded — which is exactly the M0-6 machinery working: a new tenant-scoped table cannot
+be added without the isolation suite noticing.
+
+**A live run found a device holding a credential it could never use.** A client registered
+for the device grant alone asked for `offline_access` and was handed a refresh token —
+which fosite's refresh handler then refuses, because the client does not hold the
+`refresh_token` grant. Useless, and invisible until somebody built a refresh loop around
+it. The grant now applies the same two conditions fosite's authorization code handler
+does: the scope *and* the client's registration.
+
+**The conformance checks found a real one.** fosite enforces PKCE inside
+`NewAuthorizeResponse`, which runs *after* the login — so an authorization request with no
+`code_challenge` sent the user to type a password and only then failed. The authorization
+endpoint now applies the policy itself, before the session check, reading both answers
+from the configuration fosite enforces so there is no second copy of the rule. What
+changed is when the answer is given, not what it is.
+
+The rest of the checks are the ones a certification suite makes: every endpoint the
+discovery document advertises exists; the required metadata fields are present and the
+issuer matches character for character; JWKS publishes no private key member (`d`, `p`,
+`q`, `dp`, `dq`, `qi`, `k`); the id token carries `iss`, `sub`, `aud`, `exp`, `iat`, is not
+signed with `alg=none`, echoes the `nonce` and names exactly the client that asked; token
+and userinfo responses say `no-store`; an authorization error travels back to the client
+with its `state`; and the excluded grants are refused at every surface a client can
+observe.
 
 ### Notes from M1-6, part 4b: logout and pushed authorization requests
 

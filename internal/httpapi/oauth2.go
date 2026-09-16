@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -69,6 +70,15 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refused here rather than three steps later, and the difference is a person's time:
+	// fosite enforces PKCE inside NewAuthorizeResponse, which runs *after* the login. A
+	// client that forgot the challenge would otherwise send somebody to type a password
+	// for a request that was never going to succeed.
+	if pkceErr := s.requirePKCE(ctx, request); pkceErr != nil {
+		s.provider.WriteAuthorizeError(ctx, w, request, pkceErr)
+		return
+	}
+
 	if !authenticated {
 		// Either nobody is signed in, or the session belongs to a different tenant —
 		// which happens when one browser is used for two deployments' clients, and
@@ -97,6 +107,38 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.provider.WriteAuthorizeResponse(ctx, w, request, response)
+}
+
+// requirePKCE applies the provider's PKCE policy at the authorization endpoint.
+//
+// It duplicates no policy: both answers are read from the configuration fosite itself
+// enforces, so switching the policy switches this with it. What it changes is *when* the
+// answer is given — before the login rather than after it.
+func (s *Server) requirePKCE(ctx context.Context, request fosite.AuthorizeRequester) error {
+	config := s.provider.Config()
+	if !config.GetEnforcePKCE(ctx) || !request.GetResponseTypes().ExactOne("code") {
+		return nil
+	}
+
+	form := request.GetRequestForm()
+	if form.Get("code_challenge") == "" {
+		return fosite.ErrInvalidRequest.WithHint(
+			"This authorization server requires PKCE: include a code_challenge.")
+	}
+
+	// RFC 7636 §4.3: an absent method means "plain", which is the one this provider does
+	// not accept. Defaulting it here rather than treating empty as "fine" is the
+	// difference between requiring proof and requiring a parameter.
+	method := form.Get("code_challenge_method")
+	if method == "" {
+		method = "plain"
+	}
+	if method != "S256" && !config.GetEnablePKCEPlainChallengeMethod(ctx) {
+		return fosite.ErrInvalidRequest.WithHintf(
+			"This authorization server supports only the S256 code challenge method, not %q.",
+			method)
+	}
+	return nil
 }
 
 // isPushedRequest reports whether this authorization request is the continuation of a

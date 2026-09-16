@@ -303,11 +303,10 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 			"purged: database.system_url is not configured")
 	}
 
-	// Refresh tokens hang off sessions, so they are built after them. There is no
-	// refresh endpoint yet — the token endpoint arrives with the OIDC provider in
-	// M1-6 — so the only thing that drives this today is the purge below. Building it
-	// here rather than at M1-6 keeps the wiring in one place and gives the mirrors a
-	// sweeper from the moment they start filling.
+	// Refresh tokens hang off sessions, so they are built after them. The token
+	// endpoint drives them now (M1-6): fosite's refresh storage is implemented against
+	// this, so a replayed token revokes its family here rather than in a second
+	// implementation of the same idea.
 	refreshTokens, err := authn.NewRefreshTokens(db, system, sessions, authn.RefreshTokenOptions{
 		AbsoluteLifetime: cfg.Security.RefreshTokenAbsoluteLifetime,
 		IdleLifetime:     cfg.Security.RefreshTokenIdleLifetime,
@@ -396,6 +395,11 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		}
 		if provider, err = oidcop.NewProvider(providerStorage, providerOpts); err != nil {
 			return err
+		}
+		// The provider's own rows — codes, access tokens, pushed requests, device
+		// authorizations — expire in minutes and delete nothing themselves.
+		if cfg.HasRole(config.RoleWorker) {
+			go oidcop.RunPurge(ctx, providerStorage, log)
 		}
 		log.Info("OpenID Provider ready", "issuer", cfg.Issuer)
 	} else if cfg.HasRole(config.RoleAuth) {

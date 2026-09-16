@@ -170,7 +170,10 @@ func safeReturnTo(raw string) (string, bool) {
 	if err != nil || parsed.IsAbs() || parsed.Host != "" {
 		return "", false
 	}
-	if !strings.HasPrefix(parsed.Path, "/oauth2/authorize") {
+	// An allowlist of destinations, not a shape test. Both are pages a person reaches
+	// mid-flow and must come back to after signing in; anything else is somebody's idea
+	// of where the browser should land after a password has been typed.
+	if parsed.Path != devicePath && !strings.HasPrefix(parsed.Path, "/oauth2/authorize") {
 		return "", false
 	}
 	return parsed.String(), true
@@ -470,12 +473,41 @@ func (s *Server) tenantForLogin(r *http.Request, returnTo string) (string, error
 	if err != nil {
 		return "", err
 	}
+
+	// The device verification page is the other way in, and it has no client: the person
+	// typed a code off a screen, and that code is the only thing that says which tenant
+	// they belong to.
+	if parsed.Path == devicePath {
+		return s.tenantForDeviceLogin(r, parsed.Query().Get("user_code")), nil
+	}
+
 	clientID := parsed.Query().Get("client_id")
 	if clientID == "" {
 		return "", errors.New("the authorization request names no client")
 	}
 	return s.provider.Storage().Clients().TenantOf(r.Context(), clientID)
 }
+
+// tenantForDeviceLogin resolves a typed user code to the tenant to authenticate against.
+//
+// An unresolvable code is not an error here, and that is the point. Refusing it — or
+// rendering a different page for it — would make the login form an oracle for which user
+// codes exist, and a code short enough to be typed is short enough to be enumerated. So a
+// code that resolves to nothing authenticates against a tenant that does not exist, where
+// the credential check does its usual constant work and fails exactly as a wrong password
+// does.
+func (s *Server) tenantForDeviceLogin(r *http.Request, typed string) string {
+	tenantID, err := s.provider.Storage().TenantOfUserCode(r.Context(), typed)
+	if err != nil {
+		s.log.Debug("a device verification login named no resolvable user code", "error", err)
+		return unknownTenantID
+	}
+	return tenantID
+}
+
+// unknownTenantID is a syntactically valid tenant that no row can belong to. Used where
+// a lookup failed but the answer must be indistinguishable from a wrong password.
+const unknownTenantID = "ten_no_such_tenant"
 
 // clientIP returns the address the request came from, honouring X-Forwarded-For only
 // from proxies the operator has listed.

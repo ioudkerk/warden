@@ -222,6 +222,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /oauth2/logout", s.requireProvider(s.handleLogout))
 	mux.HandleFunc("POST /oauth2/logout", s.requireProvider(s.handleLogout))
 
+	// The device grant. The endpoint the device talks to is under /oauth2 like the rest;
+	// the page a person opens is at the root, because it is read off a screen and typed
+	// into a phone and every character is one somebody can get wrong.
+	mux.HandleFunc("POST /oauth2/device", s.requireProvider(s.handleDeviceAuthorization))
+	mux.HandleFunc("GET /device", s.requireProvider(s.requireLogin(s.handleDeviceVerification)))
+	mux.HandleFunc("POST /device", s.requireProvider(s.requireLogin(s.handleDeviceVerificationSubmit)))
+
 	mux.HandleFunc("POST /v1/authz/check", s.requireCaller(s.handleCheck))
 	mux.HandleFunc("POST /v1/authz/batch-check", s.requireCaller(s.handleBatchCheck))
 	mux.HandleFunc("POST /v1/authz/explain", s.requireCaller(s.handleExplain))
