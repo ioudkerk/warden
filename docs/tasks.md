@@ -248,7 +248,7 @@ library, with no Warden-specific client code.
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
-| M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and gets a **645-byte** token that verifies against published JWKS, carries `wd.roles` and `wd.perm_rev`, and says `wd.truncated`. The same run against the deployment produced **1163 bytes** under RS256 with every §8.2 claim present |
+| M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met, and §8.2 amended: the authorization facts are now a per-client grant, empty by default, because Warden is the decision point and a role list in a JWT is that decision made stale and unrevocable. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and, for a client that opted in, gets a **645-byte** token that verifies against published JWKS and says `wd.truncated`. For the default client the same five thousand memberships produce **586 bytes** with nothing dropped and no membership walk at all |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
@@ -359,6 +359,46 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-7, revisited: the token says who you are, not what you may do
+
+The first cut of M1-7 implemented SPEC §8.2 as written: `wd.roles`, `wd.groups` and
+`wd.attrs` in every access token. Reviewing it against the rest of the product, §8.2 was
+the odd one out, and the spec has been changed rather than the code left to contradict it.
+
+**The argument.** Warden is the policy decision point: "may this person do this?" is
+answered at `/v1/authz/check`, against a model an administrator can edit, with the answer in
+the decision log and revocable the moment the model changes. A role list inside a JWT is the
+same question answered once, up to fifteen minutes before anybody reads it, where no
+revocation reaches it and no audit records that it was used. That is how an identity server
+that is *not* a PDP works — the application decides — and it is a different product.
+
+The rest of the spec already had better answers for every case §8.2's claims were meant to
+serve. §10.4's decision bundle is the sanctioned way to evaluate locally: signed, with a
+TTL and change-stream invalidation. §11's UI bundle is how a front end hides a button, and
+it is what makes the element-to-permission binding editable by an administrator instead of
+compiled into the app. `wd.roles` was a third channel, redundant with both and revocable
+like neither. Warden itself never read it: the decision API authenticates service accounts
+with `wsk_` tokens, so those claims were only ever for somebody else to authorize on.
+
+**So the default is inverted.** A token carries identity, the protocol claims, the
+authentication context, and `wd.perm_rev` — which stays because it is what lets a reader
+notice that its cached model is older than the token in its hand. The authorization facts
+are a per-client grant (`token_claims`, `token_attributes`), empty by default, for the one
+case that needs them: a third-party resource server that speaks JWT and will never call the
+decision API.
+
+**What it costs and what it saves.** With nothing granted, claim assembly is one query — the
+subject's status and the tenant revision, both needed regardless — and the two recursive
+membership walks never run. A user with five thousand group memberships gets the same
+586-byte token as a user with none, and the 4 KB cap becomes something most deployments
+never meet. It is still there, still tested, and still fires for a client that opted in:
+five thousand groups with `token_claims: [roles, groups]` comes out at 645 bytes with
+`wd.truncated` set.
+
+**The closed vocabulary is deliberate.** `token_claims` is constrained to `roles` and
+`groups` by a check constraint, so a typo is a failed write rather than a claim that
+silently never appears — the same reasoning as the forbidden-grants constraint in M1-6.
 
 ### Notes from M1-7: the access token
 

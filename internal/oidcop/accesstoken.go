@@ -94,7 +94,8 @@ func (a *accessTokenStrategy) GenerateAccessToken(
 		}
 	}
 
-	facts, err := a.storage.AccessTokenFactsFor(ctx, tenantID, subject, attributesFor(requester.GetClient()))
+	grant := ClaimGrantFor(requester.GetClient())
+	facts, err := a.storage.AccessTokenFactsFor(ctx, tenantID, subject, grant)
 	if errors.Is(err, ErrSubjectNotIssuable) {
 		// The account was suspended, deprovisioned or deleted since the session began.
 		// Refused here rather than at any one endpoint, because this is the single place
@@ -117,7 +118,7 @@ func (a *accessTokenStrategy) GenerateAccessToken(
 	// The extra signatures are paid only by the tokens that need them. A user with three
 	// groups signs once; a user with five thousand signs twice.
 	for level := keepEverything; level <= dropAttrs; level++ {
-		a.baseClaims(session, requester, subject, wardenClaims(facts, level))
+		a.baseClaims(session, requester, subject, wardenClaims(facts, grant, level))
 
 		issued, sig, genErr := a.CoreStrategy.GenerateAccessToken(ctx, requester)
 		if genErr != nil {
@@ -190,13 +191,4 @@ func (a *accessTokenStrategy) baseClaims(
 		session.AccessClaims.ExpiresAt = expiry
 	}
 	session.AccessClaims.IssuedAt = time.Now().UTC()
-}
-
-// attributesFor returns the attribute allowlist a client was registered with.
-func attributesFor(client fosite.Client) []string {
-	warden, ok := client.(*Client)
-	if !ok {
-		return nil
-	}
-	return warden.TokenAttributes
 }

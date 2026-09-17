@@ -346,11 +346,11 @@ const insertOAuthClient = `-- name: InsertOAuthClient :exec
 INSERT INTO oauth_client (id, tenant_id, key, name, public, secret_hash, redirect_uris,
                           grant_types, response_types, scopes, audiences,
                           token_endpoint_auth_method, post_logout_redirect_uris,
-                          token_attributes, require_pkce)
+                          token_attributes, token_claims, require_pkce)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11,
         $12, $13,
-        $14, $15)
+        $14, $15, $16)
 `
 
 type InsertOAuthClientParams struct {
@@ -368,6 +368,7 @@ type InsertOAuthClientParams struct {
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
 	TokenAttributes         []string
+	TokenClaims             []string
 	RequirePkce             bool
 }
 
@@ -387,6 +388,7 @@ func (q *Queries) InsertOAuthClient(ctx context.Context, arg InsertOAuthClientPa
 		arg.TokenEndpointAuthMethod,
 		arg.PostLogoutRedirectUris,
 		arg.TokenAttributes,
+		arg.TokenClaims,
 		arg.RequirePkce,
 	)
 	return err
@@ -556,7 +558,8 @@ func (q *Queries) ListOAuthClients(ctx context.Context, tenantID string) ([]List
 const oAuthClientByID = `-- name: OAuthClientByID :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, token_claims, require_pkce,
+       disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = $1 AND id = $2
 `
@@ -581,6 +584,7 @@ type OAuthClientByIDRow struct {
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
 	TokenAttributes         []string
+	TokenClaims             []string
 	RequirePkce             bool
 	DisabledAt              *time.Time
 	CreatedAt               time.Time
@@ -604,6 +608,7 @@ func (q *Queries) OAuthClientByID(ctx context.Context, arg OAuthClientByIDParams
 		&i.TokenEndpointAuthMethod,
 		&i.PostLogoutRedirectUris,
 		&i.TokenAttributes,
+		&i.TokenClaims,
 		&i.RequirePkce,
 		&i.DisabledAt,
 		&i.CreatedAt,
@@ -614,7 +619,8 @@ func (q *Queries) OAuthClientByID(ctx context.Context, arg OAuthClientByIDParams
 const oAuthClientByKey = `-- name: OAuthClientByKey :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, token_claims, require_pkce,
+       disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = $1 AND key = $2
 `
@@ -639,6 +645,7 @@ type OAuthClientByKeyRow struct {
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
 	TokenAttributes         []string
+	TokenClaims             []string
 	RequirePkce             bool
 	DisabledAt              *time.Time
 	CreatedAt               time.Time
@@ -662,6 +669,7 @@ func (q *Queries) OAuthClientByKey(ctx context.Context, arg OAuthClientByKeyPara
 		&i.TokenEndpointAuthMethod,
 		&i.PostLogoutRedirectUris,
 		&i.TokenAttributes,
+		&i.TokenClaims,
 		&i.RequirePkce,
 		&i.DisabledAt,
 		&i.CreatedAt,

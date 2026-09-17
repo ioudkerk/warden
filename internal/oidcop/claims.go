@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/ory/fosite"
 
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
@@ -52,20 +53,63 @@ type AccessTokenFacts struct {
 // not by a lookup.
 var ErrSubjectNotIssuable = errors.New("no token may be issued for this subject")
 
+// ClaimGrant is what a client was registered to receive in its access tokens.
+//
+// The zero value is the default and the default is the point: identity, and the revision
+// pointer that tells a reader how fresh its own model is. Nothing about what the subject
+// may do — that question is answered at /v1/authz/check, where the answer is current,
+// revocable and logged.
+type ClaimGrant struct {
+	Roles      bool
+	Groups     bool
+	Attributes []string
+}
+
+// ClaimGrantFor reads what a client may put in its tokens.
+func ClaimGrantFor(client fosite.Client) ClaimGrant {
+	warden, ok := client.(*Client)
+	if !ok {
+		return ClaimGrant{}
+	}
+	grant := ClaimGrant{Attributes: warden.TokenAttributes}
+	for _, claim := range warden.TokenClaims {
+		switch claim {
+		case TokenClaimRoles:
+			grant.Roles = true
+		case TokenClaimGroups:
+			grant.Groups = true
+		}
+	}
+	return grant
+}
+
+// wants reports whether anything beyond identity was granted.
+func (g ClaimGrant) wants() bool {
+	return g.Roles || g.Groups || len(g.Attributes) > 0
+}
+
 // AccessTokenFactsFor reads what a subject's access token should say.
 //
-// Three queries on the tenant-scoped pool. They are not cached, and the honest reason is
-// that the cache key would be (tenant revision, user) — which is the memoization M2 builds
-// for decisions — and building half of it here would mean two caches to invalidate. At one
-// token per ten minutes per session this is not the hot path; the decision API is.
+// It reads only what the client was granted. A client with the default grant costs one
+// query — the subject's status and the tenant revision, both of which are needed whatever
+// the token carries — and the two recursive membership walks never run. That is the
+// difference between a token endpoint that does constant work and one that pays for a
+// role and group expansion on every issuance for facts nobody asked for.
+//
+// Nothing here is cached. The key would be (tenant revision, subject), which is the
+// memoization M2 builds for decisions, and building half of it here would leave two caches
+// to invalidate.
 func (s *Storage) AccessTokenFactsFor(
-	ctx context.Context, tenantID, userID string, allowedAttributes []string,
+	ctx context.Context, tenantID, userID string, grant ClaimGrant,
 ) (*AccessTokenFacts, error) {
 	facts := &AccessTokenFacts{Attrs: map[string]any{}}
 
 	err := s.tenant.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
 		q := db.New(tx)
 
+		// Always read, whatever the client was granted: perm_rev is in every token, and
+		// the status check is what stops a suspended user collecting a fresh token that
+		// no revocation can reach.
 		subject, subjectErr := q.TokenClaimSubject(ctx, db.TokenClaimSubjectParams{
 			TenantID: tenantID, UserID: userID,
 		})
@@ -74,28 +118,32 @@ func (s *Storage) AccessTokenFactsFor(
 		}
 		facts.Status = subject.Status
 		facts.PermRev = subject.PermissionRev
-		if subject.Status != "active" {
-			// Read but not assembled: there is nothing to put in a token that will not
-			// be issued.
+		if subject.Status != "active" || !grant.wants() {
+			// Nothing further to assemble: either the token will not be issued, or it
+			// carries only what is already here.
 			return nil
 		}
-		facts.Attrs = allowedAttrs(subject.Attributes, allowedAttributes)
+		facts.Attrs = allowedAttrs(subject.Attributes, grant.Attributes)
 
-		roles, rolesErr := q.TokenClaimRoles(ctx, db.TokenClaimRolesParams{
-			TenantID: tenantID, UserID: &userID,
-		})
-		if rolesErr != nil {
-			return rolesErr
+		if grant.Roles {
+			roles, rolesErr := q.TokenClaimRoles(ctx, db.TokenClaimRolesParams{
+				TenantID: tenantID, UserID: &userID,
+			})
+			if rolesErr != nil {
+				return rolesErr
+			}
+			facts.Roles = roles
 		}
-		facts.Roles = roles
 
-		groups, groupsErr := q.TokenClaimGroups(ctx, db.TokenClaimGroupsParams{
-			TenantID: tenantID, UserID: &userID,
-		})
-		if groupsErr != nil {
-			return groupsErr
+		if grant.Groups {
+			groups, groupsErr := q.TokenClaimGroups(ctx, db.TokenClaimGroupsParams{
+				TenantID: tenantID, UserID: &userID,
+			})
+			if groupsErr != nil {
+				return groupsErr
+			}
+			facts.Groups = groups
 		}
-		facts.Groups = groups
 		return nil
 	}, store.ReadOnly())
 
@@ -138,15 +186,20 @@ func allowedAttrs(all map[string]any, allowed []string) map[string]any {
 // usually written against, while `wd.attrs` exists precisely so that a condition can be
 // evaluated without a round trip.
 //
-// `wd.roles` and `wd.perm_rev` are never dropped. Without perm_rev an SDK cannot tell
+// `wd.roles` and `wd.perm_rev` are never dropped. Without perm_rev a reader cannot tell
 // whether its cached model predates the token, which is the one thing that makes local
-// evaluation safe at all.
-func wardenClaims(facts *AccessTokenFacts, level truncation) map[string]any {
-	wd := map[string]any{
-		"roles":    orEmptyStrings(facts.Roles),
-		"perm_rev": facts.PermRev,
+// evaluation safe at all; and a client that was deliberately granted roles is a client
+// with nothing else to fall back on.
+func wardenClaims(facts *AccessTokenFacts, grant ClaimGrant, level truncation) map[string]any {
+	// perm_rev alone is the default token's `wd`, and it earns its place: it is what lets
+	// a reader with a cached model notice that the model is older than the token in its
+	// hand. Without it, local evaluation is a guess; with it, a stale cache is detectable.
+	wd := map[string]any{"perm_rev": facts.PermRev}
+
+	if grant.Roles {
+		wd["roles"] = orEmptyStrings(facts.Roles)
 	}
-	if level < dropGroups {
+	if grant.Groups && level < dropGroups {
 		wd["groups"] = orEmptyStrings(facts.Groups)
 	}
 	if level < dropAttrs && len(facts.Attrs) > 0 {

@@ -26,7 +26,7 @@ func TestTheAccessTokenCarriesWhatTheSpecificationSays(t *testing.T) {
 	f := newOIDCFixture(t)
 	f.grantRole(t, "finance.viewer")
 
-	token := f.accessToken(t, "openid profile email", f.audience, "state-for-the-claims-case")
+	token := f.accessTokenFor(t, f.legacy, "openid profile email", f.audience, "state-for-the-claims-case")
 	claims := f.verifyAgainstJWKS(t, token)
 
 	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat", "jti", "tid", "sid",
@@ -42,7 +42,7 @@ func TestTheAccessTokenCarriesWhatTheSpecificationSays(t *testing.T) {
 	if claims["iss"] != f.issuer {
 		t.Errorf("iss = %v; want %s", claims["iss"], f.issuer)
 	}
-	if claims["azp"] != f.client.ID {
+	if claims["azp"] != f.legacy.ID {
 		t.Errorf("azp = %v; want the client the token was issued to", claims["azp"])
 	}
 	if jti, _ := claims["jti"].(string); !strings.HasPrefix(jti, "tok_") { //nolint:errcheck // checked
@@ -87,7 +87,7 @@ func TestAUserWithFiveThousandGroupsGetsAUsableToken(t *testing.T) {
 	f.grantRole(t, "finance.viewer")
 	f.joinGroups(t, 5000)
 
-	token := f.accessToken(t, "openid profile email", f.audience, "state-for-the-big-case")
+	token := f.accessTokenFor(t, f.legacy, "openid profile email", f.audience, "state-for-the-big-case")
 
 	if len(token) > 4096 {
 		t.Fatalf("the access token is %d bytes; SPEC §8.2 caps it at 4096", len(token))
@@ -168,7 +168,7 @@ func TestTheAttributeAllowlistDecidesWhatIsDisclosed(t *testing.T) {
 func TestARefreshedTokenDescribesTheUserNow(t *testing.T) {
 	f := newOIDCFixture(t)
 
-	tokens := f.tokensFor(t, "openid offline_access", "", "state-for-the-freshness-case")
+	tokens := f.tokensForClient(t, f.legacy, "openid offline_access", "", "state-for-the-freshness-case")
 	first, _ := tokens["access_token"].(string)         //nolint:errcheck // checked below
 	refreshToken, _ := tokens["refresh_token"].(string) //nolint:errcheck // checked below
 	if first == "" || refreshToken == "" {
@@ -183,7 +183,7 @@ func TestARefreshedTokenDescribesTheUserNow(t *testing.T) {
 
 	refreshed := f.exchange(t, url.Values{
 		"grant_type": {"refresh_token"}, "refresh_token": {refreshToken},
-		"client_id": {f.client.ID},
+		"client_id": {f.legacy.ID},
 	})
 	second, _ := refreshed["access_token"].(string) //nolint:errcheck // checked below
 	if second == "" {
@@ -333,7 +333,7 @@ func TestGroupsSurviveWhenTheyFit(t *testing.T) {
 	f.joinGroups(t, 20)
 
 	claims := f.verifyAgainstJWKS(t,
-		f.accessToken(t, "openid profile", "", "state-for-the-small-group-case"))
+		f.accessTokenFor(t, f.legacy, "openid profile", "", "state-for-the-small-group-case"))
 	wd, isMap := claims["wd"].(map[string]any)
 	if !isMap {
 		t.Fatalf("wd = %T", claims["wd"])
@@ -352,7 +352,7 @@ func TestGroupsSurviveWhenTheyFit(t *testing.T) {
 // byte than the group list that assigned the roles in the first place.
 func TestAttributesGoAfterGroups(t *testing.T) {
 	f := newOIDCFixture(t)
-	f.allowAttributes(t, f.client.ID, "department", "dossier")
+	f.allowAttributes(t, f.legacy.ID, "department", "dossier")
 	// Sized so that groups and attributes together do not fit and attributes alone do.
 	// Base64 is the reason the numbers look generous: a 4096-byte token holds about
 	// 3000 bytes of JSON once the encoding, the header and the signature are paid for.
@@ -364,7 +364,7 @@ func TestAttributesGoAfterGroups(t *testing.T) {
 	t.Run("groups alone are enough", func(t *testing.T) {
 		f.joinGroups(t, 60)
 		claims := f.verifyAgainstJWKS(t,
-			f.accessToken(t, "openid profile", "", "state-for-the-order-case-one"))
+			f.accessTokenFor(t, f.legacy, "openid profile", "", "state-for-the-order-case-one"))
 		wd, _ := claims["wd"].(map[string]any) //nolint:errcheck // asserted below
 		if wd == nil {
 			t.Fatal("no wd")
@@ -384,7 +384,7 @@ func TestAttributesGoAfterGroups(t *testing.T) {
 		// A dossier no token can hold: groups go, then attributes, and what is left is
 		// the identity and the roles.
 		f.setAttributes(t, map[string]any{"dossier": strings.Repeat("x", 5000)})
-		token := f.accessToken(t, "openid profile", "", "state-for-the-order-case-two")
+		token := f.accessTokenFor(t, f.legacy, "openid profile", "", "state-for-the-order-case-two")
 		if len(token) > 4096 {
 			t.Fatalf("token is %d bytes", len(token))
 		}
@@ -400,4 +400,92 @@ func TestAttributesGoAfterGroups(t *testing.T) {
 			t.Fatal("perm_rev was dropped")
 		}
 	})
+}
+
+// TestByDefaultATokenSaysWhoYouAreAndNothingMore is the decision this design turns on.
+//
+// Warden is the policy decision point. "May this person do this?" is answered at
+// /v1/authz/check, against a model an administrator can change, with the answer in the
+// decision log. A role list inside a JWT is the same question answered once, up to ten
+// minutes ago, somewhere no revocation can reach and no audit can see — and once the claim
+// is there, something will eventually authorize on it.
+//
+// So a client gets identity and a freshness pointer, and asks Warden for the rest. Roles
+// and groups are a concession granted per client, for the resource server that speaks JWT
+// and will never call the decision API.
+func TestByDefaultATokenSaysWhoYouAreAndNothingMore(t *testing.T) {
+	f := newOIDCFixture(t)
+	f.grantRole(t, "finance.viewer")
+	f.joinGroups(t, 30)
+	f.setAttributes(t, map[string]any{"department": "finance"})
+
+	claims := f.verifyAgainstJWKS(t,
+		f.accessToken(t, "openid profile email", f.audience, "state-for-the-default-case"))
+
+	// Identity and the protocol are all there.
+	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat", "jti", "tid", "sid",
+		"scope", "azp", "amr", "auth_time"} {
+		if claims[claim] == nil {
+			t.Errorf("the access token has no %q", claim)
+		}
+	}
+
+	wd, isMap := claims["wd"].(map[string]any)
+	if !isMap {
+		t.Fatalf("wd = %T; perm_rev travels in every token", claims["wd"])
+	}
+	if wd["perm_rev"] == nil {
+		t.Error("wd.perm_rev is absent; it is what lets a reader notice its cached model " +
+			"is older than the token, and it is the whole of wd by default")
+	}
+	for _, leaked := range []string{"roles", "groups", "attrs"} {
+		if wd[leaked] != nil {
+			t.Errorf("wd.%s = %v in a token for a client that was granted nothing; "+
+				"authorization is Warden's answer to give, not the token's", leaked, wd[leaked])
+		}
+	}
+	if len(wd) != 1 {
+		t.Errorf("wd = %v; want perm_rev alone", wd)
+	}
+}
+
+// TestGrantingTheClaimsIsPerClient. The concession exists, and it is a concession: one
+// client carries the facts because it was registered to, the next one does not.
+func TestGrantingTheClaimsIsPerClient(t *testing.T) {
+	f := newOIDCFixture(t)
+	f.grantRole(t, "finance.viewer")
+
+	granted := f.rolesIn(t,
+		f.accessTokenFor(t, f.legacy, "openid", "", "state-for-the-grant-case-yes"))
+	if len(granted) != 1 || granted[0] != "finance.viewer" {
+		t.Fatalf("a client granted wd.roles received %v", granted)
+	}
+
+	claims := f.verifyAgainstJWKS(t,
+		f.accessToken(t, "openid", "", "state-for-the-grant-case-no"))
+	wd, _ := claims["wd"].(map[string]any) //nolint:errcheck // asserted below
+	if wd["roles"] != nil {
+		t.Fatalf("a client granted nothing received wd.roles = %v", wd["roles"])
+	}
+}
+
+// TestTheDefaultTokenCostsOneQuery is the other half of the decision, and the reason it is
+// worth measuring: with nothing granted there is no role expansion and no group walk, so a
+// user with five thousand memberships costs exactly what a user with none costs.
+func TestTheDefaultTokenCostsOneQuery(t *testing.T) {
+	f := newOIDCFixture(t)
+	f.joinGroups(t, 5000)
+
+	token := f.accessToken(t, "openid profile email", f.audience, "state-for-the-cost-case")
+	if len(token) > 900 {
+		t.Fatalf("the default token is %d bytes with 5000 groups in the database; nothing "+
+			"about the subject's memberships should reach it", len(token))
+	}
+
+	claims := f.verifyAgainstJWKS(t, token)
+	wd, _ := claims["wd"].(map[string]any) //nolint:errcheck // asserted below
+	if wd["truncated"] != nil {
+		t.Fatalf("the default token was truncated; there was nothing to truncate: %v", wd)
+	}
+	t.Logf("5000 groups, default client → %d bytes, nothing dropped", len(token))
 }

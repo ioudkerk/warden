@@ -39,6 +39,18 @@ const (
 	ResponseTypeCode = "code"
 )
 
+// The authorization facts a client may be granted in its access tokens (SPEC §8.2).
+//
+// Neither is on by default. The decision API is where "may this person do this?" is
+// answered, against a model an administrator can change and with every answer in the
+// decision log; a role list inside a JWT is the same question answered once, ten minutes
+// ago, somewhere nobody can see. These exist for the resource server that speaks JWT and
+// nothing else.
+const (
+	TokenClaimRoles  = "roles"
+	TokenClaimGroups = "groups"
+)
+
 // Signing algorithms, matching internal/keys. SPEC §8.2 makes RS256 the default and
 // ES256 selectable; symmetric algorithms are deliberately absent, because a relying
 // party must be able to verify without holding anything that could mint.
@@ -84,7 +96,12 @@ type Client struct {
 	// TokenAttributes is the allowlist of user attributes this client's access tokens
 	// may carry in wd.attrs (SPEC §8.2). Empty means none, which is the default.
 	TokenAttributes []string
-	RequirePKCE     bool
+	// TokenClaims names the authorization facts this client's access tokens may carry:
+	// any of "roles", "groups". Empty means none, which is the default — Warden answers
+	// "may this person do this?", and a token asserting it would be a second, slower,
+	// unrevocable answer to the same question.
+	TokenClaims []string
+	RequirePKCE bool
 
 	DisabledAt *time.Time
 	CreatedAt  time.Time
@@ -270,6 +287,7 @@ type NewClientOptions struct {
 	Audiences              []string
 	PostLogoutRedirectURIs []string
 	TokenAttributes        []string
+	TokenClaims            []string
 }
 
 // Register creates a client, returning the generated secret for a confidential one.
@@ -317,6 +335,7 @@ func (r *Clients) Register(ctx context.Context, o NewClientOptions) (client *Cli
 			Audiences: o.Audiences, TokenEndpointAuthMethod: authMethod,
 			PostLogoutRedirectUris: o.PostLogoutRedirectURIs,
 			TokenAttributes:        o.TokenAttributes,
+			TokenClaims:            o.TokenClaims,
 			// Public clients are forced to PKCE by the schema; confidential ones get
 			// it anyway, because there is no good reason not to and OAuth 2.1 makes it
 			// universal.
@@ -472,6 +491,17 @@ func validateNewClient(o *NewClientOptions) error {
 	if o.TokenAttributes == nil {
 		o.TokenAttributes = []string{}
 	}
+	for _, claim := range o.TokenClaims {
+		if claim != TokenClaimRoles && claim != TokenClaimGroups {
+			return fmt.Errorf(
+				"%q is not a token claim; want %q or %q. Warden decides authorization at "+
+					"/v1/authz/check, and a token carries only what a client was deliberately "+
+					"granted (SPEC §8.2)", claim, TokenClaimRoles, TokenClaimGroups)
+		}
+	}
+	if o.TokenClaims == nil {
+		o.TokenClaims = []string{}
+	}
 	if o.RedirectURIs == nil {
 		o.RedirectURIs = []string{}
 	}
@@ -564,6 +594,7 @@ func clientFromRow(r db.OAuthClientByIDRow) *Client {
 		TokenEndpointAuthMethod: r.TokenEndpointAuthMethod,
 		PostLogoutRedirectURIs:  r.PostLogoutRedirectUris,
 		TokenAttributes:         r.TokenAttributes,
+		TokenClaims:             r.TokenClaims,
 		RequirePKCE:             r.RequirePkce,
 		DisabledAt:              r.DisabledAt, CreatedAt: r.CreatedAt,
 	}

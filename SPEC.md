@@ -428,21 +428,41 @@ Format: JWT, `RS256` by default (`ES256` selectable), 5–15 minute lifetime (de
   "amr": ["pwd", "otp"],
   "auth_time": 1755799400,
   "wd": {
-    "roles": ["finance.viewer", "billing.approver"],
-    "groups": ["g_finance", "g_emea"],
-    "perm_rev": 184,
-    "attrs": { "department": "finance" }
+    "perm_rev": 184
   }
 }
 ```
 
-- `wd.roles` — tenant-wide role slugs only. Resource-scoped roles are **not** included.
-- `wd.perm_rev` — the tenant's permission revision at issuance; SDKs use it to detect a
-  stale local cache.
-- `wd.attrs` — a small, allowlisted set of attributes (configurable per application) so that
-  the most common conditions can be evaluated without a PDP round trip.
-- Token size budget: **hard cap 4 KB**; the issuer drops `wd.groups` then `wd.attrs` and sets
-  `wd.truncated: true` rather than emitting an oversized token.
+**By default a token says who you are, not what you may do.** `wd` carries `perm_rev` and
+nothing else.
+
+This is the line that separates Warden from an identity server that hands an application a
+role list and lets it decide. Authorization is answered at `/v1/authz/check`, against a
+model an administrator can change, with every answer in the decision log. The same question
+answered inside a JWT is answered once, up to fifteen minutes before it is read, somewhere
+no revocation reaches and no audit sees — and a claim that is present will eventually be
+authorized on.
+
+- `wd.perm_rev` — the tenant's permission revision at issuance. Always present, and the
+  reason the rest can be absent: it is what lets an SDK holding a cached decision bundle
+  (§10.4) notice that its model is older than the token in its hand.
+
+**The authorization facts are a per-client concession**, granted on the client registration
+(`token_claims`, `token_attributes`), empty by default. They exist for one case: a
+third-party resource server that speaks JWT and will never call the decision API. Granting
+them is a tenant saying "this client decides for itself", and it costs what that costs —
+the facts go stale until the token expires, and they travel to every resource server and
+every access log on the way.
+
+- `wd.roles` — tenant-wide role slugs only; resource-scoped roles are **not** included.
+  Requires `token_claims: [roles]`.
+- `wd.groups` — requires `token_claims: [groups]`.
+- `wd.attrs` — an allowlisted set of user attributes, named per client in
+  `token_attributes`.
+- Token size budget: **hard cap 4 KB**; the issuer drops `wd.groups` then `wd.attrs` and
+  sets `wd.truncated: true` rather than emitting an oversized token. With the default
+  grant there is nothing to drop: a token is the same size whether the subject belongs to
+  three groups or five thousand.
 
 ### 8.3 Refresh token and sessions
 

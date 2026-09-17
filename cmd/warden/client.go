@@ -89,6 +89,19 @@ func (l *stringList) Set(v string) error {
 	return nil
 }
 
+// tokenClaimNote describes what this client's access tokens will carry, and says so even
+// when the answer is "nothing" — because that is the answer worth knowing.
+func tokenClaimNote(c *oidcop.Client) string {
+	parts := append([]string{}, c.TokenClaims...)
+	if len(c.TokenAttributes) > 0 {
+		parts = append(parts, "attrs("+strings.Join(c.TokenAttributes, ",")+")")
+	}
+	if len(parts) == 0 {
+		return "identity only (authorization is answered at /v1/authz/check)"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func runClientRegister(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("warden client register", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -98,12 +111,19 @@ func runClientRegister(args []string, stdout, stderr io.Writer) error {
 	confidential := fs.Bool("confidential", false,
 		"this client can keep a secret (a server-side app). Public by default, because a "+
 			"single-page app or a mobile binary cannot")
-	var redirects, scopes, audiences, grants, logoutRedirects stringList
+	var redirects, scopes, audiences, grants, logoutRedirects, tokenClaims, tokenAttrs stringList
 	fs.Var(&redirects, "redirect-uri", "an allowed redirect_uri; repeatable. Matched exactly, no wildcards")
 	fs.Var(&logoutRedirects, "post-logout-redirect-uri", "an allowed post-logout redirect_uri; repeatable")
 	fs.Var(&scopes, "scope", "a scope this client may request; repeatable")
 	fs.Var(&audiences, "audience", "an audience tokens may be addressed to; repeatable")
 	fs.Var(&grants, "grant", "a grant type; repeatable. Defaults to authorization_code and refresh_token")
+	fs.Var(&tokenClaims, "token-claim",
+		"an authorization fact this client's access tokens may carry: roles or groups; repeatable. "+
+			"Off by default — Warden answers authorization at /v1/authz/check, and a role list "+
+			"inside a token is the same answer, ten minutes stale, where nothing can revoke it. "+
+			"Grant it only to a resource server that will never call the decision API")
+	fs.Var(&tokenAttrs, "token-attribute",
+		"a user attribute this client's access tokens may carry in wd.attrs; repeatable. Off by default")
 
 	own, rest := splitOwnFlags(fs, args)
 	if err := fs.Parse(own); err != nil {
@@ -124,6 +144,8 @@ func runClientRegister(args []string, stdout, stderr io.Writer) error {
 			Scopes:                 scopes,
 			Audiences:              audiences,
 			PostLogoutRedirectURIs: logoutRedirects,
+			TokenClaims:            tokenClaims,
+			TokenAttributes:        tokenAttrs,
 		})
 		if err != nil {
 			return err
@@ -136,6 +158,7 @@ func runClientRegister(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "  grant_types   %s\n", strings.Join(client.GrantTypes, ", "))
 		fmt.Fprintf(stdout, "  scopes        %s\n", strings.Join(client.Scopes, ", "))
 		fmt.Fprintf(stdout, "  PKCE          %s\n", pkceNote(client))
+		fmt.Fprintf(stdout, "  token claims  %s\n", tokenClaimNote(client))
 
 		if secret != "" {
 			fmt.Fprintf(stdout, "\n  client_secret %s\n", secret)

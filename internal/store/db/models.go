@@ -254,6 +254,8 @@ type OauthClient struct {
 	UpdatedAt               time.Time
 	// Allowlist of app_user.attributes keys this client's access tokens may carry in wd.attrs (SPEC §8.2). Empty means none.
 	TokenAttributes []string
+	// Authorization facts this client's access tokens may carry in wd (SPEC §8.2): any of roles, groups. Empty means none, which is the default — Warden decides, the token does not.
+	TokenClaims []string
 }
 
 // Short-lived OpenID Provider artifacts (SPEC §7.7). Refresh tokens are NOT here; they live in refresh_token, which carries the family rotation of SPEC §8.3.

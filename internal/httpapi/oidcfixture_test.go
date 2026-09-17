@@ -54,6 +54,9 @@ type oidcFixture struct {
 	confidential       *oidcop.Client
 	confidentialSecret string
 
+	// legacy is granted wd.roles and wd.groups, which no client gets by default.
+	legacy *oidcop.Client
+
 	// A client belonging to a different tenant entirely.
 	rival         *oidcop.Client
 	rivalSecret   string
@@ -308,6 +311,21 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		t.Fatalf("device-only client: %v", err)
 	}
 
+	// A client granted the authorization facts, for the tests that exercise them. It is
+	// registered separately on purpose: the default client must not carry them, and a
+	// fixture that granted everything to everybody would hide exactly that.
+	legacy, _, err := clients.Register(ctx, oidcop.NewClientOptions{
+		TenantID: tenantID, Key: "legacy-rs", Name: "A resource server that only reads JWTs",
+		Public:       true,
+		RedirectURIs: []string{redirectURI},
+		Scopes:       []string{"openid", "profile", "email", "offline_access"},
+		Audiences:    []string{audience},
+		TokenClaims:  []string{oidcop.TokenClaimRoles, oidcop.TokenClaimGroups},
+	})
+	if err != nil {
+		t.Fatalf("legacy client: %v", err)
+	}
+
 	// A confidential client of this tenant that performs the code flow. Pushing an
 	// authorization request for it is supposed to require its secret.
 	confidential, confidentialSecret, err := clients.Register(ctx, oidcop.NewClientOptions{
@@ -356,6 +374,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		deviceOnly: deviceOnly,
 		rival:      rival, rivalSecret: rivalSecret,
 		confidential: confidential, confidentialSecret: confidentialSecret,
+		legacy:        legacy,
 		postLogoutURI: postLogoutURI,
 		email:         email, password: password, userID: userID, tenantID: tenantID,
 		cfg: cfg, deps: deps,

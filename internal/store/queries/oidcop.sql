@@ -13,14 +13,16 @@ SELECT tenant_id FROM oauth_client WHERE id = @id;
 -- name: OAuthClientByID :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, token_claims, require_pkce,
+       disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = @tenant_id AND id = @id;
 
 -- name: OAuthClientByKey :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, token_claims, require_pkce,
+       disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = @tenant_id AND key = @key;
 
@@ -35,11 +37,11 @@ SELECT id, tenant_id, key, name, public, redirect_uris, grant_types, scopes,
 INSERT INTO oauth_client (id, tenant_id, key, name, public, secret_hash, redirect_uris,
                           grant_types, response_types, scopes, audiences,
                           token_endpoint_auth_method, post_logout_redirect_uris,
-                          token_attributes, require_pkce)
+                          token_attributes, token_claims, require_pkce)
 VALUES (@id, @tenant_id, @key, @name, @public, @secret_hash, @redirect_uris,
         @grant_types, @response_types, @scopes, @audiences,
         @token_endpoint_auth_method, @post_logout_redirect_uris,
-        @token_attributes, @require_pkce);
+        @token_attributes, @token_claims, @require_pkce);
 
 -- Rotates a confidential client's secret. The old one stops working immediately;
 -- SPEC §8.4's overlap window is for service accounts, which are a different credential

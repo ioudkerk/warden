@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/warden-project/warden/internal/oidcop"
 )
 
 // The endpoints a client uses once it holds a token: userinfo, introspection and
@@ -367,8 +369,17 @@ func authorizeURLFor(clientID, redirectURI, challenge, state, scope, audience st
 // tokensFor signs a user in and completes one exchange, returning the token response.
 func (f *oidcFixture) tokensFor(t *testing.T, scope, audience, state string) map[string]any {
 	t.Helper()
+	return f.tokensForClient(t, f.client, scope, audience, state)
+}
+
+// tokensForClient is the same for a named client, because which client asked decides what
+// the token carries.
+func (f *oidcFixture) tokensForClient(
+	t *testing.T, client *oidcop.Client, scope, audience, state string,
+) map[string]any {
+	t.Helper()
 	verifier, challenge := pkcePair(t)
-	authorize := authorizeURLFor(f.client.ID, f.redirectURI, challenge, state, scope, audience)
+	authorize := authorizeURLFor(client.ID, f.redirectURI, challenge, state, scope, audience)
 
 	rec := f.do(t, http.MethodGet, authorize, nil, nil)
 	loginURL := rec.Header().Get("Location")
@@ -394,14 +405,21 @@ func (f *oidcFixture) tokensFor(t *testing.T, scope, audience, state string) map
 
 	return f.exchange(t, url.Values{
 		"grant_type": {"authorization_code"}, "code": {code},
-		"redirect_uri": {f.redirectURI}, "client_id": {f.client.ID},
+		"redirect_uri": {f.redirectURI}, "client_id": {client.ID},
 		"code_verifier": {verifier},
 	})
 }
 
 func (f *oidcFixture) accessToken(t *testing.T, scope, audience, state string) string {
 	t.Helper()
-	tokens := f.tokensFor(t, scope, audience, state)
+	return f.accessTokenFor(t, f.client, scope, audience, state)
+}
+
+func (f *oidcFixture) accessTokenFor(
+	t *testing.T, client *oidcop.Client, scope, audience, state string,
+) string {
+	t.Helper()
+	tokens := f.tokensForClient(t, client, scope, audience, state)
 	token, ok := tokens["access_token"].(string)
 	if !ok || token == "" {
 		t.Fatalf("no access token: %v", tokens)
