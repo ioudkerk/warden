@@ -236,6 +236,21 @@ UPDATE refresh_token SET revoked_at = now()
 UPDATE refresh_token SET revoked_at = now()
  WHERE tenant_id = @tenant_id AND session_id = @session_id AND revoked_at IS NULL;
 
+-- Every refresh token a user holds, reached through their sessions.
+--
+-- Through sessions rather than through refresh_token.subject, because subject was added in
+-- M1-6 and the tokens M1-5 issues do not carry it — filtering on it would silently miss
+-- exactly the tokens that predate the column. Every refresh token has a session: the
+-- foreign key says so, and "log this person out everywhere" depends on it.
+-- name: RevokeRefreshTokensForUser :execrows
+UPDATE refresh_token rt SET revoked_at = now()
+ WHERE rt.tenant_id = @tenant_id
+   AND rt.revoked_at IS NULL
+   AND rt.session_id IN (
+       SELECT s.id FROM session s
+        WHERE s.tenant_id = @tenant_id AND s.user_id = @user_id
+   );
+
 -- name: CountRefreshTokensInFamily :one
 SELECT count(*) FROM refresh_token
  WHERE tenant_id = @tenant_id AND family_id = @family_id;
@@ -251,3 +266,68 @@ SELECT id, session_id, client_id, subject
  WHERE tenant_id = @tenant_id AND family_id = @family_id
  ORDER BY issued_at
  LIMIT 1;
+
+-- ---------------------------------------------------------------------------------
+-- Second factors (SPEC §7.1)
+-- ---------------------------------------------------------------------------------
+
+-- name: InsertSecondFactor :exec
+INSERT INTO credential (id, user_id, tenant_id, type, secret_hash, params, label)
+VALUES (@id, @user_id, @tenant_id, @type, @secret_hash, @params, @label);
+
+-- Every second factor a user holds, whatever its state. Confirmation is a field on
+-- params rather than a filter here: an unconfirmed enrolment has to be distinguishable
+-- from no enrolment at all, or a second attempt could not replace the first.
+-- name: SecondFactorsForUser :many
+SELECT id, type, secret_hash, params, label, last_used_at, created_at
+  FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND type = ANY(@types::text[])
+ ORDER BY created_at;
+
+-- name: SecondFactorByID :one
+SELECT id, type, secret_hash, params, label, last_used_at, created_at
+  FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id;
+
+-- name: UpdateSecondFactorParams :execrows
+UPDATE credential SET params = @params, last_used_at = @last_used_at
+ WHERE tenant_id = @tenant_id AND id = @id;
+
+-- name: DeleteSecondFactor :execrows
+DELETE FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
+   AND type <> 'password';
+
+-- Removes every credential of one kind. Re-enrolling replaces rather than accumulates:
+-- a user who sets up a new authenticator is not asking to keep the old one.
+-- name: DeleteSecondFactorsOfType :execrows
+DELETE FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND type = @type;
+
+-- name: CountConfirmedSecondFactors :one
+SELECT count(*)
+  FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id
+   AND type = ANY(@types::text[])
+   AND params ? 'confirmed_at';
+
+-- name: SetUserMFAEnforced :execrows
+UPDATE app_user SET mfa_enforced = @mfa_enforced
+ WHERE tenant_id = @tenant_id AND id = @id;
+
+-- A recovery code is found by its hash, not by walking a user's credentials.
+--
+-- The codes are high-entropy random values, so SHA-256 is the right function here for the
+-- same reason it is right for a service-account token: there is nothing to stretch. That
+-- is what makes the lookup a single indexed read instead of ten Argon2id comparisons.
+-- name: RecoveryCodeByHash :one
+SELECT id, params
+  FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id
+   AND type = 'recovery_code' AND secret_hash = @secret_hash;
+
+-- name: CountUnusedRecoveryCodes :one
+SELECT count(*)
+  FROM credential
+ WHERE tenant_id = @tenant_id AND user_id = @user_id
+   AND type = 'recovery_code' AND NOT (params ? 'used_at');

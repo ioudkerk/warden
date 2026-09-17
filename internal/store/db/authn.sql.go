@@ -127,6 +127,27 @@ func (q *Queries) ConsumeSetupToken(ctx context.Context, id string) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const countConfirmedSecondFactors = `-- name: CountConfirmedSecondFactors :one
+SELECT count(*)
+  FROM credential
+ WHERE tenant_id = $1 AND user_id = $2
+   AND type = ANY($3::text[])
+   AND params ? 'confirmed_at'
+`
+
+type CountConfirmedSecondFactorsParams struct {
+	TenantID string
+	UserID   string
+	Types    []string
+}
+
+func (q *Queries) CountConfirmedSecondFactors(ctx context.Context, arg CountConfirmedSecondFactorsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countConfirmedSecondFactors, arg.TenantID, arg.UserID, arg.Types)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countRefreshTokensInFamily = `-- name: CountRefreshTokensInFamily :one
 SELECT count(*) FROM refresh_token
  WHERE tenant_id = $1 AND family_id = $2
@@ -139,6 +160,25 @@ type CountRefreshTokensInFamilyParams struct {
 
 func (q *Queries) CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countRefreshTokensInFamily, arg.TenantID, arg.FamilyID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUnusedRecoveryCodes = `-- name: CountUnusedRecoveryCodes :one
+SELECT count(*)
+  FROM credential
+ WHERE tenant_id = $1 AND user_id = $2
+   AND type = 'recovery_code' AND NOT (params ? 'used_at')
+`
+
+type CountUnusedRecoveryCodesParams struct {
+	TenantID string
+	UserID   string
+}
+
+func (q *Queries) CountUnusedRecoveryCodes(ctx context.Context, arg CountUnusedRecoveryCodesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnusedRecoveryCodes, arg.TenantID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -164,6 +204,47 @@ DELETE FROM session WHERE expires_at < $1
 // the row is kept only long enough for the UI to be honest about recent activity.
 func (q *Queries) DeleteExpiredSessions(ctx context.Context, before time.Time) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredSessions, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteSecondFactor = `-- name: DeleteSecondFactor :execrows
+DELETE FROM credential
+ WHERE tenant_id = $1 AND user_id = $2 AND id = $3
+   AND type <> 'password'
+`
+
+type DeleteSecondFactorParams struct {
+	TenantID string
+	UserID   string
+	ID       string
+}
+
+func (q *Queries) DeleteSecondFactor(ctx context.Context, arg DeleteSecondFactorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSecondFactor, arg.TenantID, arg.UserID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteSecondFactorsOfType = `-- name: DeleteSecondFactorsOfType :execrows
+DELETE FROM credential
+ WHERE tenant_id = $1 AND user_id = $2 AND type = $3
+`
+
+type DeleteSecondFactorsOfTypeParams struct {
+	TenantID string
+	UserID   string
+	Type     string
+}
+
+// Removes every credential of one kind. Re-enrolling replaces rather than accumulates:
+// a user who sets up a new authenticator is not asking to keep the old one.
+func (q *Queries) DeleteSecondFactorsOfType(ctx context.Context, arg DeleteSecondFactorsOfTypeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSecondFactorsOfType, arg.TenantID, arg.UserID, arg.Type)
 	if err != nil {
 		return 0, err
 	}
@@ -212,6 +293,38 @@ func (q *Queries) InsertRefreshToken(ctx context.Context, arg InsertRefreshToken
 		arg.ClientID,
 		arg.IssuedAt,
 		arg.ExpiresAt,
+	)
+	return err
+}
+
+const insertSecondFactor = `-- name: InsertSecondFactor :exec
+
+INSERT INTO credential (id, user_id, tenant_id, type, secret_hash, params, label)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+`
+
+type InsertSecondFactorParams struct {
+	ID         string
+	UserID     string
+	TenantID   string
+	Type       string
+	SecretHash string
+	Params     dbtypes.JSONMap
+	Label      *string
+}
+
+// ---------------------------------------------------------------------------------
+// Second factors (SPEC §7.1)
+// ---------------------------------------------------------------------------------
+func (q *Queries) InsertSecondFactor(ctx context.Context, arg InsertSecondFactorParams) error {
+	_, err := q.db.Exec(ctx, insertSecondFactor,
+		arg.ID,
+		arg.UserID,
+		arg.TenantID,
+		arg.Type,
+		arg.SecretHash,
+		arg.Params,
+		arg.Label,
 	)
 	return err
 }
@@ -334,6 +447,36 @@ func (q *Queries) PasswordCredentialByEmail(ctx context.Context, arg PasswordCre
 		&i.SecretHash,
 		&i.CredentialExpiresAt,
 	)
+	return i, err
+}
+
+const recoveryCodeByHash = `-- name: RecoveryCodeByHash :one
+SELECT id, params
+  FROM credential
+ WHERE tenant_id = $1 AND user_id = $2
+   AND type = 'recovery_code' AND secret_hash = $3
+`
+
+type RecoveryCodeByHashParams struct {
+	TenantID   string
+	UserID     string
+	SecretHash string
+}
+
+type RecoveryCodeByHashRow struct {
+	ID     string
+	Params dbtypes.JSONMap
+}
+
+// A recovery code is found by its hash, not by walking a user's credentials.
+//
+// The codes are high-entropy random values, so SHA-256 is the right function here for the
+// same reason it is right for a service-account token: there is nothing to stretch. That
+// is what makes the lookup a single indexed read instead of ten Argon2id comparisons.
+func (q *Queries) RecoveryCodeByHash(ctx context.Context, arg RecoveryCodeByHashParams) (RecoveryCodeByHashRow, error) {
+	row := q.db.QueryRow(ctx, recoveryCodeByHash, arg.TenantID, arg.UserID, arg.SecretHash)
+	var i RecoveryCodeByHashRow
+	err := row.Scan(&i.ID, &i.Params)
 	return i, err
 }
 
@@ -526,6 +669,35 @@ func (q *Queries) RevokeRefreshTokensForSession(ctx context.Context, arg RevokeR
 	return result.RowsAffected(), nil
 }
 
+const revokeRefreshTokensForUser = `-- name: RevokeRefreshTokensForUser :execrows
+UPDATE refresh_token rt SET revoked_at = now()
+ WHERE rt.tenant_id = $1
+   AND rt.revoked_at IS NULL
+   AND rt.session_id IN (
+       SELECT s.id FROM session s
+        WHERE s.tenant_id = $1 AND s.user_id = $2
+   )
+`
+
+type RevokeRefreshTokensForUserParams struct {
+	TenantID string
+	UserID   string
+}
+
+// Every refresh token a user holds, reached through their sessions.
+//
+// Through sessions rather than through refresh_token.subject, because subject was added in
+// M1-6 and the tokens M1-5 issues do not carry it — filtering on it would silently miss
+// exactly the tokens that predate the column. Every refresh token has a session: the
+// foreign key says so, and "log this person out everywhere" depends on it.
+func (q *Queries) RevokeRefreshTokensForUser(ctx context.Context, arg RevokeRefreshTokensForUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokensForUser, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeSession = `-- name: RevokeSession :execrows
 UPDATE session SET revoked_at = now()
  WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL
@@ -542,6 +714,97 @@ func (q *Queries) RevokeSession(ctx context.Context, arg RevokeSessionParams) (i
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const secondFactorByID = `-- name: SecondFactorByID :one
+SELECT id, type, secret_hash, params, label, last_used_at, created_at
+  FROM credential
+ WHERE tenant_id = $1 AND user_id = $2 AND id = $3
+`
+
+type SecondFactorByIDParams struct {
+	TenantID string
+	UserID   string
+	ID       string
+}
+
+type SecondFactorByIDRow struct {
+	ID         string
+	Type       string
+	SecretHash string
+	Params     dbtypes.JSONMap
+	Label      *string
+	LastUsedAt *time.Time
+	CreatedAt  time.Time
+}
+
+func (q *Queries) SecondFactorByID(ctx context.Context, arg SecondFactorByIDParams) (SecondFactorByIDRow, error) {
+	row := q.db.QueryRow(ctx, secondFactorByID, arg.TenantID, arg.UserID, arg.ID)
+	var i SecondFactorByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.SecretHash,
+		&i.Params,
+		&i.Label,
+		&i.LastUsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const secondFactorsForUser = `-- name: SecondFactorsForUser :many
+SELECT id, type, secret_hash, params, label, last_used_at, created_at
+  FROM credential
+ WHERE tenant_id = $1 AND user_id = $2 AND type = ANY($3::text[])
+ ORDER BY created_at
+`
+
+type SecondFactorsForUserParams struct {
+	TenantID string
+	UserID   string
+	Types    []string
+}
+
+type SecondFactorsForUserRow struct {
+	ID         string
+	Type       string
+	SecretHash string
+	Params     dbtypes.JSONMap
+	Label      *string
+	LastUsedAt *time.Time
+	CreatedAt  time.Time
+}
+
+// Every second factor a user holds, whatever its state. Confirmation is a field on
+// params rather than a filter here: an unconfirmed enrolment has to be distinguishable
+// from no enrolment at all, or a second attempt could not replace the first.
+func (q *Queries) SecondFactorsForUser(ctx context.Context, arg SecondFactorsForUserParams) ([]SecondFactorsForUserRow, error) {
+	rows, err := q.db.Query(ctx, secondFactorsForUser, arg.TenantID, arg.UserID, arg.Types)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SecondFactorsForUserRow{}
+	for rows.Next() {
+		var i SecondFactorsForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Type,
+			&i.SecretHash,
+			&i.Params,
+			&i.Label,
+			&i.LastUsedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const sessionByID = `-- name: SessionByID :one
@@ -610,6 +873,25 @@ func (q *Queries) SetTenantPasswordPolicy(ctx context.Context, arg SetTenantPass
 	return err
 }
 
+const setUserMFAEnforced = `-- name: SetUserMFAEnforced :execrows
+UPDATE app_user SET mfa_enforced = $1
+ WHERE tenant_id = $2 AND id = $3
+`
+
+type SetUserMFAEnforcedParams struct {
+	MfaEnforced bool
+	TenantID    string
+	ID          string
+}
+
+func (q *Queries) SetUserMFAEnforced(ctx context.Context, arg SetUserMFAEnforcedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUserMFAEnforced, arg.MfaEnforced, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setupTokenByHash = `-- name: SetupTokenByHash :one
 
 SELECT id, tenant_id, user_id, expires_at, consumed_at
@@ -668,6 +950,31 @@ UPDATE credential SET last_used_at = now() WHERE id = $1
 func (q *Queries) TouchCredential(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, touchCredential, id)
 	return err
+}
+
+const updateSecondFactorParams = `-- name: UpdateSecondFactorParams :execrows
+UPDATE credential SET params = $1, last_used_at = $2
+ WHERE tenant_id = $3 AND id = $4
+`
+
+type UpdateSecondFactorParamsParams struct {
+	Params     dbtypes.JSONMap
+	LastUsedAt *time.Time
+	TenantID   string
+	ID         string
+}
+
+func (q *Queries) UpdateSecondFactorParams(ctx context.Context, arg UpdateSecondFactorParamsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateSecondFactorParams,
+		arg.Params,
+		arg.LastUsedAt,
+		arg.TenantID,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertPasswordCredential = `-- name: UpsertPasswordCredential :exec

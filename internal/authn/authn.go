@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/audit"
+	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
 	"github.com/warden-project/warden/internal/store/dbtypes"
@@ -76,6 +77,16 @@ type Authenticator struct {
 	breached BreachSet
 	log      *slog.Logger
 
+	// keyring seals TOTP secrets. Optional: a deployment that serves only passwords
+	// needs none, and the second-factor methods say so rather than failing obscurely.
+	keyring *secrets.Keyring
+
+	// sessions and refresh are what a recovery code ends. SPEC §7.2 requires recovery to
+	// invalidate every session and refresh token, and holding the stores here is what
+	// makes that structural rather than something each caller has to remember.
+	sessions *Sessions
+	refresh  *RefreshTokens
+
 	audit *audit.Writer
 
 	// policies caches per-tenant policy. A password change is rare and this is not on
@@ -96,6 +107,13 @@ type Options struct {
 	// Audit records password changes and failed logins. Optional; without it those
 	// events are logged but not written to the hash-chained log.
 	Audit *audit.Writer
+	// Keyring seals TOTP secrets, which cannot be hashed: verifying a code needs the
+	// original bytes. Required for second-factor enrolment, unused without it.
+	Keyring *secrets.Keyring
+	// Sessions and Refresh are ended when a recovery code is used (SPEC §7.2). Without
+	// them a redemption is logged as an error rather than quietly doing half the job.
+	Sessions *Sessions
+	Refresh  *RefreshTokens
 }
 
 // New builds an Authenticator.
@@ -109,6 +127,9 @@ func New(tenant, system *store.Store, opts Options) (*Authenticator, error) {
 		breached: opts.Breached,
 		log:      opts.Log,
 		audit:    opts.Audit,
+		keyring:  opts.Keyring,
+		sessions: opts.Sessions,
+		refresh:  opts.Refresh,
 	}
 	if a.params == (Params{}) {
 		a.params = DefaultParams()

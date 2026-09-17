@@ -394,17 +394,36 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// MFA is enrolled but not yet demanded: the step-up flow is M1-8. Recording the
-	// fact here rather than silently ignoring it means the gap is visible in the log
-	// rather than only in the task list.
-	if result.MFAEnforced {
-		s.log.Warn("a user with MFA enforced signed in with a password alone; "+
-			"second-factor verification arrives in M1-8",
-			"tenant_id", tenantID, "user_id", result.UserID)
+	// The password was right, which is not the same as being signed in. If this account
+	// has a second factor the login stops here and continues at /login/verify; no session
+	// exists until the second factor is presented, because a half-authenticated session is
+	// the thing another piece of code would eventually mistake for a real one.
+	needsSecondFactor, factorErr := s.requireSecondFactor(
+		r.Context(), tenantID, result.UserID, result.MFAEnforced)
+	if factorErr != nil {
+		if errors.Is(factorErr, errMFAEnforcedWithoutFactor) {
+			// Required and impossible. Refusing is the only honest answer: the tenant has
+			// said this account needs a second factor and it has none, so signing them in
+			// would quietly ignore the policy.
+			s.log.Error("a user requires a second factor and has none enrolled",
+				"tenant_id", tenantID, "user_id", result.UserID)
+			s.renderLoginError(w, r, returnTo, email,
+				"This account requires two-step verification, which has not been set up. "+
+					"Ask an administrator to help you enrol.", http.StatusForbidden)
+			return
+		}
+		s.log.Error("deciding whether a second factor is required", "error", factorErr)
+		writeProblem(w, http.StatusInternalServerError, "internal_error",
+			"The sign-in could not be processed.")
+		return
+	}
+	if needsSecondFactor {
+		s.beginSecondFactor(w, r, tenantID, result.UserID, email, returnTo)
+		return
 	}
 
 	session, err := s.sessions.Create(r.Context(), tenantID, result.UserID,
-		[]string{"pwd"}, ip, r.UserAgent())
+		[]string{authn.AMRPassword}, ip, r.UserAgent())
 	if err != nil {
 		s.log.Error("creating a session", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "internal_error",

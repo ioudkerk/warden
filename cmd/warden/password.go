@@ -14,6 +14,7 @@ import (
 	"github.com/warden-project/warden/internal/audit"
 	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 )
 
@@ -72,10 +73,20 @@ func withAuthenticator(
 	}
 	defer closeBreached()
 
+	// The keyring, because enrolling a second factor seals a TOTP secret with it. The
+	// session and refresh stores are deliberately absent: the CLI enrols and issues, it
+	// never redeems a recovery code, and a redemption is the only operation that has to
+	// end sessions.
+	keyring, err := cfg.Keyring(secrets.OSLookupEnv, secrets.OSReadFile)
+	if err != nil {
+		return err
+	}
+
 	a, err := authn.New(tenantPool, system, authn.Options{
 		Breached: breached,
 		Log:      slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		Audit:    audit.NewWriter(),
+		Keyring:  keyring,
 	})
 	if err != nil {
 		return err

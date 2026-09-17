@@ -87,6 +87,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runKeys(rest, stdout, stderr)
 	case "password":
 		return runPassword(rest, stdout, stderr)
+	case "mfa":
+		return runMFA(rest, stdout, stderr)
 	case "client":
 		return runClient(rest, stdout, stderr)
 
@@ -345,6 +347,12 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		Breached: breached,
 		Log:      log,
 		Audit:    audit.NewWriter(),
+		// The second factor (M1-8). The keyring seals TOTP secrets, which cannot be
+		// hashed because verifying a code needs the original bytes; the session and
+		// refresh stores are what a redeemed recovery code ends, as SPEC §7.2 requires.
+		Keyring:  keyring,
+		Sessions: sessions,
+		Refresh:  refreshTokens,
 	})
 	if err != nil {
 		return err

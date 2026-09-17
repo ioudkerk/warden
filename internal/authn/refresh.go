@@ -640,3 +640,30 @@ func (r *RefreshTokens) PurgeExpired(ctx context.Context, olderThan time.Duratio
 	})
 	return deleted, err
 }
+
+// RevokeAllForUser ends every refresh token a user holds.
+//
+// Reached through their sessions rather than through the subject column, because that
+// column arrived with M1-6 and the tokens M1-5 issues do not carry it. Every refresh token
+// has a session — the foreign key requires one — so walking sessions reaches all of them
+// and filtering on subject would silently miss the older ones.
+//
+// Used where an account has to be shut down as a unit: a redeemed recovery code (SPEC §7.2),
+// and the lifecycle transitions of M1-10.
+func (r *RefreshTokens) RevokeAllForUser(ctx context.Context, tenantID, userID, reason string) (int64, error) {
+	var revoked int64
+	err := r.tenant.InTenant(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
+		var revokeErr error
+		revoked, revokeErr = db.New(tx).RevokeRefreshTokensForUser(ctx,
+			db.RevokeRefreshTokensForUserParams{TenantID: tenantID, UserID: userID})
+		return revokeErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	if revoked > 0 {
+		r.log.Info("revoked every refresh token a user holds",
+			"tenant_id", tenantID, "user_id", userID, "count", revoked, "reason", reason)
+	}
+	return revoked, nil
+}

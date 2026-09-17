@@ -208,6 +208,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login", s.requireLogin(s.handleLoginForm))
 	mux.HandleFunc("POST /login", s.requireLogin(s.handleLoginSubmit))
 
+	// The second step. A separate path rather than a mode of /login, so that a
+	// half-finished login is never one parameter away from looking like a finished one.
+	mux.HandleFunc("GET /login/verify", s.requireLogin(s.handleSecondFactorForm))
+	mux.HandleFunc("POST /login/verify", s.requireLogin(s.handleSecondFactorSubmit))
+
 	// The endpoints a client uses once it holds a token. Both methods on userinfo,
 	// because OpenID Connect Core §5.3.1 requires both and relying-party libraries are
 	// split down the middle about which to use.

@@ -59,7 +59,9 @@ type Querier interface {
 	// check and the write being one statement is what makes it a race the database
 	// settles rather than one the application hopes not to lose.
 	ConsumeSetupToken(ctx context.Context, id string) (int64, error)
+	CountConfirmedSecondFactors(ctx context.Context, arg CountConfirmedSecondFactorsParams) (int64, error)
 	CountRefreshTokensInFamily(ctx context.Context, arg CountRefreshTokensInFamilyParams) (int64, error)
+	CountUnusedRecoveryCodes(ctx context.Context, arg CountUnusedRecoveryCodesParams) (int64, error)
 	DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
 	DeleteExpiredDeviceAuthorizations(ctx context.Context, before time.Time) (int64, error)
@@ -77,6 +79,10 @@ type Querier interface {
 	DeleteOAuthSessionsForSession(ctx context.Context, arg DeleteOAuthSessionsForSessionParams) (int64, error)
 	DeleteRoleInheritance(ctx context.Context, roleID string) error
 	DeleteRolePermissions(ctx context.Context, roleID string) error
+	DeleteSecondFactor(ctx context.Context, arg DeleteSecondFactorParams) (int64, error)
+	// Removes every credential of one kind. Re-enrolling replaces rather than accumulates:
+	// a user who sets up a new authenticator is not asking to keep the old one.
+	DeleteSecondFactorsOfType(ctx context.Context, arg DeleteSecondFactorsOfTypeParams) (int64, error)
 	DenyDeviceAuthorization(ctx context.Context, arg DenyDeviceAuthorizationParams) (int64, error)
 	DeprecateUIElement(ctx context.Context, arg DeprecateUIElementParams) error
 	// The row a device's poll is about. Returned whatever its status: "pending", "denied"
@@ -134,6 +140,10 @@ type Querier interface {
 	InsertRefreshToken(ctx context.Context, arg InsertRefreshTokenParams) error
 	InsertRoleInheritance(ctx context.Context, arg InsertRoleInheritanceParams) error
 	InsertRolePermission(ctx context.Context, arg InsertRolePermissionParams) error
+	// ---------------------------------------------------------------------------------
+	// Second factors (SPEC §7.1)
+	// ---------------------------------------------------------------------------------
+	InsertSecondFactor(ctx context.Context, arg InsertSecondFactorParams) error
 	// The token is never stored, only its SHA-256, so a copy of the database does not
 	// confer the ability to impersonate the application.
 	InsertServiceAccount(ctx context.Context, arg InsertServiceAccountParams) error
@@ -227,6 +237,12 @@ type Querier interface {
 	// overlap window (SPEC §17).
 	PublicSigningKeys(ctx context.Context) ([]PublicSigningKeysRow, error)
 	RecentAuditEvents(ctx context.Context, arg RecentAuditEventsParams) ([]RecentAuditEventsRow, error)
+	// A recovery code is found by its hash, not by walking a user's credentials.
+	//
+	// The codes are high-entropy random values, so SHA-256 is the right function here for the
+	// same reason it is right for a service-account token: there is nothing to stretch. That
+	// is what makes the lookup a single indexed read instead of ten Argon2id comparisons.
+	RecoveryCodeByHash(ctx context.Context, arg RecoveryCodeByHashParams) (RecoveryCodeByHashRow, error)
 	// Single use, enforced by the WHERE clause rather than by the caller: two polls arriving
 	// together must not both issue tokens, and the row that changes no rows is the loser.
 	RedeemDeviceAuthorization(ctx context.Context, arg RedeemDeviceAuthorizationParams) (int64, error)
@@ -278,7 +294,19 @@ type Querier interface {
 	// a second time.
 	RevokeRefreshTokenFamily(ctx context.Context, arg RevokeRefreshTokenFamilyParams) (int64, error)
 	RevokeRefreshTokensForSession(ctx context.Context, arg RevokeRefreshTokensForSessionParams) (int64, error)
+	// Every refresh token a user holds, reached through their sessions.
+	//
+	// Through sessions rather than through refresh_token.subject, because subject was added in
+	// M1-6 and the tokens M1-5 issues do not carry it — filtering on it would silently miss
+	// exactly the tokens that predate the column. Every refresh token has a session: the
+	// foreign key says so, and "log this person out everywhere" depends on it.
+	RevokeRefreshTokensForUser(ctx context.Context, arg RevokeRefreshTokensForUserParams) (int64, error)
 	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
+	SecondFactorByID(ctx context.Context, arg SecondFactorByIDParams) (SecondFactorByIDRow, error)
+	// Every second factor a user holds, whatever its state. Confirmation is a field on
+	// params rather than a filter here: an unconfirmed enrolment has to be distinguishable
+	// from no enrolment at all, or a second attempt could not replace the first.
+	SecondFactorsForUser(ctx context.Context, arg SecondFactorsForUserParams) ([]SecondFactorsForUserRow, error)
 	// The HTTP surface (internal/httpapi).
 	// Resolves a bearer token to a service account. This runs on the system pool, and
 	// necessarily so: it has to find which tenant the token belongs to before a tenant
@@ -310,6 +338,7 @@ type Querier interface {
 	// security boundary. is_local also ties the setting to the transaction, so it cannot
 	// leak to the next user of a pooled connection.
 	SetTenantScope(ctx context.Context, setConfig string) error
+	SetUserMFAEnforced(ctx context.Context, arg SetUserMFAEnforcedParams) (int64, error)
 	// ---------------------------------------------------------------------------------
 	// Setup tokens (system pool: see the header)
 	// ---------------------------------------------------------------------------------
@@ -376,6 +405,7 @@ type Querier interface {
 	// applies to all environments, which is what makes a change testable in staging
 	// before it is promoted (SPEC §11.3).
 	UIElementsWithBindings(ctx context.Context, arg UIElementsWithBindingsParams) ([]UIElementsWithBindingsRow, error)
+	UpdateSecondFactorParams(ctx context.Context, arg UpdateSecondFactorParamsParams) (int64, error)
 	UpsertAction(ctx context.Context, arg UpsertActionParams) error
 	UpsertApplication(ctx context.Context, arg UpsertApplicationParams) error
 	UpsertEnvironment(ctx context.Context, arg UpsertEnvironmentParams) error

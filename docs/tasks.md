@@ -249,7 +249,7 @@ library, with no Warden-specific client code.
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
 | M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met, and §8.2 amended: the authorization facts are now a per-client grant, empty by default, because Warden is the decision point and a role list in a JWT is that decision made stale and unrevocable. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and, for a client that opted in, gets a **645-byte** token that verifies against published JWKS and says `wd.truncated`. For the default client the same five thousand memberships produce **586 bytes** with nothing dropped and no membership walk at all |
-| M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
+| M1-8 | **In progress (TOTP and recovery codes done; WebAuthn next).** TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows work end to end: a password alone now reaches `/login/verify` and authorizes nothing, and `amr` comes back `["pwd","otp","mfa"]`. A recovery code signs in and ends every other session and refresh token (§7.2). Verified against the deployment with an independently written TOTP client, which is what proves the implementation interoperates rather than merely agreeing with itself |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
 
@@ -359,6 +359,53 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-8: the second factor
+
+**TOTP is written here rather than imported, and WebAuthn will not be.** The whole of
+RFC 6238 is an HMAC, a counter and a truncation — sixty lines — and the RFC publishes test
+vectors that prove an implementation correct. A dependency for that is a supply-chain
+surface and a transitive tree to audit in exchange for less code than would configure it.
+`TestTOTPMatchesRFC6238` and `TestHOTPMatchesRFC4226` run the published tables; breaking the
+truncation offset by one bit fails both. WebAuthn is the opposite case — CBOR, COSE and
+attestation formats — and gets a library.
+
+**A password is no longer a login.** Between the two steps there is a *pending* record: a
+short-lived entry in the cache under a random identifier, with the browser holding the
+identifier. Deliberately not a session, because a half-authenticated session is the thing
+another piece of code eventually mistakes for a real one; and deliberately not a signed
+cookie, because a signed cookie cannot be withdrawn. The test that matters is not that the
+code is checked — it is that the cookies left after the password step authorize *nothing*.
+Removing the step-up makes that test fail on the redirect, not on the code.
+
+**An enrolment is not a factor until it is proved.** Somebody who opens the page, scans the
+QR code and closes the tab has changed nothing: the secret is stored, the account is not
+protected by it, and only a correct code from the device turns it on. The alternative locks
+people out of their own accounts on a mis-click. For the same reason, requiring a factor for
+an account that has none is refused where it is set rather than discovered at the next
+login.
+
+**A code is spent when it is used.** RFC 6238 §5.2 requires it and the reason is concrete:
+a code lives thirty seconds, so anybody who watched it typed has the rest of that window
+unless the first use consumes the counter. The spent counter goes in the credential's
+params. It cost a test-fixture change to notice — confirming an enrolment and signing in a
+second later was correctly refused, because the confirmation had already spent that code.
+
+**A recovery code is a password-equivalent credential.** Shown once, hashed at rest — SHA-256,
+because there is nothing for Argon2id to stretch in 160 random bits, which is the same
+reasoning service-account tokens follow — single use, and looked up by hash so a wrong guess
+costs one indexed read rather than ten comparisons. Using one ends every session and every
+refresh token, as §7.2 requires, and that lives in `afterRecovery` rather than in the caller:
+a caller that forgets loses the property silently. `RefreshTokens.RevokeAllForUser` reaches
+the tokens through sessions rather than through `refresh_token.subject`, because that column
+arrived with M1-6 and filtering on it would miss every token M1-5 issues.
+
+**The race worth testing.** A redeemed recovery code revokes everything and then creates the
+session it just authenticated. The revocation marker and the new session are written moments
+apart, and a session whose auth time does not beat the marker would be dead on arrival —
+so the test signs in with a recovery code and then *uses* the resulting session.
+
+**Still to come in M1-8:** WebAuthn as a second factor.
 
 ### Notes from M1-7, revisited: the token says who you are, not what you may do
 

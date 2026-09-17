@@ -202,6 +202,10 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 
 	authenticator, err := authn.New(tenantPool, system, authn.Options{
 		Params: params, Log: log,
+		// The second factor needs the keyring to seal TOTP secrets, and the session and
+		// refresh stores so that a recovery code ends everything (SPEC §7.2).
+		Keyring: keyring, Sessions: sessions, Refresh: refresh,
+		Audit: audit.NewWriter(),
 	})
 	if err != nil {
 		t.Fatalf("authenticator: %v", err)
