@@ -346,10 +346,11 @@ const insertOAuthClient = `-- name: InsertOAuthClient :exec
 INSERT INTO oauth_client (id, tenant_id, key, name, public, secret_hash, redirect_uris,
                           grant_types, response_types, scopes, audiences,
                           token_endpoint_auth_method, post_logout_redirect_uris,
-                          require_pkce)
+                          token_attributes, require_pkce)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11,
-        $12, $13, $14)
+        $12, $13,
+        $14, $15)
 `
 
 type InsertOAuthClientParams struct {
@@ -366,6 +367,7 @@ type InsertOAuthClientParams struct {
 	Audiences               []string
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
+	TokenAttributes         []string
 	RequirePkce             bool
 }
 
@@ -384,6 +386,7 @@ func (q *Queries) InsertOAuthClient(ctx context.Context, arg InsertOAuthClientPa
 		arg.Audiences,
 		arg.TokenEndpointAuthMethod,
 		arg.PostLogoutRedirectUris,
+		arg.TokenAttributes,
 		arg.RequirePkce,
 	)
 	return err
@@ -553,7 +556,7 @@ func (q *Queries) ListOAuthClients(ctx context.Context, tenantID string) ([]List
 const oAuthClientByID = `-- name: OAuthClientByID :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = $1 AND id = $2
 `
@@ -577,6 +580,7 @@ type OAuthClientByIDRow struct {
 	Audiences               []string
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
+	TokenAttributes         []string
 	RequirePkce             bool
 	DisabledAt              *time.Time
 	CreatedAt               time.Time
@@ -599,6 +603,7 @@ func (q *Queries) OAuthClientByID(ctx context.Context, arg OAuthClientByIDParams
 		&i.Audiences,
 		&i.TokenEndpointAuthMethod,
 		&i.PostLogoutRedirectUris,
+		&i.TokenAttributes,
 		&i.RequirePkce,
 		&i.DisabledAt,
 		&i.CreatedAt,
@@ -609,7 +614,7 @@ func (q *Queries) OAuthClientByID(ctx context.Context, arg OAuthClientByIDParams
 const oAuthClientByKey = `-- name: OAuthClientByKey :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = $1 AND key = $2
 `
@@ -633,6 +638,7 @@ type OAuthClientByKeyRow struct {
 	Audiences               []string
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectUris  []string
+	TokenAttributes         []string
 	RequirePkce             bool
 	DisabledAt              *time.Time
 	CreatedAt               time.Time
@@ -655,6 +661,7 @@ func (q *Queries) OAuthClientByKey(ctx context.Context, arg OAuthClientByKeyPara
 		&i.Audiences,
 		&i.TokenEndpointAuthMethod,
 		&i.PostLogoutRedirectUris,
+		&i.TokenAttributes,
 		&i.RequirePkce,
 		&i.DisabledAt,
 		&i.CreatedAt,
@@ -888,6 +895,137 @@ func (q *Queries) SetOAuthClientSecret(ctx context.Context, arg SetOAuthClientSe
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const tokenClaimGroups = `-- name: TokenClaimGroups :many
+WITH RECURSIVE membership AS (
+    SELECT base.group_id
+      FROM group_member base
+     WHERE base.tenant_id = $1 AND base.member_user_id = $2
+    UNION
+    SELECT gm.group_id
+      FROM group_member gm
+      JOIN membership ms ON gm.member_group_id = ms.group_id
+     WHERE gm.tenant_id = $1
+)
+SELECT g.key
+  FROM group_ g
+  JOIN membership ms ON ms.group_id = g.id
+ WHERE g.tenant_id = $1
+ ORDER BY g.key
+`
+
+type TokenClaimGroupsParams struct {
+	TenantID string
+	UserID   *string
+}
+
+// The groups a user belongs to, nesting walked outward.
+func (q *Queries) TokenClaimGroups(ctx context.Context, arg TokenClaimGroupsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, tokenClaimGroups, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const tokenClaimRoles = `-- name: TokenClaimRoles :many
+
+WITH RECURSIVE membership AS (
+    SELECT base.group_id
+      FROM group_member base
+     WHERE base.tenant_id = $1 AND base.member_user_id = $2
+    UNION
+    SELECT gm.group_id
+      FROM group_member gm
+      JOIN membership ms ON gm.member_group_id = ms.group_id
+     WHERE gm.tenant_id = $1
+)
+SELECT DISTINCT r.key
+  FROM grant_ g
+  JOIN role r ON r.id = g.role_id
+ WHERE g.tenant_id = $1
+   AND g.scope_kind = 'tenant'
+   AND (g.valid_from IS NULL OR g.valid_from <= now())
+   AND (g.valid_until IS NULL OR g.valid_until > now())
+   AND (g.subject_user_id = $2
+        OR g.subject_group_id IN (SELECT group_id FROM membership))
+ ORDER BY r.key
+`
+
+type TokenClaimRolesParams struct {
+	TenantID string
+	UserID   *string
+}
+
+// ---------------------------------------------------------------------------------
+// Access token claim assembly (SPEC §8.2)
+// ---------------------------------------------------------------------------------
+// The tenant-wide roles a user holds, directly or through a group.
+//
+// Tenant-wide only, as §8.2 requires: a resource-scoped role says nothing without the
+// resource it is scoped to, and a token cannot carry the scope. Grants outside their
+// validity window are excluded, because a token that claims a role the user does not
+// currently hold is worse than one that omits it.
+//
+// The recursion walks group nesting outward, so a member of a nested group holds the
+// outer group's roles too — the same rule the decision engine applies (SPEC §9.4).
+func (q *Queries) TokenClaimRoles(ctx context.Context, arg TokenClaimRolesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, tokenClaimRoles, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const tokenClaimSubject = `-- name: TokenClaimSubject :one
+SELECT u.status, u.attributes, t.permission_rev
+  FROM app_user u
+  JOIN tenant t ON t.id = u.tenant_id
+ WHERE u.tenant_id = $1 AND u.id = $2 AND u.deleted_at IS NULL
+`
+
+type TokenClaimSubjectParams struct {
+	TenantID string
+	UserID   string
+}
+
+type TokenClaimSubjectRow struct {
+	Status        string
+	Attributes    dbtypes.JSONMap
+	PermissionRev int64
+}
+
+// The subject's own facts, and the tenant revision the token is issued against.
+func (q *Queries) TokenClaimSubject(ctx context.Context, arg TokenClaimSubjectParams) (TokenClaimSubjectRow, error) {
+	row := q.db.QueryRow(ctx, tokenClaimSubject, arg.TenantID, arg.UserID)
+	var i TokenClaimSubjectRow
+	err := row.Scan(&i.Status, &i.Attributes, &i.PermissionRev)
+	return i, err
 }
 
 const touchDeviceAuthorizationPoll = `-- name: TouchDeviceAuthorizationPoll :exec

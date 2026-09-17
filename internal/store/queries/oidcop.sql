@@ -13,14 +13,14 @@ SELECT tenant_id FROM oauth_client WHERE id = @id;
 -- name: OAuthClientByID :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = @tenant_id AND id = @id;
 
 -- name: OAuthClientByKey :one
 SELECT id, tenant_id, key, name, public, secret_hash, redirect_uris, grant_types,
        response_types, scopes, audiences, token_endpoint_auth_method,
-       post_logout_redirect_uris, require_pkce, disabled_at, created_at
+       post_logout_redirect_uris, token_attributes, require_pkce, disabled_at, created_at
   FROM oauth_client
  WHERE tenant_id = @tenant_id AND key = @key;
 
@@ -35,10 +35,11 @@ SELECT id, tenant_id, key, name, public, redirect_uris, grant_types, scopes,
 INSERT INTO oauth_client (id, tenant_id, key, name, public, secret_hash, redirect_uris,
                           grant_types, response_types, scopes, audiences,
                           token_endpoint_auth_method, post_logout_redirect_uris,
-                          require_pkce)
+                          token_attributes, require_pkce)
 VALUES (@id, @tenant_id, @key, @name, @public, @secret_hash, @redirect_uris,
         @grant_types, @response_types, @scopes, @audiences,
-        @token_endpoint_auth_method, @post_logout_redirect_uris, @require_pkce);
+        @token_endpoint_auth_method, @post_logout_redirect_uris,
+        @token_attributes, @require_pkce);
 
 -- Rotates a confidential client's secret. The old one stops working immediately;
 -- SPEC §8.4's overlap window is for service accounts, which are a different credential
@@ -215,3 +216,63 @@ DELETE FROM device_authorization WHERE expires_at < @before;
 -- against is precisely what the code has to answer.
 -- name: DeviceAuthorizationTenant :one
 SELECT tenant_id FROM device_authorization WHERE user_code_hash = @user_code_hash;
+
+-- ---------------------------------------------------------------------------------
+-- Access token claim assembly (SPEC §8.2)
+-- ---------------------------------------------------------------------------------
+
+-- The tenant-wide roles a user holds, directly or through a group.
+--
+-- Tenant-wide only, as §8.2 requires: a resource-scoped role says nothing without the
+-- resource it is scoped to, and a token cannot carry the scope. Grants outside their
+-- validity window are excluded, because a token that claims a role the user does not
+-- currently hold is worse than one that omits it.
+--
+-- The recursion walks group nesting outward, so a member of a nested group holds the
+-- outer group's roles too — the same rule the decision engine applies (SPEC §9.4).
+-- name: TokenClaimRoles :many
+WITH RECURSIVE membership AS (
+    SELECT base.group_id
+      FROM group_member base
+     WHERE base.tenant_id = @tenant_id AND base.member_user_id = @user_id
+    UNION
+    SELECT gm.group_id
+      FROM group_member gm
+      JOIN membership ms ON gm.member_group_id = ms.group_id
+     WHERE gm.tenant_id = @tenant_id
+)
+SELECT DISTINCT r.key
+  FROM grant_ g
+  JOIN role r ON r.id = g.role_id
+ WHERE g.tenant_id = @tenant_id
+   AND g.scope_kind = 'tenant'
+   AND (g.valid_from IS NULL OR g.valid_from <= now())
+   AND (g.valid_until IS NULL OR g.valid_until > now())
+   AND (g.subject_user_id = @user_id
+        OR g.subject_group_id IN (SELECT group_id FROM membership))
+ ORDER BY r.key;
+
+-- The groups a user belongs to, nesting walked outward.
+-- name: TokenClaimGroups :many
+WITH RECURSIVE membership AS (
+    SELECT base.group_id
+      FROM group_member base
+     WHERE base.tenant_id = @tenant_id AND base.member_user_id = @user_id
+    UNION
+    SELECT gm.group_id
+      FROM group_member gm
+      JOIN membership ms ON gm.member_group_id = ms.group_id
+     WHERE gm.tenant_id = @tenant_id
+)
+SELECT g.key
+  FROM group_ g
+  JOIN membership ms ON ms.group_id = g.id
+ WHERE g.tenant_id = @tenant_id
+ ORDER BY g.key;
+
+-- The subject's own facts, and the tenant revision the token is issued against.
+-- name: TokenClaimSubject :one
+SELECT u.status, u.attributes, t.permission_rev
+  FROM app_user u
+  JOIN tenant t ON t.id = u.tenant_id
+ WHERE u.tenant_id = @tenant_id AND u.id = @user_id AND u.deleted_at IS NULL;

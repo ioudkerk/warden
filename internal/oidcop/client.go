@@ -81,7 +81,10 @@ type Client struct {
 	Audiences               []string
 	TokenEndpointAuthMethod string
 	PostLogoutRedirectURIs  []string
-	RequirePKCE             bool
+	// TokenAttributes is the allowlist of user attributes this client's access tokens
+	// may carry in wd.attrs (SPEC §8.2). Empty means none, which is the default.
+	TokenAttributes []string
+	RequirePKCE     bool
 
 	DisabledAt *time.Time
 	CreatedAt  time.Time
@@ -266,6 +269,7 @@ type NewClientOptions struct {
 	Scopes                 []string
 	Audiences              []string
 	PostLogoutRedirectURIs []string
+	TokenAttributes        []string
 }
 
 // Register creates a client, returning the generated secret for a confidential one.
@@ -312,6 +316,7 @@ func (r *Clients) Register(ctx context.Context, o NewClientOptions) (client *Cli
 			ResponseTypes: []string{ResponseTypeCode}, Scopes: o.Scopes,
 			Audiences: o.Audiences, TokenEndpointAuthMethod: authMethod,
 			PostLogoutRedirectUris: o.PostLogoutRedirectURIs,
+			TokenAttributes:        o.TokenAttributes,
 			// Public clients are forced to PKCE by the schema; confidential ones get
 			// it anyway, because there is no good reason not to and OAuth 2.1 makes it
 			// universal.
@@ -464,6 +469,9 @@ func validateNewClient(o *NewClientOptions) error {
 	if o.PostLogoutRedirectURIs == nil {
 		o.PostLogoutRedirectURIs = []string{}
 	}
+	if o.TokenAttributes == nil {
+		o.TokenAttributes = []string{}
+	}
 	if o.RedirectURIs == nil {
 		o.RedirectURIs = []string{}
 	}
@@ -555,6 +563,7 @@ func clientFromRow(r db.OAuthClientByIDRow) *Client {
 		ResponseTypes: r.ResponseTypes, Scopes: r.Scopes, Audiences: r.Audiences,
 		TokenEndpointAuthMethod: r.TokenEndpointAuthMethod,
 		PostLogoutRedirectURIs:  r.PostLogoutRedirectUris,
+		TokenAttributes:         r.TokenAttributes,
 		RequirePKCE:             r.RequirePkce,
 		DisabledAt:              r.DisabledAt, CreatedAt: r.CreatedAt,
 	}

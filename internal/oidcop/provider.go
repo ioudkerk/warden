@@ -35,6 +35,17 @@ type Session struct {
 	*openid.DefaultSession
 	TenantID  string `json:"wd_tid"`
 	SessionID string `json:"wd_sid"`
+
+	// AccessClaims and AccessHeaders are the access token's own JWT claims, assembled
+	// at issuance (SPEC §8.2). Separate from the id token's, because the two tokens go
+	// to different audiences and say different things.
+	//
+	// Never serialized. They are rebuilt on every issuance, so storing them would put a
+	// copy of the user's group list in every access-token row and every refresh-token
+	// row — and the copy would be stale the moment the user's roles changed, which is
+	// precisely the staleness this design exists to avoid.
+	AccessClaims  *jwt.JWTClaims `json:"-"`
+	AccessHeaders *jwt.Headers   `json:"-"`
 }
 
 // WardenSessionID satisfies the interface the storage adapter looks for when deciding
@@ -115,7 +126,20 @@ func (s *Session) Clone() fosite.Session {
 	if !ok {
 		return nil
 	}
-	return &Session{DefaultSession: cloned, TenantID: s.TenantID, SessionID: s.SessionID}
+	copied := &Session{DefaultSession: cloned, TenantID: s.TenantID, SessionID: s.SessionID}
+	// The access claims are rebuilt on every issuance, so a shallow copy would be
+	// harmless today. Copied anyway: a clone that shares a map with its original is the
+	// kind of thing that is fine until one of them is mutated.
+	if s.AccessClaims != nil {
+		claims := *s.AccessClaims
+		claims.Extra = jwt.Copy(s.AccessClaims.Extra)
+		copied.AccessClaims = &claims
+	}
+	if s.AccessHeaders != nil {
+		headers := jwt.Headers{Extra: jwt.Copy(s.AccessHeaders.Extra)}
+		copied.AccessHeaders = &headers
+	}
+	return copied
 }
 
 // Provider is Warden's OpenID Provider: fosite, configured.
@@ -132,8 +156,9 @@ type Provider struct {
 	config *fosite.Config
 
 	// strategy is the token strategy the provider was composed with. The introspection
-	// endpoint needs it to derive a signature from a presented token.
-	strategy *oauth2.HMACSHAStrategy
+	// endpoint needs it to derive a signature from a presented token — which for a JWT
+	// access token is its third segment, and for a refresh token the half after the dot.
+	strategy oauth2.CoreStrategy
 }
 
 // ProviderOptions configure a Provider.
@@ -199,6 +224,11 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 		AuthorizeCodeLifespan: authorizeCodeLifetime,
 		IDTokenLifespan:       accessTTL,
 
+		// `scope` as a space-delimited string, which is what SPEC §8.2 shows and what
+		// RFC 9068 §2.2.3 specifies. fosite's default emits `scp` as a JSON array
+		// instead, which is a different claim by a different name.
+		JWTScopeClaimKey: jwt.JWTScopeFieldString,
+
 		// PKCE for everyone. The schema already forces it on public clients, which is
 		// where RFC 8252 and OAuth 2.1 require it; enforcing it globally means a
 		// confidential client cannot quietly omit it either, and there is no good
@@ -238,11 +268,20 @@ func NewProvider(storage *Storage, opts ProviderOptions) (*Provider, error) {
 		return opts.Keys.SigningKey(ctx)
 	}
 
-	// Retained rather than passed anonymously: the introspection endpoint has to turn
-	// a bearer token back into the signature the storage is keyed by, and doing that
-	// with a second strategy built from the same configuration would be one more place
-	// for the two to disagree about what a token looks like.
-	strategy := compose.NewOAuth2HMACStrategy(cfg)
+	// Two strategies, one wrapping the other.
+	//
+	// The HMAC strategy still mints authorization codes and refresh tokens: those are
+	// opaque by design, because they are redeemed at Warden and nobody else needs to
+	// read them. The access token is a JWT (SPEC §8.2), so a resource server can verify
+	// one without a round trip — and the wrapper around it is what assembles Warden's
+	// claims and holds the token to its size cap.
+	hmacStrategy := compose.NewOAuth2HMACStrategy(cfg)
+	strategy := &accessTokenStrategy{
+		CoreStrategy: compose.NewOAuth2JWTStrategy(keyGetter, hmacStrategy, cfg),
+		storage:      storage,
+		issuer:       opts.Issuer,
+		log:          log,
+	}
 
 	provider := compose.Compose(
 		cfg,

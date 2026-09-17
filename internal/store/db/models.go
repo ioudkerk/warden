@@ -252,6 +252,8 @@ type OauthClient struct {
 	DisabledAt              *time.Time
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+	// Allowlist of app_user.attributes keys this client's access tokens may carry in wd.attrs (SPEC §8.2). Empty means none.
+	TokenAttributes []string
 }
 
 // Short-lived OpenID Provider artifacts (SPEC §7.7). Refresh tokens are NOT here; they live in refresh_token, which carries the family rotation of SPEC §8.3.

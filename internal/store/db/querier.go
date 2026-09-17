@@ -338,6 +338,23 @@ type Querier interface {
 	// not apply and these predicates are the only thing keeping one tenant's roles out
 	// of another's decision.
 	TenantRevision(ctx context.Context, id string) (int64, error)
+	// The groups a user belongs to, nesting walked outward.
+	TokenClaimGroups(ctx context.Context, arg TokenClaimGroupsParams) ([]string, error)
+	// ---------------------------------------------------------------------------------
+	// Access token claim assembly (SPEC §8.2)
+	// ---------------------------------------------------------------------------------
+	// The tenant-wide roles a user holds, directly or through a group.
+	//
+	// Tenant-wide only, as §8.2 requires: a resource-scoped role says nothing without the
+	// resource it is scoped to, and a token cannot carry the scope. Grants outside their
+	// validity window are excluded, because a token that claims a role the user does not
+	// currently hold is worse than one that omits it.
+	//
+	// The recursion walks group nesting outward, so a member of a nested group holds the
+	// outer group's roles too — the same rule the decision engine applies (SPEC §9.4).
+	TokenClaimRoles(ctx context.Context, arg TokenClaimRolesParams) ([]string, error)
+	// The subject's own facts, and the tenant revision the token is issued against.
+	TokenClaimSubject(ctx context.Context, arg TokenClaimSubjectParams) (TokenClaimSubjectRow, error)
 	// Records that a credential was used. Deliberately not in the same transaction as the
 	// verification: a successful login must not fail because this write contended, and an
 	// unsuccessful one must not be distinguishable by having skipped it.

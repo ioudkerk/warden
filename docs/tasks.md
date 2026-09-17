@@ -248,7 +248,7 @@ library, with no Warden-specific client code.
 | M1-4 | **Status: done.** Sessions in Redis with a Postgres mirror; `sid`; revoke one / revoke all | Met, by a factor of 600. `TestRevokeAllPropagatesToAnotherReplicaWithinOneSecond` revokes on one replica and polls an independent one: visible in **1.65 ms** against the 1 s budget |
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
-| M1-7 | Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | A user with 5 000 groups still gets a valid, verifiable, sub-4 KB token |
+| M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and gets a **645-byte** token that verifies against published JWKS, carries `wd.roles` and `wd.perm_rev`, and says `wd.truncated`. The same run against the deployment produced **1163 bytes** under RS256 with every §8.2 claim present |
 | M1-8 | TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows; recovery invalidates all sessions (§7.2) |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
@@ -359,6 +359,62 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-7: the access token
+
+**The access token was opaque and §8.2 says it is a JWT.** That is the whole change, and
+it changes who trusts whom: a resource server verifies a signature instead of asking
+Warden. The authorization code and the refresh token stay opaque — they are redeemed here
+and nobody else needs to read them — so fosite is composed with its JWT strategy for access
+tokens wrapping the HMAC strategy for everything else.
+
+**Claims are assembled at issuance, not when the session is created.** A session lasts
+thirty days and a token ten minutes. Freezing the claims with the session would mean a
+refresh a week later described the roles the user had when they signed in — while
+`wd.perm_rev` said the token was current, which is worse than saying nothing. The seam is
+`GenerateAccessToken`, the only place with a context, the request and the moment of
+issuance at once. `TestARefreshedTokenDescribesTheUserNow` grants a role after the session
+begins and asserts the refreshed token knows about it.
+
+**The cap is enforced by measuring the token, not by estimating it.** SPEC §8.2 caps the
+*token* at 4 KB, and between the claims and the token lie base64, a header and a signature
+whose length depends on the algorithm. So the issuer generates, measures, and gives
+something up if it does not fit: groups first, then attributes, then a refusal. The extra
+signature is paid only by the tokens that need one — a user with three groups signs once, a
+user with five thousand signs twice. Five thousand groups came out at 645 bytes in the
+fixture and 1163 against the deployment.
+
+**Roles and `perm_rev` are never dropped.** Roles are what is left when everything else
+goes, and without `perm_rev` an SDK cannot tell that its cached model predates the token —
+which is the one thing that makes local evaluation safe at all. When even those do not fit,
+the request is refused rather than answered with an oversized or a silently empty token. It
+takes roughly two hundred roles on one user to reach that.
+
+**`wd.attrs` is an allowlist on the client, and the specification says application.** The
+deviation is deliberate and recorded: an access token is issued to a *client*, a client
+need not correspond to an application at all — migration 000014 says so at length — and
+there is no link between the two tables to read an allowlist through. The client is what
+receives the token, so its registration decides what the token discloses. Empty by default,
+because attributes are arbitrary tenant data and the failure mode of a denylist is that the
+next attribute somebody adds is disclosed to every client until it is noticed.
+
+**Suspension is now checked at issuance**, which closes what the security review recorded
+as latent. The status check lives in claim assembly rather than at any one endpoint, because
+that is the single place every grant passes through on the way to a token — and a JWT
+access token cannot be recalled once signed, so "refuse to mint" is the only enforcement
+that works. `TestASuspendedUserGetsNoFurtherTokens` suspends a user mid-session and asserts
+the refresh is refused.
+
+**One deviation from RFC 9068 that could not be fixed here.** §2.1 asks for `typ: at+jwt`
+so an access token cannot be mistaken for an id token. fosite's signer merges header extras
+with `assign`, which skips any key already present, and it sets `typ: JWT` itself — so the
+value cannot be overridden without replacing the signer. The exposure is bounded: an id
+token's `aud` is the client, an access token's is the resource server, and a resource server
+that checks `aud` — which it must do anyway — already refuses the other one.
+
+**The assembled claims are deliberately not serialized.** They are rebuilt on every
+issuance, so storing them would put a copy of the user's group list in every access-token
+row and every refresh-token row, and the copy would be stale the moment the roles changed.
 
 ### Security review of M0 and M1-1…M1-6
 

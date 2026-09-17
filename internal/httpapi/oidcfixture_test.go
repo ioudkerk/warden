@@ -63,6 +63,7 @@ type oidcFixture struct {
 	email    string
 	password string
 	userID   string
+	tenantID string
 
 	// Kept so a test can build a second server that differs in one setting.
 	cfg  *config.Config
@@ -356,7 +357,7 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		rival:      rival, rivalSecret: rivalSecret,
 		confidential: confidential, confidentialSecret: confidentialSecret,
 		postLogoutURI: postLogoutURI,
-		email:         email, password: password, userID: userID,
+		email:         email, password: password, userID: userID, tenantID: tenantID,
 		cfg: cfg, deps: deps,
 	}
 }
