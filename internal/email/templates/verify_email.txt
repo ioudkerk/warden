@@ -1,0 +1,8 @@
+Confirm your email address
+
+Open this link to confirm that {{.Address}} belongs to you. It works once, and
+expires in {{.ExpiresIn}}.
+
+{{.Link}}
+
+If you were not expecting this, you can ignore it.

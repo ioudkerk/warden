@@ -50,6 +50,13 @@ type Querier interface {
 	// every tenant's revision moves and every cached model is rebuilt (SPEC §10.5).
 	BumpEveryTenantRevision(ctx context.Context) error
 	BumpTenantRevision(ctx context.Context, id string) error
+	// Claims a batch for one worker.
+	//
+	// FOR UPDATE SKIP LOCKED is what lets several workers drain the queue without any message
+	// being sent twice: a row another worker is holding is stepped over rather than waited for.
+	// Suppressed addresses are filtered here rather than at send time, so a suppressed message
+	// is never claimed at all.
+	ClaimOutboundEmail(ctx context.Context, batchSize int32) ([]ClaimOutboundEmailRow, error)
 	// Consumes a token, but only if it is still unconsumed. The row count is what settles
 	// a race: the loser updates nothing and is treated as a replay.
 	ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error)
@@ -83,6 +90,7 @@ type Querier interface {
 	// Removes every credential of one kind. Re-enrolling replaces rather than accumulates:
 	// a user who sets up a new authenticator is not asking to keep the old one.
 	DeleteSecondFactorsOfType(ctx context.Context, arg DeleteSecondFactorsOfTypeParams) (int64, error)
+	DeleteSentEmails(ctx context.Context, before time.Time) (int64, error)
 	DenyDeviceAuthorization(ctx context.Context, arg DenyDeviceAuthorizationParams) (int64, error)
 	DeprecateUIElement(ctx context.Context, arg DeprecateUIElementParams) error
 	// The row a device's poll is about. Returned whatever its status: "pending", "denied"
@@ -95,6 +103,11 @@ type Querier interface {
 	// there is no tenant scope to read it under, and which tenant to authenticate them
 	// against is precisely what the code has to answer.
 	DeviceAuthorizationTenant(ctx context.Context, userCodeHash []byte) (string, error)
+	EmailQueueDepth(ctx context.Context) (int64, error)
+	// ---------------------------------------------------------------------------------
+	// Email delivery (docs/design-email.md §5)
+	// ---------------------------------------------------------------------------------
+	EnqueueEmail(ctx context.Context, arg EnqueueEmailParams) error
 	EnrolTenantInEveryApplication(ctx context.Context, tenantID string) error
 	EnvironmentID(ctx context.Context, arg EnvironmentIDParams) (string, error)
 	// Read before deleting: an audit entry saying only "a grant was revoked" cannot
@@ -178,6 +191,12 @@ type Querier interface {
 	// forever after. A row lock is not enough — FOR UPDATE on an empty table locks
 	// nothing — so this is an advisory lock, held for the transaction.
 	LockAuditChain(ctx context.Context, pgAdvisoryXactLock int64) error
+	// A permanent failure, or one that has run out of attempts.
+	MarkEmailFailed(ctx context.Context, arg MarkEmailFailedParams) error
+	// A transient failure: try again later, with the backoff the caller computed.
+	MarkEmailRetrying(ctx context.Context, arg MarkEmailRetryingParams) error
+	MarkEmailSent(ctx context.Context, id string) error
+	MarkEmailSuppressed(ctx context.Context, id string) error
 	// Action implication is expanded at load, never during a check (SPEC §9.2).
 	ModelActionImplications(ctx context.Context) ([]ModelActionImplicationsRow, error)
 	ModelDenials(ctx context.Context, tenantID string) ([]ModelDenialsRow, error)
@@ -343,6 +362,7 @@ type Querier interface {
 	// Setup tokens (system pool: see the header)
 	// ---------------------------------------------------------------------------------
 	SetupTokenByHash(ctx context.Context, tokenHash []byte) (SetupTokenByHashRow, error)
+	SuppressEmailAddress(ctx context.Context, arg SuppressEmailAddressParams) error
 	// SPEC §16.2 makes the decision log level per application; with one decision endpoint
 	// and no application in the request, the caller takes the strictest level across the
 	// tenant's enrolled applications.

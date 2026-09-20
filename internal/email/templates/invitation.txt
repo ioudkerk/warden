@@ -1,0 +1,8 @@
+You have been invited to {{.TenantName}}
+
+{{.InviterName}} invited you to join {{.TenantName}}. Open this link to accept and
+set a password. It works once, and expires in {{.ExpiresIn}}.
+
+{{.Link}}
+
+If you were not expecting this invitation, you can ignore it.

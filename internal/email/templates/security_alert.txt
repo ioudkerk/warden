@@ -1,0 +1,8 @@
+Security alert for your {{.TenantName}} account
+
+{{.Headline}}
+
+{{.Detail}}
+
+If this was you, nothing needs to happen. If it was not, change your password and
+review the devices signed in to your account.

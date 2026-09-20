@@ -1,0 +1,8 @@
+Sign in to {{.TenantName}}
+
+Open this link to sign in. It works once, and expires in {{.ExpiresIn}}.
+
+{{.Link}}
+
+If you did not ask to sign in, you can ignore this message — nobody can use the
+link without it, and it stops working on its own.

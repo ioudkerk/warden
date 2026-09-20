@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color:#1a1a2e; line-height:1.5;">
+  <h1 style="font-size:1.25rem;">You have been invited to {{.TenantName}}</h1>
+  <p>{{.InviterName}} invited you to join {{.TenantName}}. Open this link to accept and set a password. It works once, and expires in {{.ExpiresIn}}.</p>
+  <p><a href="{{.Link}}" style="display:inline-block; padding:.625rem 1rem; background:#1a1a2e; color:#fff; text-decoration:none; border-radius:4px;">Accept the invitation</a></p>
+  <p style="color:#666; font-size:.875rem;">Or copy this address into your browser:<br>{{.Link}}</p>
+  <p style="color:#666; font-size:.875rem;">If you were not expecting this invitation, you can ignore it.</p>
+</body></html>

@@ -331,3 +331,69 @@ SELECT count(*)
   FROM credential
  WHERE tenant_id = @tenant_id AND user_id = @user_id
    AND type = 'recovery_code' AND NOT (params ? 'used_at');
+
+-- ---------------------------------------------------------------------------------
+-- Email delivery (docs/design-email.md §5)
+-- ---------------------------------------------------------------------------------
+
+-- name: EnqueueEmail :exec
+INSERT INTO outbound_email (id, tenant_id, to_address, template, locale, payload)
+VALUES (@id, @tenant_id, @to_address, @template, @locale, @payload);
+
+-- Claims a batch for one worker.
+--
+-- FOR UPDATE SKIP LOCKED is what lets several workers drain the queue without any message
+-- being sent twice: a row another worker is holding is stepped over rather than waited for.
+-- Suppressed addresses are filtered here rather than at send time, so a suppressed message
+-- is never claimed at all.
+-- name: ClaimOutboundEmail :many
+WITH claimed AS (
+    SELECT e.id
+      FROM outbound_email e
+     WHERE e.status = 'pending'
+       AND e.next_attempt_at <= now()
+     ORDER BY e.next_attempt_at
+     LIMIT @batch_size
+       FOR UPDATE SKIP LOCKED
+)
+SELECT e.id, e.tenant_id, e.to_address, e.template, e.locale, e.payload, e.attempts,
+       -- Cast, or sqlc types a computed column as interface{}: the same reason the UI
+       -- binding query casts its coalesced columns.
+       (s.address IS NOT NULL)::boolean AS suppressed
+  FROM outbound_email e
+  JOIN claimed c ON c.id = e.id
+  LEFT JOIN email_suppression s ON s.address = e.to_address;
+
+-- name: MarkEmailSent :exec
+UPDATE outbound_email
+   SET status = 'sent', sent_at = now(), attempts = attempts + 1, last_error = NULL
+ WHERE id = @id;
+
+-- A transient failure: try again later, with the backoff the caller computed.
+-- name: MarkEmailRetrying :exec
+UPDATE outbound_email
+   SET attempts = attempts + 1, next_attempt_at = @next_attempt_at, last_error = @last_error
+ WHERE id = @id;
+
+-- A permanent failure, or one that has run out of attempts.
+-- name: MarkEmailFailed :exec
+UPDATE outbound_email
+   SET status = 'failed', attempts = attempts + 1, last_error = @last_error
+ WHERE id = @id;
+
+-- name: MarkEmailSuppressed :exec
+UPDATE outbound_email
+   SET status = 'suppressed', last_error = 'the recipient address is suppressed'
+ WHERE id = @id;
+
+-- name: SuppressEmailAddress :exec
+INSERT INTO email_suppression (address, reason, last_bounce_at, note)
+VALUES (@address, @reason, now(), @note)
+ON CONFLICT (address) DO UPDATE
+   SET reason = EXCLUDED.reason, last_bounce_at = now(), note = EXCLUDED.note;
+
+-- name: EmailQueueDepth :one
+SELECT count(*) FROM outbound_email WHERE status = 'pending';
+
+-- name: DeleteSentEmails :execrows
+DELETE FROM outbound_email WHERE status IN ('sent', 'failed', 'suppressed') AND created_at < @before;

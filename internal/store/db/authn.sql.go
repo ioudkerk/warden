@@ -89,6 +89,71 @@ func (q *Queries) ActiveSessionsForUser(ctx context.Context, arg ActiveSessionsF
 	return items, nil
 }
 
+const claimOutboundEmail = `-- name: ClaimOutboundEmail :many
+WITH claimed AS (
+    SELECT e.id
+      FROM outbound_email e
+     WHERE e.status = 'pending'
+       AND e.next_attempt_at <= now()
+     ORDER BY e.next_attempt_at
+     LIMIT $1
+       FOR UPDATE SKIP LOCKED
+)
+SELECT e.id, e.tenant_id, e.to_address, e.template, e.locale, e.payload, e.attempts,
+       -- Cast, or sqlc types a computed column as interface{}: the same reason the UI
+       -- binding query casts its coalesced columns.
+       (s.address IS NOT NULL)::boolean AS suppressed
+  FROM outbound_email e
+  JOIN claimed c ON c.id = e.id
+  LEFT JOIN email_suppression s ON s.address = e.to_address
+`
+
+type ClaimOutboundEmailRow struct {
+	ID         string
+	TenantID   *string
+	ToAddress  string
+	Template   string
+	Locale     string
+	Payload    dbtypes.JSONMap
+	Attempts   int32
+	Suppressed bool
+}
+
+// Claims a batch for one worker.
+//
+// FOR UPDATE SKIP LOCKED is what lets several workers drain the queue without any message
+// being sent twice: a row another worker is holding is stepped over rather than waited for.
+// Suppressed addresses are filtered here rather than at send time, so a suppressed message
+// is never claimed at all.
+func (q *Queries) ClaimOutboundEmail(ctx context.Context, batchSize int32) ([]ClaimOutboundEmailRow, error) {
+	rows, err := q.db.Query(ctx, claimOutboundEmail, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimOutboundEmailRow{}
+	for rows.Next() {
+		var i ClaimOutboundEmailRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.ToAddress,
+			&i.Template,
+			&i.Locale,
+			&i.Payload,
+			&i.Attempts,
+			&i.Suppressed,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
 UPDATE refresh_token SET consumed_at = $1::timestamptz
  WHERE id = $2 AND consumed_at IS NULL AND revoked_at IS NULL
@@ -251,6 +316,59 @@ func (q *Queries) DeleteSecondFactorsOfType(ctx context.Context, arg DeleteSecon
 	return result.RowsAffected(), nil
 }
 
+const deleteSentEmails = `-- name: DeleteSentEmails :execrows
+DELETE FROM outbound_email WHERE status IN ('sent', 'failed', 'suppressed') AND created_at < $1
+`
+
+func (q *Queries) DeleteSentEmails(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSentEmails, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const emailQueueDepth = `-- name: EmailQueueDepth :one
+SELECT count(*) FROM outbound_email WHERE status = 'pending'
+`
+
+func (q *Queries) EmailQueueDepth(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, emailQueueDepth)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const enqueueEmail = `-- name: EnqueueEmail :exec
+
+INSERT INTO outbound_email (id, tenant_id, to_address, template, locale, payload)
+VALUES ($1, $2, $3, $4, $5, $6)
+`
+
+type EnqueueEmailParams struct {
+	ID        string
+	TenantID  *string
+	ToAddress string
+	Template  string
+	Locale    string
+	Payload   dbtypes.JSONMap
+}
+
+// ---------------------------------------------------------------------------------
+// Email delivery (docs/design-email.md §5)
+// ---------------------------------------------------------------------------------
+func (q *Queries) EnqueueEmail(ctx context.Context, arg EnqueueEmailParams) error {
+	_, err := q.db.Exec(ctx, enqueueEmail,
+		arg.ID,
+		arg.TenantID,
+		arg.ToAddress,
+		arg.Template,
+		arg.Locale,
+		arg.Payload,
+	)
+	return err
+}
+
 const insertRefreshToken = `-- name: InsertRefreshToken :exec
 
 INSERT INTO refresh_token (id, session_id, tenant_id, family_id, token_hash, client_id,
@@ -387,6 +505,63 @@ func (q *Queries) InvalidateOtherSetupTokens(ctx context.Context, arg Invalidate
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const markEmailFailed = `-- name: MarkEmailFailed :exec
+UPDATE outbound_email
+   SET status = 'failed', attempts = attempts + 1, last_error = $1
+ WHERE id = $2
+`
+
+type MarkEmailFailedParams struct {
+	LastError *string
+	ID        string
+}
+
+// A permanent failure, or one that has run out of attempts.
+func (q *Queries) MarkEmailFailed(ctx context.Context, arg MarkEmailFailedParams) error {
+	_, err := q.db.Exec(ctx, markEmailFailed, arg.LastError, arg.ID)
+	return err
+}
+
+const markEmailRetrying = `-- name: MarkEmailRetrying :exec
+UPDATE outbound_email
+   SET attempts = attempts + 1, next_attempt_at = $1, last_error = $2
+ WHERE id = $3
+`
+
+type MarkEmailRetryingParams struct {
+	NextAttemptAt time.Time
+	LastError     *string
+	ID            string
+}
+
+// A transient failure: try again later, with the backoff the caller computed.
+func (q *Queries) MarkEmailRetrying(ctx context.Context, arg MarkEmailRetryingParams) error {
+	_, err := q.db.Exec(ctx, markEmailRetrying, arg.NextAttemptAt, arg.LastError, arg.ID)
+	return err
+}
+
+const markEmailSent = `-- name: MarkEmailSent :exec
+UPDATE outbound_email
+   SET status = 'sent', sent_at = now(), attempts = attempts + 1, last_error = NULL
+ WHERE id = $1
+`
+
+func (q *Queries) MarkEmailSent(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markEmailSent, id)
+	return err
+}
+
+const markEmailSuppressed = `-- name: MarkEmailSuppressed :exec
+UPDATE outbound_email
+   SET status = 'suppressed', last_error = 'the recipient address is suppressed'
+ WHERE id = $1
+`
+
+func (q *Queries) MarkEmailSuppressed(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markEmailSuppressed, id)
+	return err
 }
 
 const passwordCredentialByEmail = `-- name: PasswordCredentialByEmail :one
@@ -920,6 +1095,24 @@ func (q *Queries) SetupTokenByHash(ctx context.Context, tokenHash []byte) (Setup
 		&i.ConsumedAt,
 	)
 	return i, err
+}
+
+const suppressEmailAddress = `-- name: SuppressEmailAddress :exec
+INSERT INTO email_suppression (address, reason, last_bounce_at, note)
+VALUES ($1, $2, now(), $3)
+ON CONFLICT (address) DO UPDATE
+   SET reason = EXCLUDED.reason, last_bounce_at = now(), note = EXCLUDED.note
+`
+
+type SuppressEmailAddressParams struct {
+	Address string
+	Reason  string
+	Note    *string
+}
+
+func (q *Queries) SuppressEmailAddress(ctx context.Context, arg SuppressEmailAddressParams) error {
+	_, err := q.db.Exec(ctx, suppressEmailAddress, arg.Address, arg.Reason, arg.Note)
+	return err
 }
 
 const tenantPasswordPolicy = `-- name: TenantPasswordPolicy :one

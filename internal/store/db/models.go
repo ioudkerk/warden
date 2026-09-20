@@ -159,6 +159,15 @@ type DeviceAuthorization struct {
 	ExpiresAt         time.Time
 }
 
+// Addresses that must not be sent to (docs/design-email.md §6). Deployment-wide, because a bounce is a property of the address and the sending reputation is shared.
+type EmailSuppression struct {
+	Address      string
+	Reason       string
+	SuppressedAt time.Time
+	LastBounceAt *time.Time
+	Note         *string
+}
+
 // A slice of an application's configuration. UI bindings are environment-scoped so a change is testable in staging and promoted (SPEC §11.3).
 type Environment struct {
 	ID            string
@@ -277,6 +286,22 @@ type OauthSession struct {
 	Active      bool
 	RequestedAt time.Time
 	ExpiresAt   time.Time
+}
+
+type OutboundEmail struct {
+	ID        string
+	TenantID  *string
+	ToAddress string
+	Template  string
+	Locale    string
+	// Template data. Never the token: that is read from its own table at send time, so this row is not a second copy of a credential.
+	Payload       dbtypes.JSONMap
+	Status        string
+	Attempts      int32
+	NextAttemptAt time.Time
+	LastError     *string
+	CreatedAt     time.Time
+	SentAt        *time.Time
 }
 
 // The atom of authorization: app.resource:action. Materialized from resource_type × action at sync time (SPEC §9.2).

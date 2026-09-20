@@ -296,6 +296,9 @@ func seedTwoTenants(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			  VALUES ($1, $2, $3, sha256($4::bytea), sha256($5::bytea), now() + interval '10 minutes')`,
 				[]any{"dev_" + suffix, tn, "oac_" + suffix,
 					[]byte("device-" + suffix), []byte("user-" + suffix)}},
+			{`INSERT INTO outbound_email (id, tenant_id, to_address, template)
+			  VALUES ($1, $2, $3, 'magic_link')`,
+				[]any{"eml_" + suffix, tn, "person@" + suffix + ".test"}},
 		}
 
 		// One shared, global application, so app_enrollment has something to point
@@ -786,9 +789,9 @@ func TestTenantListIsStable(t *testing.T) {
 	want := []string{
 		"app_enrollment", "app_user", "credential", "decision_event", "denial",
 		"device_authorization", "grant_", "group_", "group_member", "identity",
-		"idp_connection", "oauth_client", "oauth_session", "refresh_token",
-		"resource_node", "role", "role_inheritance", "role_permission", "session",
-		"tenant", "ui_binding",
+		"idp_connection", "oauth_client", "oauth_session", "outbound_email",
+		"refresh_token", "resource_node", "role", "role_inheritance", "role_permission",
+		"session", "tenant", "ui_binding",
 	}
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {

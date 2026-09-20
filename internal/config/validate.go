@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/mail"
 	"net/url"
 	"sort"
 	"strings"
@@ -124,6 +125,7 @@ func (c *Config) Validate(lookupEnv secrets.LookupEnvFunc, readFile secrets.Read
 	c.validateDatabase(errs)
 	c.validateCache(errs)
 	c.validateSecurity(errs, lookupEnv, readFile)
+	c.validateEmail(errs, lookupEnv, readFile)
 	c.validateLog(errs)
 	c.validateTelemetry(errs)
 
@@ -303,6 +305,100 @@ func (c *Config) validateCache(errs *Errors) {
 	if c.Cache.PoolSize <= 0 && c.Cache.Backend == CacheRedis {
 		errs.add("cache.pool_size", "must be positive")
 	}
+}
+
+// validateEmail checks the delivery configuration (docs/design-email.md §2).
+//
+// Everything here is checked at startup rather than at send time, and that is the whole
+// point: for three of the four flows the message is a credential, so the first send is
+// somebody trying to get into their account. A malformed `from` or an unreachable secret
+// reference must fail while an operator is watching.
+func (c *Config) validateEmail(errs *Errors, lookupEnv secrets.LookupEnvFunc, readFile secrets.ReadFileFunc) {
+	switch c.Email.Sender {
+	case EmailNoop:
+		// Nothing else matters: this deployment has turned email off deliberately.
+		return
+	case EmailStdout:
+		if c.Environment == EnvProduction {
+			errs.add("email.sender",
+				"stdout writes credentials to the log and must not be used in production; "+
+					"use smtp, or noop if this deployment sends no email")
+		}
+	case EmailSMTP:
+		c.validateSMTP(errs, lookupEnv, readFile)
+	case "":
+		errs.add("email.sender", "must be set to smtp, stdout or noop")
+	default:
+		errs.add("email.sender",
+			fmt.Sprintf("%q is not a known sender; want smtp, stdout or noop", c.Email.Sender))
+	}
+
+	// Required for anything that actually delivers. Parsed rather than pattern-matched,
+	// so "Warden <no-reply@acme.com>" is accepted and "no-reply@" is not.
+	if c.Email.From == "" {
+		errs.add("email.from", "must be set unless the sender is noop")
+	} else if _, err := mail.ParseAddress(c.Email.From); err != nil {
+		errs.add("email.from",
+			fmt.Sprintf("is not a valid address: %s. A malformed sender fails every send", err))
+	}
+	if c.Email.ReplyTo != "" {
+		if _, err := mail.ParseAddress(c.Email.ReplyTo); err != nil {
+			errs.add("email.reply_to", fmt.Sprintf("is not a valid address: %s", err))
+		}
+	}
+}
+
+func (c *Config) validateSMTP(errs *Errors, lookupEnv secrets.LookupEnvFunc, readFile secrets.ReadFileFunc) {
+	if c.Email.SMTP.Host == "" {
+		errs.add("email.smtp.host", "must be set when the sender is smtp")
+	}
+	if c.Email.SMTP.Port <= 0 || c.Email.SMTP.Port > 65535 {
+		errs.add("email.smtp.port", "must be a port number between 1 and 65535")
+	}
+	if c.Email.SMTP.Timeout <= 0 {
+		errs.add("email.smtp.timeout", "must be positive")
+	}
+
+	switch c.Email.SMTP.TLS {
+	case SMTPStartTLS, SMTPImplicit:
+	case SMTPDisabled:
+		// Loopback only. An SMTP session in the clear carries the credential these
+		// messages exist to deliver, so the one place it is tolerable is a connection
+		// that never leaves the machine — which is what a local Mailpit is.
+		if !isLoopbackHost(c.Email.SMTP.Host) {
+			errs.add("email.smtp.tls",
+				fmt.Sprintf("may only be disabled for a loopback host (got %q); an SMTP "+
+					"session in the clear carries the credential the message exists to deliver",
+					c.Email.SMTP.Host))
+		}
+	case "":
+		errs.add("email.smtp.tls", "must be set to starttls, implicit or disabled")
+	default:
+		errs.add("email.smtp.tls",
+			fmt.Sprintf("%q is not a known mode; want starttls, implicit or disabled", c.Email.SMTP.TLS))
+	}
+
+	// Resolved, not merely checked for presence: a reference pointing at a missing file
+	// must fail now rather than on the first send.
+	if !c.Email.SMTP.Password.IsZero() {
+		if _, err := secrets.ResolveReference(
+			c.Email.SMTP.Password.Expose(), lookupEnv, readFile); err != nil {
+			errs.add("email.smtp.password_ref", err.Error())
+		}
+	}
+}
+
+// isLoopbackHost reports whether a host never leaves the machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	// A container name on a private network is not loopback. Docker's "mailpit" reaches
+	// another host, and the session crosses a network somebody else may be on.
+	return false
 }
 
 func (c *Config) validateSecurity(errs *Errors, lookupEnv secrets.LookupEnvFunc, readFile secrets.ReadFileFunc) {

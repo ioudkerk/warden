@@ -65,8 +65,68 @@ type Config struct {
 	Database  DatabaseConfig  `yaml:"database"`
 	Cache     CacheConfig     `yaml:"cache"`
 	Security  SecurityConfig  `yaml:"security"`
+	Email     EmailConfig     `yaml:"email"`
 	Log       LogConfig       `yaml:"log"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+}
+
+// EmailConfig configures delivery (docs/design-email.md).
+//
+// For three of the four flows that use it — magic link, password reset, invitation — the
+// message *is* the credential, which makes this part of the authentication system rather
+// than a notification feature. A deployment with email misconfigured is a deployment where
+// nobody can recover an account, and the failure appears at the worst possible moment.
+type EmailConfig struct {
+	// Sender selects the backend: smtp, stdout or noop.
+	Sender EmailSender `yaml:"sender"`
+
+	// From is the envelope and header sender. Validated at startup, because a malformed
+	// one fails every send and finding that out when somebody needs a password reset is
+	// the worst possible time.
+	From string `yaml:"from"`
+	// ReplyTo is optional.
+	ReplyTo string `yaml:"reply_to"`
+
+	SMTP SMTPConfig `yaml:"smtp"`
+}
+
+// EmailSender names a delivery backend.
+type EmailSender string
+
+const (
+	// EmailSMTP is the default and the only one a self-hoster needs.
+	EmailSMTP EmailSender = "smtp"
+	// EmailStdout writes the message as JSON. Development only, and refused in
+	// production for the same reason discovery mode is: a setting that is harmless
+	// locally and catastrophic in production should not be reachable there.
+	EmailStdout EmailSender = "stdout"
+	// EmailNoop accepts and discards. It exists so that a deployment which has turned
+	// email off has done so deliberately, rather than by leaving SMTP misconfigured and
+	// discovering it when nobody can reset a password.
+	EmailNoop EmailSender = "noop"
+)
+
+// SMTPTLS selects how the SMTP connection is protected.
+type SMTPTLS string
+
+const (
+	SMTPStartTLS SMTPTLS = "starttls"
+	SMTPImplicit SMTPTLS = "implicit"
+	// SMTPDisabled is permitted only for loopback hosts. An SMTP session in the clear
+	// carries the credential these messages exist to deliver.
+	SMTPDisabled SMTPTLS = "disabled"
+)
+
+// SMTPConfig configures the SMTP sender.
+type SMTPConfig struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	// Password is resolved from a reference — env: or file: — the same way the KEK is,
+	// so an SMTP password is never a literal in a configuration file.
+	Password secrets.Secret `yaml:"password_ref"`
+	TLS      SMTPTLS        `yaml:"tls"`
+	Timeout  time.Duration  `yaml:"timeout"`
 }
 
 // HTTPConfig configures the public listener.
@@ -298,6 +358,19 @@ func Defaults() *Config {
 			ConnMaxLifetime:  30 * time.Minute,
 			ConnectTimeout:   10 * time.Second,
 			StatementTimeout: 5 * time.Second,
+		},
+
+		Email: EmailConfig{
+			// noop by default. Not smtp: a default pointing at a host that is not there
+			// would fail every send at run time, and the failure would look like a bug
+			// rather than a deployment that has not configured email yet. Choosing noop
+			// makes "email is off" a statement rather than an accident.
+			Sender: EmailNoop,
+			SMTP: SMTPConfig{
+				Port:    587,
+				TLS:     SMTPStartTLS,
+				Timeout: 10 * time.Second,
+			},
 		},
 
 		Cache: CacheConfig{

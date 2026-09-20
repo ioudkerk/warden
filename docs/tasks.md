@@ -250,7 +250,7 @@ library, with no Warden-specific client code.
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
 | M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met, and §8.2 amended: the authorization facts are now a per-client grant, empty by default, because Warden is the decision point and a role list in a JWT is that decision made stale and unrevocable. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and, for a client that opted in, gets a **645-byte** token that verifies against published JWKS and says `wd.truncated`. For the default client the same five thousand memberships produce **586 bytes** with nothing dropped and no membership walk at all |
 | M1-8 | **Status: done.** TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows work end to end: a password alone now reaches `/login/verify` and authorizes nothing, and `amr` comes back `["pwd","otp","mfa"]`. A recovery code signs in and ends every other session and refresh token (§7.2). Verified against the deployment with an independently written TOTP client, which is what proves the implementation interoperates rather than merely agreeing with itself. WebAuthn enrols and signs in through the browser endpoints against a virtual authenticator that signs for real, with the origin check, the clone detection and the spent challenge each shown to be load-bearing by reverting them |
-| M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
+| M1-9 | **In progress (delivery done; the link flows are next).** Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest. **Done:** the three senders, the embedded templates with a hostile-input test, and the durable queue with its worker |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
 
 ### Notes from M1-6, part 1: the client registry
@@ -359,6 +359,59 @@ the one that should impose the first delay — imposed none. Reverting the `+1` 
 that both read 3 and both write 4 have counted one attempt, so an attacker with any
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
+
+### Notes from M1-9, part 1: delivery
+
+**The framing the design opens with decides the rest.** For three of the four flows — magic
+link, reset, invitation — *the message is the credential*. That makes delivery part of the
+authentication system rather than a notification feature attached to it, and it is why
+sending is durable where the decision log is not: a dropped decision record is an
+observability gap, a dropped reset email is somebody who cannot get into their account.
+
+**The queue row is written in the caller's transaction, and it does not hold the token.**
+The token and the intent to email it commit together or neither does; the link is resolved
+at *send* time through a `TokenFunc`. So there is no second copy of a credential sitting in
+a queue with a different retention — and a message whose token was used while it waited is
+dropped rather than delivered, because a link that does nothing is worse than no message.
+
+**`noop` is the default sender, not `smtp`.** A default pointing at a host that is not there
+would fail every send at run time, and the failure would look like a bug rather than a
+deployment that has not configured email yet. Choosing `noop` makes "email is off" a
+statement somebody made. `stdout` is refused in production by configuration validation for
+the same reason discovery mode is: it is the one sender that deliberately writes a
+credential to the log.
+
+**Two template engines, and using the wrong one is the bug the tests exist to catch.**
+`text/template` does not escape, so building HTML with it turns a display name of `<script>`
+into a script tag in somebody's mail client. Every value interpolated here is
+user-controlled. `TestEveryTemplateEscapesHostileInput` renders all five templates against
+seven hostile inputs; rewiring the renderer to build HTML with the text engine fails it
+immediately.
+
+The assertion had to be made precise to be worth anything. Searching the output for
+`onerror=` is a false positive — it appears inside the *escaped* text, which is the safe
+outcome. It now asks the exact question: did the raw value survive verbatim?
+
+**Quoted-printable is not decoration.** SMTP lines are capped at 998 characters and a
+rendered HTML template has no such limit, so an unencoded long line is a message some servers
+reject and others truncate — losing the end of the link. The MIME boundary is random for a
+related reason: a fixed one appearing inside a rendered template, which a user-controlled
+display name could arrange, would split the message where the sender did not intend.
+
+**`tls: disabled` is allowed only for a loopback host**, checked at startup. An SMTP session
+in the clear carries the credential the message exists to deliver, and the one place that is
+tolerable is a connection that never leaves the machine. A container name on a private
+network is not loopback, and the check says so.
+
+**4xx and 5xx are opposite decisions.** RFC 5321 splits replies at the first digit: 5xx is
+permanent and 4xx is transient. Getting it backwards is expensive both ways — retrying a
+permanent rejection for a day is how a sending domain gets blocked, and giving up on a
+transient one loses somebody's reset. Retries follow the design's schedule: 1 m, 5 m, 15 m,
+1 h, 6 h, 24 h.
+
+**`email_suppression` is registered as deployment-wide rather than tenant-scoped**, which is
+the first entry in the isolation registry to claim that deliberately: a bounce is a property
+of the address, and the sending reputation being protected is shared by every tenant.
 
 ### Notes from M1-8: the second factor
 
