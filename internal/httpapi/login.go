@@ -132,6 +132,35 @@ func (s *Server) issueCSRFToken(w http.ResponseWriter) (string, error) {
 	return token, nil
 }
 
+// checkCSRFHeader is checkCSRF for a request whose body is not a form.
+//
+// The WebAuthn endpoints carry a browser-built JSON document, so there is no field to put a
+// token in and the token travels in a header instead.
+//
+// Belt and braces, deliberately. A cross-origin POST cannot set a custom header without a
+// preflight, and the preflight fails because Warden sends no CORS headers — so those
+// endpoints are already out of reach of a forged request. This is the second lock: it holds
+// if a future change ever adds a permissive CORS policy, which is exactly the kind of change
+// that is made for one endpoint and quietly applies to all of them.
+func (s *Server) checkCSRFHeader(r *http.Request) error {
+	_, name := s.cookieNames()
+	cookie, err := r.Cookie(name)
+	if err != nil || cookie.Value == "" {
+		return errors.New("no CSRF cookie: the page was not served by this deployment, or the cookie was dropped")
+	}
+	submitted := r.Header.Get(csrfHeader)
+	if submitted == "" {
+		return errors.New("the request carried no CSRF token")
+	}
+	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(submitted)) != 1 {
+		return errors.New("the CSRF token does not match the cookie")
+	}
+	return nil
+}
+
+// csrfHeader is where a scripted request carries the double-submit token.
+const csrfHeader = "X-Warden-Csrf"
+
 // checkCSRF compares the submitted token with the cookie.
 func (s *Server) checkCSRF(r *http.Request) error {
 	_, name := s.cookieNames()

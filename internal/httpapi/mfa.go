@@ -149,10 +149,15 @@ func (s *Server) handleSecondFactorForm(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	loginSecurityHeaders(w)
+	hasKey := s.securityKeyAvailable(r, pending.TenantID, pending.UserID)
+	if hasKey {
+		s.scriptedSecurityHeaders(w)
+	} else {
+		loginSecurityHeaders(w)
+	}
 	s.renderSecondFactor(w, secondFactorPage{
 		CSRFField: csrfField, CSRFToken: token,
-		Email: pending.Email,
+		Email: pending.Email, HasSecurityKey: hasKey,
 	}, http.StatusOK)
 }
 
@@ -236,28 +241,46 @@ func (s *Server) handleSecondFactorSubmit(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// Spent: the pending record is single use, whatever happens next. Removed before the
-	// session is created so that a failure after this point cannot leave a usable one
-	// behind.
+	destination, ok := s.completeSecondFactor(w, r, pending, pendingID, method)
+	if !ok {
+		return
+	}
+	http.Redirect(w, r, destination, http.StatusSeeOther)
+}
+
+// completeSecondFactor spends the pending login and creates the session.
+//
+// Shared by the code form and by WebAuthn, because the part that must not differ between
+// them is exactly this part: which record is spent, what `amr` says, and the fact that the
+// session is created once and only after a factor has been verified.
+func (s *Server) completeSecondFactor(
+	w http.ResponseWriter, r *http.Request, pending *pendingLogin, pendingID, method string,
+) (destination string, ok bool) {
+	ctx := r.Context()
+
+	// Spent first: the pending record is single use, whatever happens next. Removed
+	// before the session is created so that a failure after this point cannot leave a
+	// usable one behind.
 	if delErr := s.cache.Delete(ctx, pendingKey(pendingID)); delErr != nil {
 		s.log.Warn("could not remove a spent pending login", "error", delErr)
 	}
 	s.clearPendingCookie(w)
 
 	amr := append(append([]string{}, pending.AMR...), method, authn.AMRMFA)
-	session, err := s.sessions.Create(ctx, pending.TenantID, pending.UserID, amr, ip, r.UserAgent())
+	session, err := s.sessions.Create(ctx, pending.TenantID, pending.UserID, amr,
+		s.clientIP(r), r.UserAgent())
 	if err != nil {
 		s.log.Error("creating a session after a second factor", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "internal_error",
 			"The sign-in could not be completed.")
-		return
+		return "", false
 	}
 
 	s.log.Info("a user signed in with a second factor",
 		"tenant_id", pending.TenantID, "user_id", pending.UserID, "method", method)
 
 	s.setSessionCookie(w, session.ID, session.ExpiresAt)
-	http.Redirect(w, r, pending.ReturnTo, http.StatusSeeOther)
+	return pending.ReturnTo, true
 }
 
 func (s *Server) clearPendingCookie(w http.ResponseWriter) {
@@ -308,14 +331,37 @@ type secondFactorPage struct {
 	CSRFToken string
 	Email     string
 	Error     string
+	// HasSecurityKey decides whether the page offers the button at all. A button that
+	// prompts for a key the account does not have is a dead end somebody will press
+	// first, every time.
+	HasSecurityKey bool
+	Script         template.JS
 }
 
 func (s *Server) renderSecondFactor(w http.ResponseWriter, page secondFactorPage, status int) {
+	if page.HasSecurityKey {
+		page.Script = template.JS(webAuthnScript) //nolint:gosec // a compile-time constant, hashed into the CSP
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := secondFactorTemplate.Execute(w, page); err != nil {
 		s.log.Error("rendering the second-factor page", "error", err)
 	}
+}
+
+// securityKeyAvailable reports whether this account has a key to be asked for.
+func (s *Server) securityKeyAvailable(r *http.Request, tenantID, userID string) bool {
+	factors, err := s.authn.Factors(r.Context(), tenantID, userID)
+	if err != nil {
+		s.log.Error("listing second factors", "error", err)
+		return false
+	}
+	for _, factor := range factors {
+		if factor.Type == authn.FactorWebAuthn && factor.Confirmed {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) renderSecondFactorError(w http.ResponseWriter, email, message string, status int) {
@@ -353,6 +399,10 @@ var secondFactorTemplate = template.Must(template.New("verify").Parse(`<!doctype
  .error { background:#fdecec; border:1px solid #f5c2c2; color:#8a1f1f; padding:.625rem;
           border-radius:4px; font-size:.875rem; margin-bottom:1rem; }
  .hint { color:#666; font-size:.8125rem; margin:0; }
+ button.key { background:#fff; color:#1a1a2e; border:1px solid #1a1a2e; margin-bottom:.75rem; }
+ .divider { text-align:center; color:#999; font-size:.8125rem; margin:0 0 .75rem; }
+ .status { background:#eef2ff; border:1px solid #c7d2fe; color:#1e3a8a; padding:.625rem;
+           border-radius:4px; font-size:.875rem; margin-bottom:1rem; }
 </style>
 </head>
 <body>
@@ -360,6 +410,12 @@ var secondFactorTemplate = template.Must(template.New("verify").Parse(`<!doctype
   <h1>Two-step verification</h1>
   <p class="sub">{{.Email}}</p>
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  {{if .HasSecurityKey}}
+  <input type="hidden" id="wa-csrf" value="{{.CSRFToken}}">
+  <button type="button" id="wa-signin" class="key">Use a security key</button>
+  <div id="wa-status" class="status" hidden></div>
+  <p class="divider">or</p>
+  {{end}}
   <form method="post" action="/login/verify">
     <input type="hidden" name="{{.CSRFField}}" value="{{.CSRFToken}}">
     <label for="code">Code</label>
@@ -369,5 +425,6 @@ var secondFactorTemplate = template.Must(template.New("verify").Parse(`<!doctype
   </form>
   <p class="hint">Enter the code from your authenticator, or one of your recovery codes.</p>
 </main>
+{{if .HasSecurityKey}}<script>{{.Script}}</script>{{end}}
 </body>
 </html>`))

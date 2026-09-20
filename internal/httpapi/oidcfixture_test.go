@@ -206,6 +206,14 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		// refresh stores so that a recovery code ends everything (SPEC §7.2).
 		Keyring: keyring, Sessions: sessions, Refresh: refresh,
 		Audit: audit.NewWriter(),
+		// WebAuthn: the cache holds a challenge between the two requests, and the
+		// relying party is the fixture's own issuer.
+		Cache: cacheClient,
+		WebAuthn: authn.WebAuthnOptions{
+			RPDisplayName: "Warden test",
+			RPID:          "warden.test",
+			Origins:       []string{issuer},
+		},
 	})
 	if err != nil {
 		t.Fatalf("authenticator: %v", err)

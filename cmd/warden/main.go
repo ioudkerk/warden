@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -353,6 +354,11 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		Keyring:  keyring,
 		Sessions: sessions,
 		Refresh:  refreshTokens,
+		// WebAuthn holds a challenge between two requests, so it needs the cache; and a
+		// relying party derived from the issuer, so that "which domain is this" has one
+		// answer rather than two that can drift.
+		Cache:    cacheClient,
+		WebAuthn: webAuthnOptions(cfg, log),
 	})
 	if err != nil {
 		return err
@@ -542,4 +548,27 @@ overriding the one before it. The file is selected with -config or WARDEN_CONFIG
 Flags:
 `, buildVersion())
 	config.Usage(w)
+}
+
+// webAuthnOptions derives the relying party from the issuer.
+//
+// A failure here is not fatal: it means this deployment does not offer security keys, which
+// is the correct answer for one on plain http — a browser refuses WebAuthn outside a secure
+// context anyway. Logged at info so that an operator who expected keys can see why there are
+// none, rather than finding a button that does nothing.
+func webAuthnOptions(cfg *config.Config, log *slog.Logger) authn.WebAuthnOptions {
+	options, err := authn.WebAuthnOptionsFromIssuer(cfg.Issuer, "")
+	if err != nil {
+		log.Info("security keys are not offered: the issuer has no host to bind them to",
+			"issuer", cfg.Issuer, "error", err)
+		return authn.WebAuthnOptions{}
+	}
+	if !strings.HasPrefix(cfg.Issuer, "https://") && options.RPID != "localhost" {
+		// Browsers treat localhost as a secure context and nothing else on http, so a
+		// deployment there would advertise keys that fail in the browser.
+		log.Info("security keys are not offered: WebAuthn needs a secure context",
+			"issuer", cfg.Issuer)
+		return authn.WebAuthnOptions{}
+	}
+	return options
 }

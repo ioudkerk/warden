@@ -213,6 +213,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login/verify", s.requireLogin(s.handleSecondFactorForm))
 	mux.HandleFunc("POST /login/verify", s.requireLogin(s.handleSecondFactorSubmit))
 
+	// WebAuthn. JSON rather than forms, because navigator.credentials is a JavaScript
+	// API and there is no HTML element that speaks to a security key.
+	mux.HandleFunc("POST /login/verify/webauthn/begin", s.requireLogin(s.handleWebAuthnLoginBegin))
+	mux.HandleFunc("POST /login/verify/webauthn/finish", s.requireLogin(s.handleWebAuthnLoginFinish))
+
+	// The account's own page: what it has enrolled, and where a key is added. M6's
+	// console takes this over; it exists now because a key cannot be enrolled from a
+	// command line.
+	mux.HandleFunc("GET /account/security", s.requireLogin(s.handleAccountSecurity))
+	mux.HandleFunc("POST /account/security/webauthn/begin", s.requireLogin(s.handleWebAuthnRegisterBegin))
+	mux.HandleFunc("POST /account/security/webauthn/finish", s.requireLogin(s.handleWebAuthnRegisterFinish))
+
 	// The endpoints a client uses once it holds a token. Both methods on userinfo,
 	// because OpenID Connect Core §5.3.1 requires both and relying-party libraries are
 	// split down the middle about which to use.

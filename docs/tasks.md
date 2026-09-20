@@ -249,7 +249,7 @@ library, with no Warden-specific client code.
 | M1-5 | **Status: done.** Refresh tokens: opaque 256-bit, hashed, rotating, **reuse detection revokes the family** and raises a security event | Met. `TestReplayingARotatedTokenKillsTheFamily` builds a chain three deep, replays the first token, and asserts all three are dead, the session is ended, and exactly one `security.refresh_token_reuse` is written with the family, session and token count on it |
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
 | M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met, and §8.2 amended: the authorization facts are now a per-client grant, empty by default, because Warden is the decision point and a role list in a JWT is that decision made stale and unrevocable. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and, for a client that opted in, gets a **645-byte** token that verifies against published JWKS and says `wd.truncated`. For the default client the same five thousand memberships produce **586 bytes** with nothing dropped and no membership walk at all |
-| M1-8 | **In progress (TOTP and recovery codes done; WebAuthn next).** TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows work end to end: a password alone now reaches `/login/verify` and authorizes nothing, and `amr` comes back `["pwd","otp","mfa"]`. A recovery code signs in and ends every other session and refresh token (§7.2). Verified against the deployment with an independently written TOTP client, which is what proves the implementation interoperates rather than merely agreeing with itself |
+| M1-8 | **Status: done.** TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows work end to end: a password alone now reaches `/login/verify` and authorizes nothing, and `amr` comes back `["pwd","otp","mfa"]`. A recovery code signs in and ends every other session and refresh token (§7.2). Verified against the deployment with an independently written TOTP client, which is what proves the implementation interoperates rather than merely agreeing with itself. WebAuthn enrols and signs in through the browser endpoints against a virtual authenticator that signs for real, with the origin check, the clone detection and the spent challenge each shown to be load-bearing by reverting them |
 | M1-9 | Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
 
@@ -405,7 +405,53 @@ session it just authenticated. The revocation marker and the new session are wri
 apart, and a session whose auth time does not beat the marker would be dead on arrival —
 so the test signs in with a recovery code and then *uses* the resulting session.
 
-**Still to come in M1-8:** WebAuthn as a second factor.
+**WebAuthn is the one factor a phishing page cannot relay.** A TOTP code is six digits a
+person will type wherever they are asked to, including into a convincing copy of this login
+page. A WebAuthn assertion is signed over the *origin the browser is actually talking to*, so
+one collected by `warden-login.test` is worthless against `warden.test`. That is the whole
+value, and `TestAnAssertionFromAnotherOriginIsRefused` is what holds it: adding the
+attacker's origin to the relying-party configuration makes the assertion succeed, which is
+how the test was shown to be testing something.
+
+**It is a library, and TOTP is not, for a reason that is about proportion rather than
+principle.** RFC 6238 is sixty lines with published vectors; WebAuthn is CBOR inside COSE
+with attestation statements in half a dozen formats and nothing that proves an
+implementation correct. `go-webauthn` is pinned to **v0.13.0** — the last release declaring
+`go 1.23.0`, so ADR-0001's floor holds; every later one declares 1.24 or above. OSV reports
+no known vulnerabilities for the module. The pin is the fifth standing in that go.mod
+comment.
+
+**The tests bring their own authenticator.** A security key is a physical device and
+`navigator.credentials` is a browser API, so WebAuthn either goes untested until somebody
+plugs a key into a laptop, or the test supplies one. `internal/authn/authntest` is a hundred
+lines that holds a P-256 pair, builds the COSE key and the authenticator data, and signs over
+the client-data hash — everything the server verifies is produced honestly, so a server bug
+shows up as a refusal rather than as two sides agreeing on the same mistake. It is a package
+rather than a `_test.go` file because both `internal/authn` and `internal/httpapi` need it,
+and two copies would mean a bug in one looking like a bug in the server.
+
+**A test that passed for the wrong reason.** The first version of "a challenge is spent"
+asserted only that the second attempt failed — and it passed with the challenge left in the
+cache, because the signature counter caught the replay first. It was testing the clone
+detector. It now asserts the *error*: `ErrInvalidSecondFactor`, meaning the challenge is
+gone, rather than `ErrCredentialCloned`.
+
+**The only JavaScript Warden serves.** There is no HTML element that speaks to a security
+key, so the verification page carries a script — inline, with its SHA-256 computed from the
+bytes and placed in `script-src`. Computed rather than written down, so the policy cannot
+drift from the script; a mismatch would not fail loudly, the browser would simply refuse to
+run it. `style-src` keeps `'unsafe-inline'` for the page's own CSS and `script-src` does not,
+so an injected script still does not run on the pages that have one.
+
+**The JSON endpoints carry the CSRF token too.** A cross-origin POST cannot set the custom
+header they require without a preflight, and the preflight fails because Warden sends no CORS
+headers — so they are already out of reach. The double-submit check is the second lock, and
+it is the one that still holds if a future change adds a permissive CORS policy for something
+else.
+
+**Whether keys are offered is decided once.** The page asks `WebAuthnAvailable()` rather than
+re-deriving "is this a secure context?" from the issuer. Two places applying that rule would
+eventually disagree, and the visible symptom is a button that cannot work.
 
 ### Notes from M1-7, revisited: the token says who you are, not what you may do
 

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warden-project/warden/internal/audit"
+	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/secrets"
 	"github.com/warden-project/warden/internal/store"
 	"github.com/warden-project/warden/internal/store/db"
@@ -87,6 +88,12 @@ type Authenticator struct {
 	sessions *Sessions
 	refresh  *RefreshTokens
 
+	// cache holds a WebAuthn challenge between the request that issues it and the one
+	// that answers it. webAuthn is the relying-party configuration, derived from the
+	// issuer; its zero value means WebAuthn is simply not offered.
+	cache    cache.Cache
+	webAuthn WebAuthnOptions
+
 	audit *audit.Writer
 
 	// policies caches per-tenant policy. A password change is rare and this is not on
@@ -114,6 +121,13 @@ type Options struct {
 	// them a redemption is logged as an error rather than quietly doing half the job.
 	Sessions *Sessions
 	Refresh  *RefreshTokens
+	// Cache holds WebAuthn challenges between requests, and WebAuthn is the reason it is
+	// here: a challenge has to be spendable, and a value the browser holds is not.
+	Cache cache.Cache
+	// WebAuthn is the relying party. Absent means security keys are not offered, which is
+	// the right answer for a deployment on plain http — a browser refuses WebAuthn there
+	// anyway, and offering it would be a button that never works.
+	WebAuthn WebAuthnOptions
 }
 
 // New builds an Authenticator.
@@ -130,6 +144,8 @@ func New(tenant, system *store.Store, opts Options) (*Authenticator, error) {
 		keyring:  opts.Keyring,
 		sessions: opts.Sessions,
 		refresh:  opts.Refresh,
+		cache:    opts.Cache,
+		webAuthn: opts.WebAuthn,
 	}
 	if a.params == (Params{}) {
 		a.params = DefaultParams()
