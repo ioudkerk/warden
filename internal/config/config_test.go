@@ -409,6 +409,53 @@ func TestValidationRejectsUnsafeCombinations(t *testing.T) {
 			wantField:  "environment",
 			wantDetail: "not a known environment",
 		},
+		{
+			// The message being delivered in the clear is the credential itself: a
+			// magic link, a reset link, an invitation. Anyone on the path between
+			// Warden and a remote relay reads them and becomes the user.
+			name: "cleartext SMTP to a remote relay in production",
+			env: map[string]string{
+				"WARDEN_EMAIL_SENDER":    "smtp",
+				"WARDEN_EMAIL_FROM":      "Warden <no-reply@acme.com>",
+				"WARDEN_EMAIL_SMTP_HOST": "smtp.acme.com",
+				"WARDEN_EMAIL_SMTP_TLS":  "disabled",
+			},
+			wantField:  "email.smtp.tls",
+			wantDetail: "loopback host in production",
+		},
+		{
+			// Staging holds real addresses and sends real links, so the same rule
+			// applies. Comparing against EnvProduction alone would let it through.
+			name: "cleartext SMTP to a remote relay in staging",
+			env: map[string]string{
+				"WARDEN_ENVIRONMENT":     "staging",
+				"WARDEN_EMAIL_SENDER":    "smtp",
+				"WARDEN_EMAIL_FROM":      "Warden <no-reply@acme.com>",
+				"WARDEN_EMAIL_SMTP_HOST": "smtp.acme.com",
+				"WARDEN_EMAIL_SMTP_TLS":  "disabled",
+			},
+			wantField:  "email.smtp.tls",
+			wantDetail: "loopback host in production",
+		},
+		{
+			name: "stdout sender in staging",
+			env: map[string]string{
+				"WARDEN_ENVIRONMENT":  "staging",
+				"WARDEN_EMAIL_SENDER": "stdout",
+				"WARDEN_EMAIL_FROM":   "Warden <no-reply@acme.com>",
+			},
+			wantField:  "email.sender",
+			wantDetail: "writes credentials to the log",
+		},
+		{
+			name: "sender address that cannot be parsed",
+			env: map[string]string{
+				"WARDEN_EMAIL_SENDER": "smtp",
+				"WARDEN_EMAIL_FROM":   "no-reply@",
+			},
+			wantField:  "email.from",
+			wantDetail: "not a valid address",
+		},
 	}
 
 	for _, tc := range cases {
@@ -450,6 +497,75 @@ func TestDevelopmentRelaxesProductionOnlyRules(t *testing.T) {
 	cfg := load(t, src(env))
 	if cfg.Cache.Backend != config.CacheInProcess {
 		t.Fatal("in-process cache should be allowed in dev")
+	}
+}
+
+// The development stack reaches Mailpit by container name, which is not loopback and
+// never will be — so outside production, cleartext SMTP has to be allowed to a named
+// host. This is the same concession as the in-process cache above; the test exists
+// because tightening the rule back to loopback-only would break `make dev-up` and
+// nothing else would notice.
+func TestCleartextSMTPIsAllowedOutsideProduction(t *testing.T) {
+	env := minimalEnv()
+	env["WARDEN_ENVIRONMENT"] = "dev"
+	env["WARDEN_EMAIL_SENDER"] = "smtp"
+	env["WARDEN_EMAIL_FROM"] = "Warden <no-reply@warden.test>"
+	env["WARDEN_EMAIL_SMTP_HOST"] = "mailpit"
+	env["WARDEN_EMAIL_SMTP_PORT"] = "1025"
+	env["WARDEN_EMAIL_SMTP_TLS"] = "disabled"
+
+	cfg := load(t, src(env))
+	if cfg.Email.SMTP.Host != "mailpit" || cfg.Email.SMTP.Port != 1025 {
+		t.Fatalf("SMTP host and port did not survive: %q:%d", cfg.Email.SMTP.Host, cfg.Email.SMTP.Port)
+	}
+	if cfg.Email.Sender != config.EmailSMTP || cfg.Email.From != "Warden <no-reply@warden.test>" {
+		t.Fatalf("sender = %q, from = %q", cfg.Email.Sender, cfg.Email.From)
+	}
+}
+
+// Every email setting reaches the struct. A variable the deployment sets and the loader
+// ignores is silent: the server starts, and sends through whatever the default was.
+func TestEmailSettingsAreBound(t *testing.T) {
+	env := minimalEnv()
+	env["WARDEN_EMAIL_SENDER"] = "smtp"
+	env["WARDEN_EMAIL_FROM"] = "Warden <no-reply@acme.com>"
+	env["WARDEN_EMAIL_REPLY_TO"] = "support@acme.com"
+	env["WARDEN_EMAIL_SMTP_HOST"] = "smtp.acme.com"
+	env["WARDEN_EMAIL_SMTP_PORT"] = "587"
+	env["WARDEN_EMAIL_SMTP_USERNAME"] = "warden"
+	env["WARDEN_EMAIL_SMTP_PASSWORD_REF"] = "env:WARDEN_SMTP_PASSWORD"
+	env["WARDEN_SMTP_PASSWORD"] = "hunter2"
+	env["WARDEN_EMAIL_SMTP_TLS"] = "starttls"
+	env["WARDEN_EMAIL_SMTP_TIMEOUT"] = "45s"
+
+	cfg := load(t, src(env))
+	for name, got := range map[string]any{
+		"sender":       string(cfg.Email.Sender),
+		"from":         cfg.Email.From,
+		"reply_to":     cfg.Email.ReplyTo,
+		"smtp.host":    cfg.Email.SMTP.Host,
+		"smtp.port":    cfg.Email.SMTP.Port,
+		"smtp.tls":     string(cfg.Email.SMTP.TLS),
+		"smtp.timeout": cfg.Email.SMTP.Timeout,
+		"username":     cfg.Email.SMTP.Username,
+	} {
+		want := map[string]any{
+			"sender": "smtp", "from": "Warden <no-reply@acme.com>",
+			"reply_to": "support@acme.com", "smtp.host": "smtp.acme.com",
+			"smtp.port": 587, "smtp.tls": "starttls",
+			"smtp.timeout": 45 * time.Second, "username": "warden",
+		}[name]
+		if got != want {
+			t.Errorf("email.%s = %v, want %v", name, got, want)
+		}
+	}
+	// The password is a reference, resolved at load; validation already proved it
+	// resolves, so all that is left is that it is held rather than dropped.
+	if cfg.Email.SMTP.Password.IsZero() {
+		t.Error("the SMTP password reference was dropped; every authenticated send would fail")
+	}
+	if strings.Contains(cfg.String(), "hunter2") {
+		t.Error("the SMTP password appears in the redacted rendering of the configuration")
 	}
 }
 

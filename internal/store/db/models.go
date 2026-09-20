@@ -240,6 +240,20 @@ type IdpConnection struct {
 	UpdatedAt    time.Time
 }
 
+// Single-use emailed links (docs/design-email.md §8). Hashed at rest; consumed in the transaction that acts on them, so a replay loses the race.
+type LinkToken struct {
+	ID          string
+	Kind        string
+	TenantID    string
+	UserID      string
+	TokenHash   []byte
+	Address     *string
+	ExpiresAt   time.Time
+	ConsumedAt  *time.Time
+	RequestedIp *string
+	CreatedAt   time.Time
+}
+
 // An OAuth 2.0 / OIDC client (SPEC §7.7). Distinct from `application`, which declares a permission surface.
 type OauthClient struct {
 	// The protocol client_id. Opaque and deployment-unique: the token endpoint resolves it before any tenant scope exists.

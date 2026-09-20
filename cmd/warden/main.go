@@ -20,6 +20,7 @@ import (
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
 	"github.com/warden-project/warden/internal/decisionlog"
+	"github.com/warden-project/warden/internal/email"
 	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/metrics"
@@ -359,6 +360,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		// answer rather than two that can drift.
 		Cache:    cacheClient,
 		WebAuthn: webAuthnOptions(cfg, log),
+		Issuer:   cfg.Issuer,
 	})
 	if err != nil {
 		return err
@@ -382,6 +384,37 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Email. The sender is opened eagerly for the same reason the cache is: a misspelled
+	// relay or an unreadable password reference should stop the process coming up, not
+	// surface as the reset link that never arrived.
+	//
+	// The worker drains through the system pool, across every tenant, so without one there
+	// is nobody to send what the tenant-scoped side enqueues. That is worth a warning
+	// rather than a failure — a deployment can legitimately run with the sending left to
+	// another replica — but a queue nothing drains is invisible from the outside: every
+	// request for a link still answers 200, and no message ever arrives.
+	sender, err := email.NewSender(cfg, secrets.OSLookupEnv, secrets.OSReadFile, log)
+	if err != nil {
+		return err
+	}
+	if cfg.HasRole(config.RoleWorker) {
+		if system == nil {
+			log.Warn("no email worker: draining the queue needs database.system_url, " +
+				"so queued messages will wait for a replica that has one")
+		} else {
+			queue, queueErr := email.NewQueue(db, system, email.QueueOptions{
+				Sender: sender, Log: log,
+				// The link is resealed out of the queue payload at send time; the
+				// authenticator owns the KEK, so it owns that step.
+				TokenFor: authenticator.EmailLinkResolver(),
+			})
+			if queueErr != nil {
+				return queueErr
+			}
+			go queue.Run(ctx)
+		}
 	}
 
 	// The OpenID Provider. It needs the client registry, the storage adapter over both
@@ -425,7 +458,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		Tenant: db, System: system,
 		Decisions: decisions, Metrics: metricSet, Cache: cacheClient, Tracing: tracing,
 		Keys: keyManager, Sessions: sessions, Provider: provider,
-		Authn: authenticator, Lockout: lockout,
+		Authn: authenticator, Lockout: lockout, Refresh: refreshTokens,
 	})
 	if err != nil {
 		return err

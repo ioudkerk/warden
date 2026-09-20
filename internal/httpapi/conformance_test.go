@@ -258,6 +258,16 @@ func TestTheIDTokenCarriesTheRequiredClaims(t *testing.T) {
 		t.Fatalf("iss = %v; want exactly %q, which is what a client compares against",
 			claims["iss"], f.issuer)
 	}
+
+	// And the discovery document has to say the same thing, byte for byte. OpenID
+	// Connect Discovery §4.3 requires the issuer returned from the document to be
+	// identical to the "iss" claim; certified relying parties compare the strings, so
+	// a trailing slash on one side and not the other rejects every token.
+	if got := f.discovery(t)["issuer"]; got != claims["iss"] {
+		t.Fatalf("the discovery document advertises issuer %q but tokens carry iss %v. "+
+			"A conforming client compares these as strings and refuses every token this "+
+			"deployment issues (OIDC Discovery §4.3)", got, claims["iss"])
+	}
 }
 
 // TestTokenResponsesAreNotCached. OpenID Connect Core §3.1.3.4 requires no-store on the

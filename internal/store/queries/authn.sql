@@ -364,9 +364,16 @@ SELECT e.id, e.tenant_id, e.to_address, e.template, e.locale, e.payload, e.attem
   JOIN claimed c ON c.id = e.id
   LEFT JOIN email_suppression s ON s.address = e.to_address;
 
+-- Marks a message sent, and empties the payload.
+--
+-- Emptying it is the point. The payload carries the link token, sealed under the KEK,
+-- because a message cannot be rendered without one and the token cannot be read back out of
+-- link_token — that table holds only a hash. Sealed and short-lived is the compromise;
+-- leaving it in a row that is kept for observability would make it neither.
 -- name: MarkEmailSent :exec
 UPDATE outbound_email
-   SET status = 'sent', sent_at = now(), attempts = attempts + 1, last_error = NULL
+   SET status = 'sent', sent_at = now(), attempts = attempts + 1,
+       last_error = NULL, payload = '{}'
  WHERE id = @id;
 
 -- A transient failure: try again later, with the backoff the caller computed.
@@ -375,10 +382,11 @@ UPDATE outbound_email
    SET attempts = attempts + 1, next_attempt_at = @next_attempt_at, last_error = @last_error
  WHERE id = @id;
 
--- A permanent failure, or one that has run out of attempts.
+-- A permanent failure, or one that has run out of attempts. The payload goes with it: the
+-- message will not be sent, so the sealed token in it has no further use.
 -- name: MarkEmailFailed :exec
 UPDATE outbound_email
-   SET status = 'failed', attempts = attempts + 1, last_error = @last_error
+   SET status = 'failed', attempts = attempts + 1, last_error = @last_error, payload = '{}'
  WHERE id = @id;
 
 -- name: MarkEmailSuppressed :exec
@@ -397,3 +405,47 @@ SELECT count(*) FROM outbound_email WHERE status = 'pending';
 
 -- name: DeleteSentEmails :execrows
 DELETE FROM outbound_email WHERE status IN ('sent', 'failed', 'suppressed') AND created_at < @before;
+
+-- ---------------------------------------------------------------------------------
+-- Emailed links (docs/design-email.md §8)
+-- ---------------------------------------------------------------------------------
+
+-- name: InsertLinkToken :exec
+INSERT INTO link_token (id, kind, tenant_id, user_id, token_hash, address, expires_at, requested_ip)
+VALUES (@id, @kind, @tenant_id, @user_id, @token_hash, @address, @expires_at, @requested_ip);
+
+-- Resolves a token to its row. System pool: the token arrives in a URL with nothing else
+-- attached, so there is no tenant to scope the read by until this returns one.
+--
+-- Returned whatever its state. "Expired", "already used" and "never existed" have to be
+-- distinguishable here — the caller answers them identically, but only the first two are
+-- worth recording, and a consumed token presented again is worth recording loudly.
+-- name: LinkTokenByHash :one
+SELECT id, kind, tenant_id, user_id, address, expires_at, consumed_at, created_at
+  FROM link_token
+ WHERE token_hash = @token_hash;
+
+-- Consumes a token, and only if it is still unconsumed.
+--
+-- The WHERE clause is the single-use rule. Two requests racing with the same link both read
+-- an unconsumed row; only one updates one, and the other is told the token is spent. Doing
+-- this check in Go would leave a window between the read and the write.
+-- name: ConsumeLinkToken :execrows
+UPDATE link_token SET consumed_at = now()
+ WHERE id = @id AND consumed_at IS NULL AND expires_at > now();
+
+-- Invalidates every other outstanding token of one kind for a user (§8).
+-- Two live reset links is one more than anyone needs.
+-- name: ConsumeOtherLinkTokens :execrows
+UPDATE link_token SET consumed_at = now()
+ WHERE tenant_id = @tenant_id AND user_id = @user_id AND kind = @kind
+   AND id <> @keep_id AND consumed_at IS NULL;
+
+-- name: DeleteExpiredLinkTokens :execrows
+DELETE FROM link_token WHERE expires_at < @before;
+
+-- The name a person sees in an emailed message. Read inside the transaction that queues
+-- the message, rather than passed in by the caller: every call site would otherwise have
+-- to remember, and the one that forgot sent "Sign in to ten_acme" to a real person.
+-- name: TenantDisplayName :one
+SELECT name FROM tenant WHERE id = @tenant_id;

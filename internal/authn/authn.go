@@ -94,6 +94,10 @@ type Authenticator struct {
 	cache    cache.Cache
 	webAuthn WebAuthnOptions
 
+	// issuer roots the URL in every emailed link. Without it a link would be relative,
+	// which is no link at all in a mail client.
+	issuer string
+
 	audit *audit.Writer
 
 	// policies caches per-tenant policy. A password change is rare and this is not on
@@ -128,6 +132,8 @@ type Options struct {
 	// the right answer for a deployment on plain http — a browser refuses WebAuthn there
 	// anyway, and offering it would be a button that never works.
 	WebAuthn WebAuthnOptions
+	// Issuer roots the URL in every emailed link.
+	Issuer string
 }
 
 // New builds an Authenticator.
@@ -146,6 +152,7 @@ func New(tenant, system *store.Store, opts Options) (*Authenticator, error) {
 		refresh:  opts.Refresh,
 		cache:    opts.Cache,
 		webAuthn: opts.WebAuthn,
+		issuer:   opts.Issuer,
 	}
 	if a.params == (Params{}) {
 		a.params = DefaultParams()

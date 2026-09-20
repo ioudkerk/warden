@@ -57,6 +57,15 @@ type Querier interface {
 	// Suppressed addresses are filtered here rather than at send time, so a suppressed message
 	// is never claimed at all.
 	ClaimOutboundEmail(ctx context.Context, batchSize int32) ([]ClaimOutboundEmailRow, error)
+	// Consumes a token, and only if it is still unconsumed.
+	//
+	// The WHERE clause is the single-use rule. Two requests racing with the same link both read
+	// an unconsumed row; only one updates one, and the other is told the token is spent. Doing
+	// this check in Go would leave a window between the read and the write.
+	ConsumeLinkToken(ctx context.Context, id string) (int64, error)
+	// Invalidates every other outstanding token of one kind for a user (§8).
+	// Two live reset links is one more than anyone needs.
+	ConsumeOtherLinkTokens(ctx context.Context, arg ConsumeOtherLinkTokensParams) (int64, error)
 	// Consumes a token, but only if it is still unconsumed. The row count is what settles
 	// a race: the loser updates nothing and is treated as a replay.
 	ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error)
@@ -72,6 +81,7 @@ type Querier interface {
 	DeactivateOAuthSession(ctx context.Context, arg DeactivateOAuthSessionParams) (int64, error)
 	DeclaredUIElementKeys(ctx context.Context, applicationID string) ([]string, error)
 	DeleteExpiredDeviceAuthorizations(ctx context.Context, before time.Time) (int64, error)
+	DeleteExpiredLinkTokens(ctx context.Context, before time.Time) (int64, error)
 	DeleteExpiredOAuthSessions(ctx context.Context, before time.Time) (int64, error)
 	DeleteExpiredRefreshTokens(ctx context.Context, before time.Time) (int64, error)
 	// Sessions whose absolute lifetime has passed are of no further interest to anyone;
@@ -124,6 +134,10 @@ type Querier interface {
 	// Grants
 	// ---------------------------------------------------------------------------------
 	InsertGrant(ctx context.Context, arg InsertGrantParams) error
+	// ---------------------------------------------------------------------------------
+	// Emailed links (docs/design-email.md §8)
+	// ---------------------------------------------------------------------------------
+	InsertLinkToken(ctx context.Context, arg InsertLinkTokenParams) error
 	InsertOAuthClient(ctx context.Context, arg InsertOAuthClientParams) error
 	// ---------------------------------------------------------------------------------
 	// Provider storage (the fosite adapter)
@@ -178,6 +192,13 @@ type Querier interface {
 	// Redemption invalidates every other outstanding token for the same user
 	// (docs/design-email.md §8). Two live setup links is one more than anyone needs.
 	InvalidateOtherSetupTokens(ctx context.Context, arg InvalidateOtherSetupTokensParams) (int64, error)
+	// Resolves a token to its row. System pool: the token arrives in a URL with nothing else
+	// attached, so there is no tenant to scope the read by until this returns one.
+	//
+	// Returned whatever its state. "Expired", "already used" and "never existed" have to be
+	// distinguishable here — the caller answers them identically, but only the first two are
+	// worth recording, and a consumed token presented again is worth recording loudly.
+	LinkTokenByHash(ctx context.Context, tokenHash []byte) (LinkTokenByHashRow, error)
 	ListOAuthClients(ctx context.Context, tenantID string) ([]ListOAuthClientsRow, error)
 	ListSigningKeys(ctx context.Context) ([]ListSigningKeysRow, error)
 	// The administrative audit log (internal/audit).
@@ -191,10 +212,17 @@ type Querier interface {
 	// forever after. A row lock is not enough — FOR UPDATE on an empty table locks
 	// nothing — so this is an advisory lock, held for the transaction.
 	LockAuditChain(ctx context.Context, pgAdvisoryXactLock int64) error
-	// A permanent failure, or one that has run out of attempts.
+	// A permanent failure, or one that has run out of attempts. The payload goes with it: the
+	// message will not be sent, so the sealed token in it has no further use.
 	MarkEmailFailed(ctx context.Context, arg MarkEmailFailedParams) error
 	// A transient failure: try again later, with the backoff the caller computed.
 	MarkEmailRetrying(ctx context.Context, arg MarkEmailRetryingParams) error
+	// Marks a message sent, and empties the payload.
+	//
+	// Emptying it is the point. The payload carries the link token, sealed under the KEK,
+	// because a message cannot be rendered without one and the token cannot be read back out of
+	// link_token — that table holds only a hash. Sealed and short-lived is the compromise;
+	// leaving it in a row that is kept for observability would make it neither.
 	MarkEmailSent(ctx context.Context, id string) error
 	MarkEmailSuppressed(ctx context.Context, id string) error
 	// Action implication is expanded at load, never during a check (SPEC §9.2).
@@ -367,6 +395,10 @@ type Querier interface {
 	// and no application in the request, the caller takes the strictest level across the
 	// tenant's enrolled applications.
 	TenantDecisionLogLevels(ctx context.Context, tenantID string) ([]string, error)
+	// The name a person sees in an emailed message. Read inside the transaction that queues
+	// the message, rather than passed in by the caller: every call site would otherwise have
+	// to remember, and the one that forgot sent "Sign in to ten_acme" to a real person.
+	TenantDisplayName(ctx context.Context, tenantID string) (string, error)
 	// ---------------------------------------------------------------------------------
 	// Tenancy
 	// ---------------------------------------------------------------------------------

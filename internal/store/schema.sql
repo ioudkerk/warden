@@ -406,6 +406,69 @@ CREATE TABLE public.denial (
 ALTER TABLE ONLY public.denial FORCE ROW LEVEL SECURITY;
 
 --
+-- Name: device_authorization; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.device_authorization (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    client_id text NOT NULL,
+    device_code_hash bytea NOT NULL,
+    user_code_hash bytea NOT NULL,
+    requested_scope text[] DEFAULT '{}'::text[] NOT NULL,
+    granted_scope text[] DEFAULT '{}'::text[] NOT NULL,
+    requested_audience text[] DEFAULT '{}'::text[] NOT NULL,
+    granted_audience text[] DEFAULT '{}'::text[] NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    subject text DEFAULT ''::text NOT NULL,
+    session_id text,
+    interval_seconds integer DEFAULT 5 NOT NULL,
+    last_polled_at timestamp with time zone,
+    approved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT device_authorization_approved_has_subject CHECK (((status <> 'approved'::text) OR ((subject <> ''::text) AND (session_id IS NOT NULL)))),
+    CONSTRAINT device_authorization_device_hash_is_sha256 CHECK ((octet_length(device_code_hash) = 32)),
+    CONSTRAINT device_authorization_id_check CHECK ((id ~~ 'dev\_%'::text)),
+    CONSTRAINT device_authorization_interval_positive CHECK ((interval_seconds > 0)),
+    CONSTRAINT device_authorization_status_valid CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'denied'::text, 'redeemed'::text]))),
+    CONSTRAINT device_authorization_user_hash_is_sha256 CHECK ((octet_length(user_code_hash) = 32))
+);
+
+ALTER TABLE ONLY public.device_authorization FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: TABLE device_authorization; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.device_authorization IS 'RFC 8628 device grant state (SPEC §7.7). One row per device authorization, from the device''s request to the moment its tokens are issued.';
+
+--
+-- Name: COLUMN device_authorization.user_code_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.device_authorization.user_code_hash IS 'SHA-256 of the code a person types. Short by necessity, so the verification endpoint rate-limits guesses (RFC 8628 §5.1).';
+
+--
+-- Name: email_suppression; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.email_suppression (
+    address public.citext NOT NULL,
+    reason text NOT NULL,
+    suppressed_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_bounce_at timestamp with time zone,
+    note text,
+    CONSTRAINT email_suppression_reason_valid CHECK ((reason = ANY (ARRAY['hard_bounce'::text, 'complaint'::text, 'manual'::text])))
+);
+
+--
+-- Name: TABLE email_suppression; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.email_suppression IS 'Addresses that must not be sent to (docs/design-email.md §6). Deployment-wide, because a bounce is a property of the address and the sending reputation is shared.';
+
+--
 -- Name: environment; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -551,6 +614,168 @@ ALTER TABLE ONLY public.idp_connection FORCE ROW LEVEL SECURITY;
 COMMENT ON COLUMN public.idp_connection.email_trusted IS 'Allows linking a federated login to a local account by email. A known account-takeover vector when the upstream IdP does not verify addresses (SPEC §7.4.1). Defaults to false.';
 
 --
+-- Name: link_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.link_token (
+    id text NOT NULL,
+    kind text NOT NULL,
+    tenant_id text NOT NULL,
+    user_id text NOT NULL,
+    token_hash bytea NOT NULL,
+    address public.citext,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    requested_ip text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT link_token_hash_is_sha256 CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT link_token_id_check CHECK ((id ~~ 'lnk\_%'::text)),
+    CONSTRAINT link_token_kind_valid CHECK ((kind = ANY (ARRAY['magic_link'::text, 'password_reset'::text, 'verify_email'::text, 'invitation'::text])))
+);
+
+--
+-- Name: TABLE link_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.link_token IS 'Single-use emailed links (docs/design-email.md §8). Hashed at rest; consumed in the transaction that acts on them, so a replay loses the race.';
+
+--
+-- Name: oauth_client; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oauth_client (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    key text NOT NULL,
+    name text NOT NULL,
+    public boolean DEFAULT true NOT NULL,
+    secret_hash text,
+    redirect_uris text[] DEFAULT '{}'::text[] NOT NULL,
+    grant_types text[] DEFAULT '{authorization_code,refresh_token}'::text[] NOT NULL,
+    response_types text[] DEFAULT '{code}'::text[] NOT NULL,
+    scopes text[] DEFAULT '{openid,profile,email}'::text[] NOT NULL,
+    audiences text[] DEFAULT '{}'::text[] NOT NULL,
+    token_endpoint_auth_method text DEFAULT 'none'::text NOT NULL,
+    post_logout_redirect_uris text[] DEFAULT '{}'::text[] NOT NULL,
+    require_pkce boolean DEFAULT true NOT NULL,
+    disabled_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    token_attributes text[] DEFAULT '{}'::text[] NOT NULL,
+    token_claims text[] DEFAULT '{}'::text[] NOT NULL,
+    CONSTRAINT oauth_client_auth_method_matches_kind CHECK (((public AND (token_endpoint_auth_method = 'none'::text)) OR ((NOT public) AND (token_endpoint_auth_method <> 'none'::text)))),
+    CONSTRAINT oauth_client_auth_method_valid CHECK ((token_endpoint_auth_method = ANY (ARRAY['none'::text, 'client_secret_basic'::text, 'client_secret_post'::text, 'private_key_jwt'::text]))),
+    CONSTRAINT oauth_client_code_flow_needs_redirect CHECK (((NOT ('authorization_code'::text = ANY (grant_types))) OR (cardinality(redirect_uris) > 0))),
+    CONSTRAINT oauth_client_id_check CHECK ((id ~~ 'oac\_%'::text)),
+    CONSTRAINT oauth_client_no_forbidden_grants CHECK ((NOT (grant_types && ARRAY['implicit'::text, 'password'::text, 'client_credentials_jwt'::text]))),
+    CONSTRAINT oauth_client_no_forbidden_response_types CHECK ((NOT (response_types && ARRAY['token'::text, 'id_token token'::text, 'code token'::text, 'code id_token token'::text]))),
+    CONSTRAINT oauth_client_public_requires_pkce CHECK (((NOT public) OR require_pkce)),
+    CONSTRAINT oauth_client_secret_matches_kind CHECK (((public AND (secret_hash IS NULL)) OR ((NOT public) AND (secret_hash IS NOT NULL)))),
+    CONSTRAINT oauth_client_token_claims_valid CHECK ((token_claims <@ ARRAY['roles'::text, 'groups'::text]))
+);
+
+ALTER TABLE ONLY public.oauth_client FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: TABLE oauth_client; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.oauth_client IS 'An OAuth 2.0 / OIDC client (SPEC §7.7). Distinct from `application`, which declares a permission surface.';
+
+--
+-- Name: COLUMN oauth_client.id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.oauth_client.id IS 'The protocol client_id. Opaque and deployment-unique: the token endpoint resolves it before any tenant scope exists.';
+
+--
+-- Name: COLUMN oauth_client.redirect_uris; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.oauth_client.redirect_uris IS 'Exact-match allowlist. No wildcards — the comparison is string equality (SPEC §17).';
+
+--
+-- Name: COLUMN oauth_client.token_attributes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.oauth_client.token_attributes IS 'Allowlist of app_user.attributes keys this client''s access tokens may carry in wd.attrs (SPEC §8.2). Empty means none.';
+
+--
+-- Name: COLUMN oauth_client.token_claims; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.oauth_client.token_claims IS 'Authorization facts this client''s access tokens may carry in wd (SPEC §8.2): any of roles, groups. Empty means none, which is the default — Warden decides, the token does not.';
+
+--
+-- Name: oauth_session; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oauth_session (
+    signature_hash bytea NOT NULL,
+    kind text NOT NULL,
+    tenant_id text NOT NULL,
+    request_id text NOT NULL,
+    client_id text NOT NULL,
+    subject text DEFAULT ''::text NOT NULL,
+    session_id text,
+    requested_scope text[] DEFAULT '{}'::text[] NOT NULL,
+    granted_scope text[] DEFAULT '{}'::text[] NOT NULL,
+    requested_audience text[] DEFAULT '{}'::text[] NOT NULL,
+    granted_audience text[] DEFAULT '{}'::text[] NOT NULL,
+    form jsonb DEFAULT '{}'::jsonb NOT NULL,
+    session_data jsonb DEFAULT '{}'::jsonb NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT oauth_session_hash_is_sha256 CHECK ((octet_length(signature_hash) = 32)),
+    CONSTRAINT oauth_session_kind_valid CHECK ((kind = ANY (ARRAY['authorize_code'::text, 'access_token'::text, 'pkce'::text, 'openid'::text, 'par'::text, 'client_assertion'::text])))
+);
+
+ALTER TABLE ONLY public.oauth_session FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: TABLE oauth_session; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.oauth_session IS 'Short-lived OpenID Provider artifacts (SPEC §7.7). Refresh tokens are NOT here; they live in refresh_token, which carries the family rotation of SPEC §8.3.';
+
+--
+-- Name: COLUMN oauth_session.active; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.oauth_session.active IS 'False once an authorization code has been exchanged. Deactivated rather than deleted so that a replayed code is distinguishable from an unknown one.';
+
+--
+-- Name: outbound_email; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.outbound_email (
+    id text NOT NULL,
+    tenant_id text,
+    to_address public.citext NOT NULL,
+    template text NOT NULL,
+    locale text DEFAULT 'en'::text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    sent_at timestamp with time zone,
+    CONSTRAINT outbound_email_attempts_sane CHECK ((attempts >= 0)),
+    CONSTRAINT outbound_email_id_check CHECK ((id ~~ 'eml\_%'::text)),
+    CONSTRAINT outbound_email_status_valid CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'suppressed'::text])))
+);
+
+ALTER TABLE ONLY public.outbound_email FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: COLUMN outbound_email.payload; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.outbound_email.payload IS 'Template data. Never the token: that is read from its own table at send time, so this row is not a second copy of a credential.';
+
+--
 -- Name: permission; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -586,11 +811,23 @@ CREATE TABLE public.refresh_token (
     expires_at timestamp with time zone NOT NULL,
     consumed_at timestamp with time zone,
     revoked_at timestamp with time zone,
+    request_id text,
+    subject text DEFAULT ''::text NOT NULL,
+    granted_scope text[] DEFAULT '{}'::text[] NOT NULL,
+    granted_audience text[] DEFAULT '{}'::text[] NOT NULL,
+    form jsonb DEFAULT '{}'::jsonb NOT NULL,
+    session_data jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT refresh_token_hash_is_sha256 CHECK ((octet_length(token_hash) = 32)),
     CONSTRAINT refresh_token_id_check CHECK ((id ~~ 'rft\_%'::text))
 );
 
 ALTER TABLE ONLY public.refresh_token FORCE ROW LEVEL SECURITY;
+
+--
+-- Name: COLUMN refresh_token.request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.refresh_token.request_id IS 'fosite''s request id, tying this token to the exchange that produced it. Null for tokens issued through the internal API rather than the token endpoint.';
 
 --
 -- Name: resource_node; Type: TABLE; Schema: public; Owner: -
@@ -1003,6 +1240,20 @@ ALTER TABLE ONLY public.denial
     ADD CONSTRAINT denial_pkey PRIMARY KEY (id);
 
 --
+-- Name: device_authorization device_authorization_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.device_authorization
+    ADD CONSTRAINT device_authorization_pkey PRIMARY KEY (id);
+
+--
+-- Name: email_suppression email_suppression_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_suppression
+    ADD CONSTRAINT email_suppression_pkey PRIMARY KEY (address);
+
+--
 -- Name: environment environment_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1043,6 +1294,34 @@ ALTER TABLE ONLY public.identity
 
 ALTER TABLE ONLY public.idp_connection
     ADD CONSTRAINT idp_connection_pkey PRIMARY KEY (id);
+
+--
+-- Name: link_token link_token_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.link_token
+    ADD CONSTRAINT link_token_pkey PRIMARY KEY (id);
+
+--
+-- Name: oauth_client oauth_client_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oauth_client
+    ADD CONSTRAINT oauth_client_pkey PRIMARY KEY (id);
+
+--
+-- Name: oauth_session oauth_session_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oauth_session
+    ADD CONSTRAINT oauth_session_pkey PRIMARY KEY (kind, signature_hash);
+
+--
+-- Name: outbound_email outbound_email_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.outbound_email
+    ADD CONSTRAINT outbound_email_pkey PRIMARY KEY (id);
 
 --
 -- Name: permission permission_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -1327,6 +1606,30 @@ CREATE INDEX decision_event_default_tenant_id_subject_id_occurred_at_idx ON publ
 CREATE INDEX denial_tenant_idx ON public.denial USING btree (tenant_id);
 
 --
+-- Name: device_authorization_device_code_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX device_authorization_device_code_key ON public.device_authorization USING btree (device_code_hash);
+
+--
+-- Name: device_authorization_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX device_authorization_expiry_idx ON public.device_authorization USING btree (expires_at);
+
+--
+-- Name: device_authorization_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX device_authorization_tenant_idx ON public.device_authorization USING btree (tenant_id);
+
+--
+-- Name: device_authorization_user_code_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX device_authorization_user_code_key ON public.device_authorization USING btree (user_code_hash);
+
+--
 -- Name: environment_application_name_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1435,6 +1738,72 @@ CREATE INDEX idp_connection_tenant_id_idx ON public.idp_connection USING btree (
 CREATE UNIQUE INDEX idp_connection_tenant_name_key ON public.idp_connection USING btree (tenant_id, name);
 
 --
+-- Name: link_token_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX link_token_expiry_idx ON public.link_token USING btree (expires_at);
+
+--
+-- Name: link_token_hash_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX link_token_hash_key ON public.link_token USING btree (token_hash);
+
+--
+-- Name: link_token_user_kind_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX link_token_user_kind_idx ON public.link_token USING btree (tenant_id, user_id, kind) WHERE (consumed_at IS NULL);
+
+--
+-- Name: oauth_client_tenant_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oauth_client_tenant_id_idx ON public.oauth_client USING btree (tenant_id);
+
+--
+-- Name: oauth_client_tenant_key_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX oauth_client_tenant_key_key ON public.oauth_client USING btree (tenant_id, key);
+
+--
+-- Name: oauth_session_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oauth_session_expiry_idx ON public.oauth_session USING btree (expires_at);
+
+--
+-- Name: oauth_session_request_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oauth_session_request_idx ON public.oauth_session USING btree (request_id);
+
+--
+-- Name: oauth_session_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oauth_session_session_idx ON public.oauth_session USING btree (session_id) WHERE (session_id IS NOT NULL);
+
+--
+-- Name: oauth_session_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oauth_session_tenant_idx ON public.oauth_session USING btree (tenant_id);
+
+--
+-- Name: outbound_email_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX outbound_email_pending_idx ON public.outbound_email USING btree (next_attempt_at) WHERE (status = 'pending'::text);
+
+--
+-- Name: outbound_email_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX outbound_email_tenant_idx ON public.outbound_email USING btree (tenant_id);
+
+--
 -- Name: permission_application_key_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1469,6 +1838,12 @@ CREATE INDEX refresh_token_family_idx ON public.refresh_token USING btree (famil
 --
 
 CREATE UNIQUE INDEX refresh_token_hash_key ON public.refresh_token USING btree (token_hash);
+
+--
+-- Name: refresh_token_request_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX refresh_token_request_idx ON public.refresh_token USING btree (request_id) WHERE (request_id IS NOT NULL);
 
 --
 -- Name: refresh_token_session_idx; Type: INDEX; Schema: public; Owner: -
@@ -1747,6 +2122,12 @@ CREATE TRIGGER audit_event_no_update BEFORE UPDATE ON public.audit_event FOR EAC
 CREATE TRIGGER group_set_updated_at BEFORE UPDATE ON public.group_ FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
 
 --
+-- Name: oauth_client oauth_client_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER oauth_client_set_updated_at BEFORE UPDATE ON public.oauth_client FOR EACH ROW EXECUTE FUNCTION public.warden_set_updated_at();
+
+--
 -- Name: resource_node resource_node_set_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -1865,6 +2246,20 @@ ALTER TABLE ONLY public.denial
     ADD CONSTRAINT denial_user_fkey FOREIGN KEY (subject_user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
 
 --
+-- Name: device_authorization device_authorization_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.device_authorization
+    ADD CONSTRAINT device_authorization_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.oauth_client(id) ON DELETE CASCADE;
+
+--
+-- Name: device_authorization device_authorization_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.device_authorization
+    ADD CONSTRAINT device_authorization_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
 -- Name: environment environment_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1968,6 +2363,48 @@ ALTER TABLE ONLY public.identity
 
 ALTER TABLE ONLY public.idp_connection
     ADD CONSTRAINT idp_connection_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: link_token link_token_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.link_token
+    ADD CONSTRAINT link_token_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: link_token link_token_user_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.link_token
+    ADD CONSTRAINT link_token_user_fkey FOREIGN KEY (user_id, tenant_id) REFERENCES public.app_user(id, tenant_id) ON DELETE CASCADE;
+
+--
+-- Name: oauth_client oauth_client_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oauth_client
+    ADD CONSTRAINT oauth_client_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: oauth_session oauth_session_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oauth_session
+    ADD CONSTRAINT oauth_session_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.oauth_client(id) ON DELETE CASCADE;
+
+--
+-- Name: oauth_session oauth_session_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oauth_session
+    ADD CONSTRAINT oauth_session_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
+
+--
+-- Name: outbound_email outbound_email_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.outbound_email
+    ADD CONSTRAINT outbound_email_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(id);
 
 --
 -- Name: permission permission_action_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
@@ -2221,6 +2658,12 @@ ALTER TABLE public.decision_event_default ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.denial ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: device_authorization; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.device_authorization ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: grant_; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2249,6 +2692,24 @@ ALTER TABLE public.identity ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.idp_connection ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: oauth_client; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.oauth_client ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: oauth_session; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.oauth_session ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: outbound_email; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.outbound_email ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: refresh_token; Type: ROW SECURITY; Schema: public; Owner: -
@@ -2341,6 +2802,12 @@ CREATE POLICY tenant_isolation ON public.decision_event_default USING ((tenant_i
 CREATE POLICY tenant_isolation ON public.denial USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
 
 --
+-- Name: device_authorization tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.device_authorization USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
 -- Name: grant_ tenant_isolation; Type: POLICY; Schema: public; Owner: -
 --
 
@@ -2369,6 +2836,24 @@ CREATE POLICY tenant_isolation ON public.identity USING ((tenant_id = current_se
 --
 
 CREATE POLICY tenant_isolation ON public.idp_connection USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: oauth_client tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.oauth_client USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: oauth_session tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.oauth_session USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
+
+--
+-- Name: outbound_email tenant_isolation; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY tenant_isolation ON public.outbound_email USING ((tenant_id = current_setting('warden.tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('warden.tenant_id'::text, true)));
 
 --
 -- Name: refresh_token tenant_isolation; Type: POLICY; Schema: public; Owner: -

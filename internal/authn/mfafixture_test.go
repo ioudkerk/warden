@@ -61,6 +61,7 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 		Audit:   audit.NewWriter(),
 		Keyring: keyring,
 		Cache:   cacheClient,
+		Issuer:  "https://warden.example.com",
 		WebAuthn: authn.WebAuthnOptions{
 			RPDisplayName: "Warden", RPID: testRPID, Origins: []string{testOrigin},
 		},

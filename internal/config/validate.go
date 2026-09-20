@@ -291,7 +291,7 @@ func (c *Config) validateCache(errs *Errors) {
 		// An in-process cache cannot fan out change events (SPEC §10.5), so a
 		// multi-replica deployment using it would serve stale permissions after a
 		// revocation — the exact failure the change stream exists to prevent.
-		if c.Environment == EnvProduction {
+		if c.Environment.IsProduction() {
 			errs.add("cache.backend", "in-process is single-node only and cannot propagate permission changes between replicas; use redis in production")
 		}
 		if !c.Cache.URL.IsZero() {
@@ -319,7 +319,7 @@ func (c *Config) validateEmail(errs *Errors, lookupEnv secrets.LookupEnvFunc, re
 		// Nothing else matters: this deployment has turned email off deliberately.
 		return
 	case EmailStdout:
-		if c.Environment == EnvProduction {
+		if c.Environment.IsProduction() {
 			errs.add("email.sender",
 				"stdout writes credentials to the log and must not be used in production; "+
 					"use smtp, or noop if this deployment sends no email")
@@ -362,14 +362,19 @@ func (c *Config) validateSMTP(errs *Errors, lookupEnv secrets.LookupEnvFunc, rea
 	switch c.Email.SMTP.TLS {
 	case SMTPStartTLS, SMTPImplicit:
 	case SMTPDisabled:
-		// Loopback only. An SMTP session in the clear carries the credential these
-		// messages exist to deliver, so the one place it is tolerable is a connection
-		// that never leaves the machine — which is what a local Mailpit is.
-		if !isLoopbackHost(c.Email.SMTP.Host) {
+		// An SMTP session in the clear carries the credential the message exists to
+		// deliver, so in production this is allowed only for a connection that never
+		// leaves the machine.
+		//
+		// Outside production it is allowed anywhere, and that is not laziness: the
+		// development stack talks to a Mailpit container by name, which is not loopback
+		// and never will be. The same shape as the in-process cache and the stdout
+		// sender — permitted where it is convenient, refused where it would matter.
+		if c.Environment.IsProduction() && !isLoopbackHost(c.Email.SMTP.Host) {
 			errs.add("email.smtp.tls",
-				fmt.Sprintf("may only be disabled for a loopback host (got %q); an SMTP "+
-					"session in the clear carries the credential the message exists to deliver",
-					c.Email.SMTP.Host))
+				fmt.Sprintf("may only be disabled for a loopback host in production (got %q); "+
+					"an SMTP session in the clear carries the credential the message exists "+
+					"to deliver", c.Email.SMTP.Host))
 		}
 	case "":
 		errs.add("email.smtp.tls", "must be set to starttls, implicit or disabled")

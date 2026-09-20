@@ -424,7 +424,11 @@ func (p *Provider) Discovery(algorithms []string) Discovery {
 		algorithms = []string{AlgRS256}
 	}
 	return Discovery{
-		Issuer:                             base + "/",
+		// Exactly what goes in the "iss" claim, with no trailing slash added. OpenID
+		// Connect Discovery §4.3 requires the two to be identical, and a certified
+		// relying party compares them as strings: an extra slash here and every token
+		// this deployment issues is refused by every client that checks.
+		Issuer:                             base,
 		AuthorizationEndpoint:              base + "/oauth2/authorize",
 		TokenEndpoint:                      base + "/oauth2/token",
 		UserinfoEndpoint:                   base + "/oauth2/userinfo",

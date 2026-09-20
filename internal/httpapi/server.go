@@ -49,6 +49,7 @@ type Server struct {
 	provider  *oidcop.Provider
 	authn     *authn.Authenticator
 	lockout   *authn.Lockout
+	refresh   *authn.RefreshTokens
 	// level is the decision log level, read from the application's configuration.
 	// Cached per tenant so the hot path does not query for it on every decision.
 	levels sync.Map // tenant id -> decisionlog.Level
@@ -93,6 +94,8 @@ type Deps struct {
 	// answer 503 rather than serving a form that cannot work.
 	Authn   *authn.Authenticator
 	Lockout *authn.Lockout
+	// Refresh is revoked alongside sessions when a password is reset (SPEC §7.2).
+	Refresh *authn.RefreshTokens
 }
 
 // New builds the server.
@@ -111,7 +114,7 @@ func New(d Deps) (*Server, error) {
 		tenant: d.Tenant, system: d.System, decisions: d.Decisions,
 		metrics: d.Metrics, cache: d.Cache, tracer: tracerOf(d.Tracing),
 		keys: d.Keys, sessions: d.Sessions, provider: d.Provider,
-		authn: d.Authn, lockout: d.Lockout,
+		authn: d.Authn, lockout: d.Lockout, refresh: d.Refresh,
 	}, nil
 }
 
@@ -207,6 +210,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /oauth2/token", s.requireProvider(s.handleToken))
 	mux.HandleFunc("GET /login", s.requireLogin(s.handleLoginForm))
 	mux.HandleFunc("POST /login", s.requireLogin(s.handleLoginSubmit))
+
+	// Emailed links (M1-9). The request endpoints answer identically whether or not the
+	// address has an account, which is why they are ordinary pages rather than an API.
+	mux.HandleFunc("GET /login/magic", s.requireLogin(s.handleMagicLinkForm))
+	mux.HandleFunc("POST /login/magic", s.requireLogin(s.handleMagicLinkSubmit))
+	mux.HandleFunc("GET /login/link", s.requireLogin(s.handleMagicLinkRedeem))
+	mux.HandleFunc("GET /password/forgot", s.requireLogin(s.handlePasswordResetRequestForm))
+	mux.HandleFunc("POST /password/forgot", s.requireLogin(s.handlePasswordResetRequest))
+	mux.HandleFunc("GET /password/reset", s.requireLogin(s.handlePasswordResetForm))
+	mux.HandleFunc("POST /password/reset", s.requireLogin(s.handlePasswordResetSubmit))
 
 	// The second step. A separate path rather than a mode of /login, so that a
 	// half-finished login is never one parameter away from looking like a finished one.

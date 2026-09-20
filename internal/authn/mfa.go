@@ -426,6 +426,10 @@ const (
 	AMRWebAuthn     = "webauthn"
 	AMRRecoveryCode = "rc"
 	AMRMFA          = "mfa"
+	// AMRMagicLink is RFC 8176's value for a link sent to a registered address. It is
+	// one factor, not two: it proves control of a mailbox, which is why a magic link
+	// still meets a second factor when the account has one.
+	AMRMagicLink = "mail"
 )
 
 func (a *Authenticator) recordFactorEvent(ctx context.Context, tenantID, userID, action, factorType, reason string) {

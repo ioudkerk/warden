@@ -21,6 +21,7 @@ import (
 	"github.com/warden-project/warden/internal/authn"
 	"github.com/warden-project/warden/internal/cache"
 	"github.com/warden-project/warden/internal/config"
+	"github.com/warden-project/warden/internal/email"
 	"github.com/warden-project/warden/internal/httpapi"
 	"github.com/warden-project/warden/internal/keys"
 	"github.com/warden-project/warden/internal/oidcop"
@@ -62,6 +63,11 @@ type oidcFixture struct {
 	rivalSecret   string
 	audience      string
 	postLogoutURI string
+
+	// queue and sender let a test drain what a request queued, so the link it follows is
+	// the link a person would receive.
+	queue  *email.Queue
+	sender *captureSender
 
 	email    string
 	password string
@@ -208,7 +214,8 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		Audit: audit.NewWriter(),
 		// WebAuthn: the cache holds a challenge between the two requests, and the
 		// relying party is the fixture's own issuer.
-		Cache: cacheClient,
+		Cache:  cacheClient,
+		Issuer: issuer,
 		WebAuthn: authn.WebAuthnOptions{
 			RPDisplayName: "Warden test",
 			RPID:          "warden.test",
@@ -257,8 +264,10 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
 	}
-	const email, password = "maria@acme.test", "correct horse battery staple"
-	userID, err := p.CreateUser(ctx, "acme", email, nil)
+	// Not named `email`: that shadows the package of the same name, and the fixture
+	// builds an email queue a few lines below.
+	const userEmail, password = "maria@acme.test", "correct horse battery staple"
+	userID, err := p.CreateUser(ctx, "acme", userEmail, nil)
 	if err != nil {
 		t.Fatalf("user: %v", err)
 	}
@@ -367,11 +376,21 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		t.Fatalf("rival client: %v", err)
 	}
 
+	// The queue a test drains, so the link it follows is the link a person would receive:
+	// sealed into the payload at enqueue time and opened again at send time.
+	capture := &captureSender{}
+	queue, err := email.NewQueue(tenantPool, system, email.QueueOptions{
+		Sender: capture, Log: log, TokenFor: authenticator.EmailLinkResolver(),
+	})
+	if err != nil {
+		t.Fatalf("email queue: %v", err)
+	}
+
 	deps := httpapi.Deps{
 		Config: cfg, Log: log,
 		Tenant: tenantPool, System: system,
 		Cache: cacheClient, Keys: km, Sessions: sessions,
-		Provider: provider, Authn: authenticator, Lockout: lockout,
+		Provider: provider, Authn: authenticator, Lockout: lockout, Refresh: refresh,
 	}
 	server, err := httpapi.New(deps)
 	if err != nil {
@@ -388,7 +407,8 @@ func newOIDCFixture(t *testing.T) *oidcFixture {
 		confidential: confidential, confidentialSecret: confidentialSecret,
 		legacy:        legacy,
 		postLogoutURI: postLogoutURI,
-		email:         email, password: password, userID: userID, tenantID: tenantID,
+		queue:         queue, sender: capture,
+		email: userEmail, password: password, userID: userID, tenantID: tenantID,
 		cfg: cfg, deps: deps,
 	}
 }

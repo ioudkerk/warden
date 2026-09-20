@@ -68,6 +68,18 @@ func (s *Server) pendingCookieName() string {
 func (s *Server) beginSecondFactor(
 	w http.ResponseWriter, r *http.Request, tenantID, userID, email, returnTo string,
 ) {
+	s.beginSecondFactorWithAMR(w, r, tenantID, userID, email, returnTo, authn.AMRPassword)
+}
+
+// beginSecondFactorWithAMR is beginSecondFactor for a first factor that was not a password.
+//
+// A magic link is the other way in, and what it proved has to travel with the pending login:
+// the session that eventually exists should say `mail` rather than `pwd`, because `amr` is
+// what a role's requires_mfa constraint is evaluated against and claiming the wrong factor
+// there is worse than claiming none.
+func (s *Server) beginSecondFactorWithAMR(
+	w http.ResponseWriter, r *http.Request, tenantID, userID, email, returnTo, firstFactor string,
+) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		s.log.Error("generating a pending-login identifier", "error", err)
@@ -79,7 +91,7 @@ func (s *Server) beginSecondFactor(
 
 	pending := pendingLogin{
 		TenantID: tenantID, UserID: userID, Email: email,
-		AMR:      []string{authn.AMRPassword},
+		AMR:      []string{firstFactor},
 		ReturnTo: returnTo, StartedAt: time.Now().UTC(), IP: s.clientIP(r),
 	}
 	encoded, err := json.Marshal(pending)

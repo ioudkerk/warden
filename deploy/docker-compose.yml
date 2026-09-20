@@ -28,6 +28,15 @@ x-warden-env: &warden-env
   WARDEN_CACHE_URL: redis://redis:6379/0
   WARDEN_SECURITY_KEK: file:/var/lib/warden/kek
 
+  # Email through the Mailpit container, read at http://localhost:8025. TLS is off
+  # because Mailpit is reached by container name on a private network and speaks no
+  # TLS — permitted outside production, and refused there unless the host is loopback.
+  WARDEN_EMAIL_SENDER: smtp
+  WARDEN_EMAIL_FROM: "Warden <no-reply@warden.test>"
+  WARDEN_EMAIL_SMTP_HOST: mailpit
+  WARDEN_EMAIL_SMTP_PORT: "1025"
+  WARDEN_EMAIL_SMTP_TLS: disabled
+
 services:
   postgres:
     image: postgres:16-alpine

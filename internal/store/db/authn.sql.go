@@ -154,6 +154,52 @@ func (q *Queries) ClaimOutboundEmail(ctx context.Context, batchSize int32) ([]Cl
 	return items, nil
 }
 
+const consumeLinkToken = `-- name: ConsumeLinkToken :execrows
+UPDATE link_token SET consumed_at = now()
+ WHERE id = $1 AND consumed_at IS NULL AND expires_at > now()
+`
+
+// Consumes a token, and only if it is still unconsumed.
+//
+// The WHERE clause is the single-use rule. Two requests racing with the same link both read
+// an unconsumed row; only one updates one, and the other is told the token is spent. Doing
+// this check in Go would leave a window between the read and the write.
+func (q *Queries) ConsumeLinkToken(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeLinkToken, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const consumeOtherLinkTokens = `-- name: ConsumeOtherLinkTokens :execrows
+UPDATE link_token SET consumed_at = now()
+ WHERE tenant_id = $1 AND user_id = $2 AND kind = $3
+   AND id <> $4 AND consumed_at IS NULL
+`
+
+type ConsumeOtherLinkTokensParams struct {
+	TenantID string
+	UserID   string
+	Kind     string
+	KeepID   string
+}
+
+// Invalidates every other outstanding token of one kind for a user (§8).
+// Two live reset links is one more than anyone needs.
+func (q *Queries) ConsumeOtherLinkTokens(ctx context.Context, arg ConsumeOtherLinkTokensParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeOtherLinkTokens,
+		arg.TenantID,
+		arg.UserID,
+		arg.Kind,
+		arg.KeepID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
 UPDATE refresh_token SET consumed_at = $1::timestamptz
  WHERE id = $2 AND consumed_at IS NULL AND revoked_at IS NULL
@@ -247,6 +293,18 @@ func (q *Queries) CountUnusedRecoveryCodes(ctx context.Context, arg CountUnusedR
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const deleteExpiredLinkTokens = `-- name: DeleteExpiredLinkTokens :execrows
+DELETE FROM link_token WHERE expires_at < $1
+`
+
+func (q *Queries) DeleteExpiredLinkTokens(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredLinkTokens, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteExpiredRefreshTokens = `-- name: DeleteExpiredRefreshTokens :execrows
@@ -365,6 +423,40 @@ func (q *Queries) EnqueueEmail(ctx context.Context, arg EnqueueEmailParams) erro
 		arg.Template,
 		arg.Locale,
 		arg.Payload,
+	)
+	return err
+}
+
+const insertLinkToken = `-- name: InsertLinkToken :exec
+
+INSERT INTO link_token (id, kind, tenant_id, user_id, token_hash, address, expires_at, requested_ip)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`
+
+type InsertLinkTokenParams struct {
+	ID          string
+	Kind        string
+	TenantID    string
+	UserID      string
+	TokenHash   []byte
+	Address     *string
+	ExpiresAt   time.Time
+	RequestedIp *string
+}
+
+// ---------------------------------------------------------------------------------
+// Emailed links (docs/design-email.md §8)
+// ---------------------------------------------------------------------------------
+func (q *Queries) InsertLinkToken(ctx context.Context, arg InsertLinkTokenParams) error {
+	_, err := q.db.Exec(ctx, insertLinkToken,
+		arg.ID,
+		arg.Kind,
+		arg.TenantID,
+		arg.UserID,
+		arg.TokenHash,
+		arg.Address,
+		arg.ExpiresAt,
+		arg.RequestedIp,
 	)
 	return err
 }
@@ -507,9 +599,48 @@ func (q *Queries) InvalidateOtherSetupTokens(ctx context.Context, arg Invalidate
 	return result.RowsAffected(), nil
 }
 
+const linkTokenByHash = `-- name: LinkTokenByHash :one
+SELECT id, kind, tenant_id, user_id, address, expires_at, consumed_at, created_at
+  FROM link_token
+ WHERE token_hash = $1
+`
+
+type LinkTokenByHashRow struct {
+	ID         string
+	Kind       string
+	TenantID   string
+	UserID     string
+	Address    *string
+	ExpiresAt  time.Time
+	ConsumedAt *time.Time
+	CreatedAt  time.Time
+}
+
+// Resolves a token to its row. System pool: the token arrives in a URL with nothing else
+// attached, so there is no tenant to scope the read by until this returns one.
+//
+// Returned whatever its state. "Expired", "already used" and "never existed" have to be
+// distinguishable here — the caller answers them identically, but only the first two are
+// worth recording, and a consumed token presented again is worth recording loudly.
+func (q *Queries) LinkTokenByHash(ctx context.Context, tokenHash []byte) (LinkTokenByHashRow, error) {
+	row := q.db.QueryRow(ctx, linkTokenByHash, tokenHash)
+	var i LinkTokenByHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.TenantID,
+		&i.UserID,
+		&i.Address,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const markEmailFailed = `-- name: MarkEmailFailed :exec
 UPDATE outbound_email
-   SET status = 'failed', attempts = attempts + 1, last_error = $1
+   SET status = 'failed', attempts = attempts + 1, last_error = $1, payload = '{}'
  WHERE id = $2
 `
 
@@ -518,7 +649,8 @@ type MarkEmailFailedParams struct {
 	ID        string
 }
 
-// A permanent failure, or one that has run out of attempts.
+// A permanent failure, or one that has run out of attempts. The payload goes with it: the
+// message will not be sent, so the sealed token in it has no further use.
 func (q *Queries) MarkEmailFailed(ctx context.Context, arg MarkEmailFailedParams) error {
 	_, err := q.db.Exec(ctx, markEmailFailed, arg.LastError, arg.ID)
 	return err
@@ -544,10 +676,17 @@ func (q *Queries) MarkEmailRetrying(ctx context.Context, arg MarkEmailRetryingPa
 
 const markEmailSent = `-- name: MarkEmailSent :exec
 UPDATE outbound_email
-   SET status = 'sent', sent_at = now(), attempts = attempts + 1, last_error = NULL
+   SET status = 'sent', sent_at = now(), attempts = attempts + 1,
+       last_error = NULL, payload = '{}'
  WHERE id = $1
 `
 
+// Marks a message sent, and empties the payload.
+//
+// Emptying it is the point. The payload carries the link token, sealed under the KEK,
+// because a message cannot be rendered without one and the token cannot be read back out of
+// link_token — that table holds only a hash. Sealed and short-lived is the compromise;
+// leaving it in a row that is kept for observability would make it neither.
 func (q *Queries) MarkEmailSent(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, markEmailSent, id)
 	return err
@@ -1113,6 +1252,20 @@ type SuppressEmailAddressParams struct {
 func (q *Queries) SuppressEmailAddress(ctx context.Context, arg SuppressEmailAddressParams) error {
 	_, err := q.db.Exec(ctx, suppressEmailAddress, arg.Address, arg.Reason, arg.Note)
 	return err
+}
+
+const tenantDisplayName = `-- name: TenantDisplayName :one
+SELECT name FROM tenant WHERE id = $1
+`
+
+// The name a person sees in an emailed message. Read inside the transaction that queues
+// the message, rather than passed in by the caller: every call site would otherwise have
+// to remember, and the one that forgot sent "Sign in to ten_acme" to a real person.
+func (q *Queries) TenantDisplayName(ctx context.Context, tenantID string) (string, error) {
+	row := q.db.QueryRow(ctx, tenantDisplayName, tenantID)
+	var name string
+	err := row.Scan(&name)
+	return name, err
 }
 
 const tenantPasswordPolicy = `-- name: TenantPasswordPolicy :one

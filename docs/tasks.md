@@ -250,7 +250,7 @@ library, with no Warden-specific client code.
 | M1-6 [B] | **Status: done.** OIDC OP endpoints via fosite: authorize (PKCE required for public clients), token, userinfo, JWKS, introspect, revoke, logout, PAR, device | Met, in four commits. Every endpoint is served and every one is exercised end to end through HTTP: the authorization code flow with PKCE, the token endpoint, userinfo, introspection, revocation, RP-initiated logout, pushed authorization requests, and the device grant — which is hand-written, because fosite v0.49 implements no part of RFC 8628. The conformance checks pass, and implicit and ROPC are absent at all four surfaces: no factory composes them, no client row can name them, the discovery document does not offer them, and both endpoints refuse them |
 | M1-7 | **Status: done.** Access-token claim assembly per §8.2 including `wd.perm_rev`, with the **4 KB cap** dropping `wd.groups` then `wd.attrs` and setting `wd.truncated` | Met, and §8.2 amended: the authorization facts are now a per-client grant, empty by default, because Warden is the decision point and a role list in a JWT is that decision made stale and unrevocable. `TestAUserWithFiveThousandGroupsGetsAUsableToken` builds five thousand memberships and, for a client that opted in, gets a **645-byte** token that verifies against published JWKS and says `wd.truncated`. For the default client the same five thousand memberships produce **586 bytes** with nothing dropped and no membership walk at all |
 | M1-8 | **Status: done.** TOTP, recovery codes, WebAuthn as second factor | Enrolment and step-up flows work end to end: a password alone now reaches `/login/verify` and authorizes nothing, and `amr` comes back `["pwd","otp","mfa"]`. A recovery code signs in and ends every other session and refresh token (§7.2). Verified against the deployment with an independently written TOTP client, which is what proves the implementation interoperates rather than merely agreeing with itself. WebAuthn enrols and signs in through the browser endpoints against a virtual authenticator that signs for real, with the origin check, the clone detection and the spent challenge each shown to be load-bearing by reverting them |
-| M1-9 | **In progress (delivery done; the link flows are next).** Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest. **Done:** the three senders, the embedded templates with a hostile-input test, and the durable queue with its worker |
+| M1-9 | **In progress (delivery and the sign-in flows done; verification and invitation are next).** Magic link and email delivery, per the M0-12 email design | Links are single-use, 15-minute, hashed at rest. **Done:** the three senders, the embedded templates with a hostile-input test, the durable queue with its worker running under `serve`, and the magic-link and password-reset flows — verified end to end against Mailpit: one message, to the right address, carrying a link that works exactly once, and a reset that ends every session. **Remaining:** email verification and invitation |
 | M1-10 | User lifecycle `invited → active → suspended → deprovisioned → deleted` | Suspension kills sessions and refresh tokens immediately |
 
 ### Notes from M1-6, part 1: the client registry
@@ -360,6 +360,47 @@ that both read 3 and both write 4 have counted one attempt, so an attacker with 
 concurrency raises the effective limit by it. Redis does INCR and EXPIRE in one pipeline;
 the in-process backend holds its mutex across the read and the write.
 
+### Notes from M1-9, part 2: the link flows
+
+**A queue nothing drains is invisible from the outside.** Part 1 built the worker; nothing
+started it. Every request for a magic link still answered `200`, the row still landed in
+`outbound_email`, the HTTP tests still passed — and no message was ever sent. The first live
+run is what found it, because it is the only check that asks whether a person receives
+anything. `serve` now builds the sender eagerly (a misspelled relay should stop startup, not
+surface as the reset link that never arrived) and runs the drainer under the worker role.
+
+**"Sign in to ten\_acme".** The tenant's display name was a deferred `TODO` returning the
+tenant *identifier*, with a comment arguing it was "odd but not wrong". Seen in a real
+message it is plainly wrong, and the fix was one query. It now reads the name inside the
+transaction that queues the message rather than taking it from the caller, so there is one
+place that knows what a tenant is called instead of one per call site.
+
+**The discovery document advertised an issuer no token carried.** `Discovery.Issuer` was
+built as `base + "/"` while `iss` is `base`. OpenID Connect Discovery §4.3 requires them to
+be identical and certified relying parties compare the strings, so every token this
+deployment issued would have been refused by every client that checks. M1-6's
+certification-style tests missed it: the `iss` assertion compared the claim against the
+fixture's issuer rather than against what discovery publishes. The test now compares the two
+to each other, which is the rule as written.
+
+**The earlier "full suite green" runs were not.** `go test ./...` without
+`WARDEN_TEST_DATABASE_URL` skips every database-backed test and still prints `ok`. Three
+skipped runs read as passes here before a `-v` showed `SKIP`. `make test-integration` is the
+one that proves anything, and re-introducing a defect to watch a test fail only counts when
+the test actually ran.
+
+**A magic link satisfies one factor, not both.** It proves control of a mailbox. If the
+account has a second factor it is still demanded, with `amr: ["mail"]` recorded — otherwise
+enabling a second factor would be undone by the feature that bypasses it. Verified live: a
+magic link opens a session, and a password reset through an emailed link closes it (§7.2),
+counted in the database before and after.
+
+**Looking at a reset link must not spend it.** The `GET` renders the form; only the `POST`
+consumes the token. A mail client that prefetches links would otherwise burn every reset
+before its owner read the message. (The magic link is the opposite case and deliberately so:
+it is consumed on `GET`, because a mail client follows it with one, so a prefetch spends the
+link rather than leaving it usable.)
+
 ### Notes from M1-9, part 1: delivery
 
 **The framing the design opens with decides the rest.** For three of the four flows — magic
@@ -398,10 +439,14 @@ reject and others truncate — losing the end of the link. The MIME boundary is 
 related reason: a fixed one appearing inside a rendered template, which a user-controlled
 display name could arrange, would split the message where the sender did not intend.
 
-**`tls: disabled` is allowed only for a loopback host**, checked at startup. An SMTP session
-in the clear carries the credential the message exists to deliver, and the one place that is
-tolerable is a connection that never leaves the machine. A container name on a private
-network is not loopback, and the check says so.
+**`tls: disabled` is refused in production for anything but a loopback host**, checked at
+startup. An SMTP session in the clear carries the credential the message exists to deliver,
+and the one place that is tolerable is a connection that never leaves the machine. (Part 1
+made the rule loopback-only everywhere; part 2 relaxed it outside production, because the
+development stack reaches Mailpit by container name and never will be loopback. The same
+shape as the in-process cache and the `stdout` sender. Staging counts as production — the
+first version of the relaxed check compared against `EnvProduction` rather than calling
+`Environment.IsProduction()`, which would have let staging send real links in the clear.)
 
 **4xx and 5xx are opposite decisions.** RFC 5321 splits replies at the first digit: 5xx is
 permanent and 4xx is transient. Getting it backwards is expensive both ways — retrying a
